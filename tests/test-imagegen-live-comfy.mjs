@@ -13,10 +13,11 @@
  *
  * Run with:  node tests/test-imagegen-live-comfy.mjs   (from the repo root)
  */
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as plugin from '../godot-imagegen.ts'
+import { WORKFLOW_TEMPLATES, compactLayouts, createWorkflowLibrary, patchWorkflow, uiToApi } from '../godot-imagegen.ts'
 
 const COMFY_PORT = Number(process.env.GIG_LIVE_COMFY_PORT || 8188)
 const SD_PORT = Number(process.env.GIG_LIVE_PORT || 7860)
@@ -195,7 +196,86 @@ async function main() {
   assert(readPngSize(editedBytes).width === 512, 'the img2img result keeps the source resolution')
   assert(editedBytes.length > 20_000, 'a blank negative_prompt still produced a full-size result')
 
-  console.log(`\n— 实测 —\n  txt2img 512²/12 步 : ${secs(ms)}\n  img2img 512²/12 步 : ${secs(editMs)}`)
+  // ── the built-in templates must actually EXECUTE on the real server ──
+  // Structural validation (test-workflow-library.mjs) proves a template converts
+  // against the real /object_info; only running one proves the wiring, the pinned
+  // checkpoint and the seven-slot KSampler are all right together. A UI workflow
+  // is positional, so the layouts have to come from the live schema.
+  console.log('\n— 内置工作流模板在真实 ComfyUI 上执行 —')
+  const liveLayouts = compactLayouts(await (await fetch(`http://127.0.0.1:${COMFY_PORT}/object_info`)).json())
+  assert(Object.keys(liveLayouts).length > 100, `read the real node layouts (${Object.keys(liveLayouts).length} classes)`)
+
+  const libDir = await mkdtemp(join(tmpdir(), 'gig-tpl-'))
+  const library = createWorkflowLibrary({ dataRoot: libDir })
+  await library.ensure()
+  const seeded = await library.list()
+  assert(seeded.length === WORKFLOW_TEMPLATES.length, `the library seeded ${seeded.length} templates for the run`)
+
+  /** Run an API graph on the real server and return the first produced PNG. */
+  async function runGraph(api, label) {
+    const queued = await (await fetch(`http://127.0.0.1:${COMFY_PORT}/prompt`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt: api, client_id: `gig-template-${label}` }),
+    })).json()
+    if (queued.prompt_id === undefined) {
+      throw new Error(`${label}: server rejected the graph — ${JSON.stringify(queued).slice(0, 400)}`)
+    }
+    const deadline = Date.now() + 600_000
+    while (Date.now() < deadline) {
+      const history = await (await fetch(`http://127.0.0.1:${COMFY_PORT}/history/${queued.prompt_id}`)).json()
+      const entry = history[queued.prompt_id]
+      if (entry !== undefined) {
+        const refs = Object.values(entry.outputs ?? {}).flatMap((o) => o.images ?? [])
+        if (refs.length === 0) throw new Error(`${label}: no image in the history entry`)
+        const url = `http://127.0.0.1:${COMFY_PORT}/view?filename=${encodeURIComponent(refs[0].filename)}&subfolder=${encodeURIComponent(refs[0].subfolder ?? '')}&type=${encodeURIComponent(refs[0].type ?? 'output')}`
+        const response = await fetch(url)
+        return Buffer.from(await response.arrayBuffer())
+      }
+      await new Promise((r) => setTimeout(r, 1200))
+    }
+    throw new Error(`${label}: timed out waiting for the history entry`)
+  }
+
+  // Shape A: txt2img (sd15-basic / item-icon / seamless-tile / sdxl-basic).
+  const basicGraph = (await library.read('sd15-basic')).graph
+  const tBasic = Date.now()
+  const basicBytes = await runGraph(uiToApi(basicGraph, liveLayouts), 'sd15-basic')
+  const basicMs = Date.now() - tBasic
+  const basicSize = readPngSize(basicBytes)
+  console.log(`  sd15-basic           : ${secs(basicMs)} → ${basicSize.width}×${basicSize.height}, ${(basicBytes.length / 1024).toFixed(0)} KB`)
+  assert(basicSize.width === 512 && basicSize.height === 512,
+    'the sd15-basic template really rendered a 512×512 image on the real server')
+  assert(basicBytes.length > 20_000, `the template output has real content (${(basicBytes.length / 1024).toFixed(0)} KB)`)
+
+  // Shape B: upscale (LoadImage → UpscaleModelLoader → ImageUpscaleWithModel).
+  const upscaleGraph = (await library.read('upscale-4x')).graph
+  const tUp = Date.now()
+  try {
+    const upBytes = await runGraph(uiToApi(upscaleGraph, liveLayouts), 'upscale-4x')
+    const upSize = readPngSize(upBytes)
+    console.log(`  upscale-4x           : ${secs(Date.now() - tUp)} → ${upSize.width}×${upSize.height}, ${(upBytes.length / 1024).toFixed(0)} KB`)
+    assert(upSize.width >= 1024, 'the upscale template really upscaled its source (R-ESRGAN ×4)')
+  } catch (error) {
+    // The template pins example.png; an install without it cannot run this one.
+    console.log(`  upscale-4x           : SKIP — ${error.message.slice(0, 120)}`)
+    assert(/example\.png|invalid|not find|missing/i.test(error.message),
+      'the upscale template only fails when its pinned source image is missing')
+  }
+
+  // A by-name patch must change what the server actually renders.
+  const { graph: patchedGraph } = patchWorkflow(basicGraph, [{ classType: 'KSampler', set: { seed: 4242, steps: 6 } }], liveLayouts)
+  const patchedApi = uiToApi(patchedGraph, liveLayouts)
+  assert(patchedApi['5'].inputs.seed === 4242 && patchedApi['5'].inputs.steps === 6,
+    'a by-name patch flows into the API graph the server receives')
+  const tPatch = Date.now()
+  const patchedBytes = await runGraph(patchedApi, 'sd15-patched')
+  console.log(`  sd15-basic(改 seed/步数) : ${secs(Date.now() - tPatch)} → ${(patchedBytes.length / 1024).toFixed(0)} KB`)
+  assert(patchedBytes.length > 20_000, 'the patched template really re-rendered on the server')
+
+  await rm(libDir, { recursive: true, force: true }).catch(() => undefined)
+
+  console.log(`\n— 实测 —\n  txt2img 512²/12 步 : ${secs(ms)}\n  img2img 512²/12 步 : ${secs(editMs)}\n  模板 sd15-basic    : ${secs(basicMs)}`)
   console.log(`  (产物保留在 ${workRoot})`)
 
   for (const dispose of disposers) dispose()

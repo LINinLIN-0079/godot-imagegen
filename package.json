@@ -17,8 +17,9 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node tests/test-workflow.mjs && node tests/test-imagegen.mjs && node tests/test-render-imagegen.mjs",
+    "test": "node tests/test-workflow.mjs && node tests/test-workflow-library.mjs && node tests/test-imagegen.mjs && node tests/test-render-imagegen.mjs",
     "test:workflow": "node tests/test-workflow.mjs",
+    "test:library": "node tests/test-workflow-library.mjs",
     "test:offline": "node tests/test-imagegen.mjs",
     "test:client": "node tests/test-render-imagegen.mjs",
     "test:live": "node tests/test-imagegen-live.mjs",

@@ -183,6 +183,11 @@ export interface ImagegenConfig {
   requestTimeoutMs: number
   /** How long `start` waits for a backend to answer. */
   startTimeoutMs: number
+  /**
+   * Plugin-owned data directory (workflow library, cached node layouts,
+   * pre-write backups). Lives in DSH home, never inside the ComfyUI install.
+   */
+  dataRoot: string
 }
 
 const DEFAULT_SDWEBUI_ROOT = 'D:/AKI open/sd-webui-aki-v4.10/sd-webui-aki-v4.10'
@@ -211,6 +216,11 @@ function resolveConfig(config: unknown): ImagegenConfig {
   }
   const godotProject = str('godotProject', '')
   const outDir = str('outDir', '')
+  // Plugin-owned scratch: workflow library, cached node layouts, pre-write
+  // backups. Deliberately NOT inside the ComfyUI install, so nothing this plugin
+  // owns can be destroyed by a 整合包 upgrade — and so phase 2 has a single
+  // source of truth to sync FROM.
+  const dataRoot = str('dataRoot', `${(process.env.DSH_HOME ?? '.dsh').replace(/\\/g, '/')}/godot-imagegen`)
   return {
     unitName,
     sdwebuiRoot,
@@ -229,6 +239,7 @@ function resolveConfig(config: unknown): ImagegenConfig {
     // ~60-77 s/step, so an 18-step image alone needs ~20 minutes.
     requestTimeoutMs: num('requestTimeoutMs', 30 * 60 * 1000),
     startTimeoutMs: num('startTimeoutMs', 6 * 60 * 1000),
+    dataRoot,
   }
 }
 
@@ -1739,6 +1750,12 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
     comfyRun: (params: Parameters<typeof comfyRun>[0]) => interruptOnFailure('comfyui', () => comfyRun(params)),
     comfyGraph,
     comfyUpload,
+    /**
+     * The whole `/object_info` document (~1.1 MB / 1212 classes on this
+     * install). Needed to address a workflow's widgets by name, so it is
+     * fetched with a generous timeout and cached by the caller.
+     */
+    comfyObjectInfo: () => probeJson(`${comfyBase}/object_info`, 180_000) as Promise<Record<string, unknown> | undefined>,
     post,
   }
 }
@@ -2856,9 +2873,16 @@ function isWidgetInput(def: unknown): boolean {
  * and a widget flagged `control_after_generate` (every `seed`) consumes a SECOND
  * slot holding its post-generation mode — the classic off-by-one that silently
  * corrupts naive writers.
+ *
+ * `source` may be either a live `/object_info` document or the compact layout
+ * cache this plugin persists (`{ [classType]: WidgetSpec[] }`), so editing a
+ * workflow keeps working after a restart with the backend down.
  */
-export function widgetLayout(objectInfo: Record<string, unknown> | undefined, classType: string): WidgetSpec[] {
-  const info = objectInfo?.[classType] as
+export function widgetLayout(source: Record<string, unknown> | undefined, classType: string): WidgetSpec[] {
+  const entry = source === undefined ? undefined : source[classType]
+  // A cached layout is already in final form.
+  if (Array.isArray(entry)) return entry as WidgetSpec[]
+  const info = entry as
     | { input?: { required?: Record<string, unknown>; optional?: Record<string, unknown> } }
     | undefined
   const out: WidgetSpec[] = []
@@ -3091,10 +3115,25 @@ export function uiToApi(graph: UiWorkflow, objectInfo?: Record<string, unknown>)
   const api: Record<string, unknown> = {}
   for (const node of graph.nodes) {
     if (node.mode === 2 || node.mode === 4) continue
-    const inputs: Record<string, unknown> = {}
-    for (const [key, value] of Object.entries(readWidgets(node, widgetLayout(objectInfo, node.type)))) {
-      inputs[key] = value
+    const layout = widgetLayout(objectInfo, node.type)
+    const widgets = readWidgets(node, layout)
+    // Without a schema the positional widgets cannot be named, so EVERY scalar
+    // parameter (checkpoint, prompt, filename prefix, seed…) would be dropped and
+    // the server would answer with a bewildering "Required input is missing".
+    // Fail here, where the real cause and its fix can be named.
+    const raw = node.widgets_values
+    const serialisedCount = Array.isArray(raw)
+      ? raw.length
+      : raw !== null && typeof raw === 'object' ? Object.keys(raw).length : 0
+    if (serialisedCount > 0 && layout.length === 0 && Object.keys(widgets).length === 0) {
+      throw new Error(
+        `无法把节点 #${node.id}（${node.type}）的参数值转换成 API 输入：缺少该节点类的参数表（/object_info）。`
+        + '这会丢掉它的全部标量参数（模型名、提示词、文件名前缀等）。'
+        + '请先启动 ComfyUI 让插件读取一次节点定义（image_backend_status action="start"，结果会被缓存），再重试。',
+      )
     }
+    const inputs: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(widgets)) inputs[key] = value
     for (const input of node.inputs ?? []) {
       if (input.link === null || input.link === undefined) continue
       const link = links.get(Number(input.link))
@@ -3124,12 +3163,47 @@ export function uiToApi(graph: UiWorkflow, objectInfo?: Record<string, unknown>)
   return api
 }
 
+/** Whether an API-graph input value is a `[nodeId, slot]` link reference. */
+function isLinkRef(value: unknown): value is [string, number] {
+  return Array.isArray(value) && value.length === 2 && typeof value[0] === 'string' && typeof value[1] === 'number'
+}
+
+/**
+ * Build a node's `widgets_values` array for a target UI graph.
+ *
+ * With a known layout the array lines up slot-for-slot, including the extra
+ * `control_after_generate` slot a seed-like widget silently requires — without
+ * it every field after the seed would land one position early on the canvas.
+ * Without a layout we can only emit the non-link inputs in declaration order,
+ * which is correct for widget-only nodes and wrong for seed-bearing ones, so a
+ * caller that cares should pass a layout.
+ */
+function buildWidgetValues(
+  classType: string,
+  inputs: Record<string, unknown>,
+  objectInfo?: Record<string, unknown>,
+): unknown[] {
+  const layout = widgetLayout(objectInfo, classType)
+  if (layout.length === 0) {
+    return Object.values(inputs).filter((value) => !isLinkRef(value))
+  }
+  const values: unknown[] = []
+  for (const spec of layout) {
+    const value = inputs[spec.name]
+    values.push(value === undefined ? (spec.default ?? null) : value)
+    if (spec.slots > 1) values.push(spec.options?.[0] ?? 'randomize')
+  }
+  return values
+}
+
 /**
  * Convert an API graph into a UI-format workflow, so an agent-authored graph can
  * be opened and edited on the canvas. Nodes are laid out on a simple grid and
- * links are materialised with fresh ids.
+ * links are materialised with fresh ids. Pass `objectInfo` (or the compact
+ * layout cache) whenever it is available: it is what makes the widget slots line
+ * up, and in particular what supplies the two-slot seed control.
  */
-export function apiToUi(api: Record<string, unknown>): UiWorkflow {
+export function apiToUi(api: Record<string, unknown>, objectInfo?: Record<string, unknown>): UiWorkflow {
   const entries = Object.entries(api).filter(
     ([, value]) => value !== null && typeof value === 'object' && typeof (value as Record<string, unknown>).class_type === 'string',
   )
@@ -3160,19 +3234,14 @@ export function apiToUi(api: Record<string, unknown>): UiWorkflow {
     })
   })
   const byId = new Map(nodes.map((node) => [String(node.id), node]))
-  // Pass 2: split widget values from links, then wire.
+  // Pass 2: wire the links, then serialise the widget values in layout order.
   for (const [key, value] of entries) {
     const node = byId.get(Number.isFinite(Number(key)) ? String(Number(key)) : key)
     if (node === undefined) continue
     const inputs = (value as { inputs?: Record<string, unknown> }).inputs ?? {}
-    const widgets: unknown[] = []
     for (const [name, entry] of Object.entries(inputs)) {
-      const isLink = Array.isArray(entry) && entry.length === 2 && typeof entry[0] === 'string'
-      if (!isLink) {
-        widgets.push(entry)
-        continue
-      }
-      const [originKey, originSlot] = entry as [string, number]
+      if (!isLinkRef(entry)) continue
+      const [originKey, originSlot] = entry
       const origin = byId.get(String(Number(originKey)))
       if (origin === undefined) continue
       linkId += 1
@@ -3182,10 +3251,9 @@ export function apiToUi(api: Record<string, unknown>): UiWorkflow {
       while (outputs.length <= originSlot) outputs.push({ name: `out${outputs.length}`, type: '*', links: [] })
       outputs[originSlot].links = [...(outputs[originSlot].links ?? []), linkId]
       links.push([linkId, origin.id, originSlot, node.id, targetSlot, '*'])
-      const key2 = `${origin.id}:${originSlot}`
-      slots.set(key2, [...(slots.get(key2) ?? []), String(linkId)])
+      slots.set(`${origin.id}:${originSlot}`, [...(slots.get(`${origin.id}:${originSlot}`) ?? []), String(linkId)])
     }
-    node.widgets_values = widgets
+    node.widgets_values = buildWidgetValues(node.type, inputs, objectInfo)
   }
   return {
     last_node_id: nodes.reduce((max, node) => Math.max(max, node.id), 0),
@@ -3249,6 +3317,542 @@ export function isApiWorkflow(raw: unknown): boolean {
   return values.every(
     (v) => v !== null && typeof v === 'object' && typeof (v as Record<string, unknown>).class_type === 'string',
   )
+}
+
+// ──────────────────── workflow library (plugin-local, no ComfyUI writes) ────────────────────
+
+/**
+ * Metadata attached to a stored workflow. It rides inside the graph's own
+ * `extra` object — a field ComfyUI preserves across load/save — so a workflow
+ * file stays a perfectly valid ComfyUI document while still carrying the
+ * plugin's name/description. No side-car index to fall out of sync.
+ */
+export interface WorkflowMeta {
+  id: string
+  name: string
+  description: string
+  category: string
+  tags: string[]
+  createdAt: string
+  updatedAt: string
+  source: 'template' | 'agent' | 'canvas' | 'import'
+}
+
+/** Key under `graph.extra` that holds {@link WorkflowMeta}. */
+export const WORKFLOW_META_KEY = 'godotImagegen'
+
+/** One line of the library listing. */
+export interface WorkflowSummary {
+  id: string
+  meta: WorkflowMeta
+  nodeCount: number
+  classCounts: Record<string, number>
+}
+
+/**
+ * Compact a live `/object_info` document down to just the widget layouts.
+ *
+ * The real document is ~1.1 MB across 1212 classes, almost all of it irrelevant
+ * here; the layouts are what `patchWorkflow` needs. Classes with no widgets are
+ * kept as empty arrays on purpose: their presence is what tells
+ * `patchWorkflow` "the schema IS known, this node simply has no editable
+ * widgets", which is a different error from "we never read the schema".
+ */
+export function compactLayouts(objectInfo: Record<string, unknown>): Record<string, WidgetSpec[]> {
+  const out: Record<string, WidgetSpec[]> = {}
+  for (const classType of Object.keys(objectInfo)) out[classType] = widgetLayout(objectInfo, classType)
+  return out
+}
+
+/** One node of a template, in a shape that keeps the template tables readable. */
+interface TemplateNode {
+  id: number
+  type: string
+  title?: string
+  /** `widgets_values`, in the exact slot order the real schema uses. */
+  widgets?: unknown[]
+  inputs?: Array<{ name: string; link: number; type?: string }>
+  outputs?: Array<{ name: string; type?: string; links?: number[] }>
+}
+
+/** A template link: `[id, originId, originSlot, targetId, targetSlot, type]`. */
+type TemplateLink = [number, number, number, number, number, string]
+
+/** A built-in workflow, authored in UI format so it opens on the canvas as-is. */
+export interface WorkflowTemplate {
+  id: string
+  name: string
+  description: string
+  category: string
+  nodes: TemplateNode[]
+  links: TemplateLink[]
+}
+
+/** Assemble a template's tables into a valid UI-format document. */
+function templateToGraph(template: WorkflowTemplate): UiWorkflow {
+  const nodes: UiWorkflowNode[] = template.nodes.map((node, order) => ({
+    id: node.id,
+    type: node.type,
+    ...(node.title === undefined ? {} : { title: node.title }),
+    pos: [(order % 4) * 340, Math.floor(order / 4) * 240],
+    size: [300, 180],
+    flags: {},
+    order,
+    mode: 0,
+    inputs: (node.inputs ?? []).map((input) => ({ name: input.name, type: input.type ?? '*', link: input.link })),
+    outputs: (node.outputs ?? []).map((output) => ({
+      name: output.name,
+      type: output.type ?? '*',
+      links: output.links ?? null,
+    })),
+    widgets_values: node.widgets ?? [],
+    properties: { 'Node name for S&R': node.type },
+  }))
+  return {
+    last_node_id: template.nodes.reduce((max, node) => Math.max(max, node.id), 0),
+    last_link_id: template.links.reduce((max, link) => Math.max(max, link[0]), 0),
+    nodes,
+    links: template.links,
+    groups: [],
+    config: {},
+    extra: { dsl: { linkExtensions: [], reroutes: [] } },
+    version: 0.4,
+  }
+}
+
+const BASE_NEGATIVE_WORKFLOW = 'lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry'
+
+/**
+ * Six built-in game-art workflows, authored for the models and nodes this
+ * machine actually has (verified against the live `/object_info`: 1212 classes,
+ * three shared checkpoints, six shared upscale weights). Widget arrays follow
+ * the real slot order — note KSampler's two-slot seed
+ * (`[seed, control_after_generate, steps, cfg, sampler, scheduler, denoise]`).
+ */
+export const WORKFLOW_TEMPLATES: WorkflowTemplate[] = [
+  {
+    id: 'sd15-basic',
+    name: 'SD1.5 文生图（anything-v5）',
+    description: '最快的探索路径：本机实测 512²/14 步约 6–24 秒。草稿阶段首选，定稿再用 upscale 放大。',
+    category: 'concept',
+    nodes: [
+      { id: 1, type: 'CheckpointLoaderSimple', title: '底模', widgets: ['anything-v5.safetensors'], outputs: [{ name: 'MODEL', type: 'MODEL', links: [1] }, { name: 'CLIP', type: 'CLIP', links: [2, 3] }, { name: 'VAE', type: 'VAE', links: [9] }] },
+      { id: 2, type: 'CLIPTextEncode', title: '正向提示词', widgets: ['masterpiece, best quality, '], inputs: [{ name: 'clip', link: 2, type: 'CLIP' }], outputs: [{ name: 'CONDITIONING', type: 'CONDITIONING', links: [4] }] },
+      { id: 3, type: 'CLIPTextEncode', title: '负向提示词', widgets: [BASE_NEGATIVE_WORKFLOW], inputs: [{ name: 'clip', link: 3, type: 'CLIP' }], outputs: [{ name: 'CONDITIONING', type: 'CONDITIONING', links: [5] }] },
+      { id: 4, type: 'EmptyLatentImage', title: '尺寸', widgets: [512, 512, 1], outputs: [{ name: 'LATENT', type: 'LATENT', links: [6] }] },
+      {
+        id: 5, type: 'KSampler', title: '采样',
+        widgets: [0, 'randomize', 20, 7, 'dpmpp_2m', 'karras', 1],
+        inputs: [{ name: 'model', link: 1, type: 'MODEL' }, { name: 'positive', link: 4, type: 'CONDITIONING' }, { name: 'negative', link: 5, type: 'CONDITIONING' }, { name: 'latent_image', link: 6, type: 'LATENT' }],
+        outputs: [{ name: 'LATENT', type: 'LATENT', links: [7] }],
+      },
+      { id: 6, type: 'VAEDecode', title: '解码', inputs: [{ name: 'samples', link: 7, type: 'LATENT' }, { name: 'vae', link: 9, type: 'VAE' }], outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [8] }] },
+      { id: 7, type: 'SaveImage', title: '保存', widgets: ['gig/sd15'], inputs: [{ name: 'images', link: 8, type: 'IMAGE' }] },
+    ],
+    links: [
+      [1, 1, 0, 5, 0, 'MODEL'],
+      [2, 1, 1, 2, 0, 'CLIP'],
+      [3, 1, 1, 3, 0, 'CLIP'],
+      [4, 2, 0, 5, 1, 'CONDITIONING'],
+      [5, 3, 0, 5, 2, 'CONDITIONING'],
+      [6, 4, 0, 5, 3, 'LATENT'],
+      [7, 5, 0, 6, 0, 'LATENT'],
+      [8, 6, 0, 7, 0, 'IMAGE'],
+      [9, 1, 2, 6, 1, 'VAE'],
+    ],
+  },
+  {
+    id: 'sdxl-basic',
+    name: 'SDXL 文生图（wai Illustrious）',
+    description: '画质更好但本机很慢：实测 60–77 秒/步，768² 的 18 步要十几分钟。只在确实需要时用。',
+    category: 'character',
+    nodes: [
+      { id: 1, type: 'CheckpointLoaderSimple', title: '底模', widgets: ['waiIllustriousSDXL_v150.safetensors'], outputs: [{ name: 'MODEL', type: 'MODEL', links: [1] }, { name: 'CLIP', type: 'CLIP', links: [2, 3] }, { name: 'VAE', type: 'VAE', links: [9] }] },
+      { id: 2, type: 'CLIPTextEncode', title: '正向提示词', widgets: ['masterpiece, best quality, '], inputs: [{ name: 'clip', link: 2, type: 'CLIP' }], outputs: [{ name: 'CONDITIONING', type: 'CONDITIONING', links: [4] }] },
+      { id: 3, type: 'CLIPTextEncode', title: '负向提示词', widgets: [BASE_NEGATIVE_WORKFLOW], inputs: [{ name: 'clip', link: 3, type: 'CLIP' }], outputs: [{ name: 'CONDITIONING', type: 'CONDITIONING', links: [5] }] },
+      { id: 4, type: 'EmptyLatentImage', title: '尺寸', widgets: [832, 1216, 1], outputs: [{ name: 'LATENT', type: 'LATENT', links: [6] }] },
+      {
+        id: 5, type: 'KSampler', title: '采样',
+        widgets: [0, 'randomize', 20, 6, 'dpmpp_2m', 'karras', 1],
+        inputs: [{ name: 'model', link: 1, type: 'MODEL' }, { name: 'positive', link: 4, type: 'CONDITIONING' }, { name: 'negative', link: 5, type: 'CONDITIONING' }, { name: 'latent_image', link: 6, type: 'LATENT' }],
+        outputs: [{ name: 'LATENT', type: 'LATENT', links: [7] }],
+      },
+      { id: 6, type: 'VAEDecode', title: '解码', inputs: [{ name: 'samples', link: 7, type: 'LATENT' }, { name: 'vae', link: 9, type: 'VAE' }], outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [8] }] },
+      { id: 7, type: 'SaveImage', title: '保存', widgets: ['gig/sdxl'], inputs: [{ name: 'images', link: 8, type: 'IMAGE' }] },
+    ],
+    links: [
+      [1, 1, 0, 5, 0, 'MODEL'],
+      [2, 1, 1, 2, 0, 'CLIP'],
+      [3, 1, 1, 3, 0, 'CLIP'],
+      [4, 2, 0, 5, 1, 'CONDITIONING'],
+      [5, 3, 0, 5, 2, 'CONDITIONING'],
+      [6, 4, 0, 5, 3, 'LATENT'],
+      [7, 5, 0, 6, 0, 'LATENT'],
+      [8, 6, 0, 7, 0, 'IMAGE'],
+      [9, 1, 2, 6, 1, 'VAE'],
+    ],
+  },
+  {
+    id: 'item-icon',
+    name: '道具图标（512²，白底便于抠图）',
+    description: '出图后接 image_cutout 抠成透明 PNG。白底 + 单物件 + 厚描边是这套提示词的要点。',
+    category: 'item',
+    nodes: [
+      { id: 1, type: 'CheckpointLoaderSimple', title: '底模', widgets: ['anything-v5.safetensors'], outputs: [{ name: 'MODEL', type: 'MODEL', links: [1] }, { name: 'CLIP', type: 'CLIP', links: [2, 3] }, { name: 'VAE', type: 'VAE', links: [9] }] },
+      { id: 2, type: 'CLIPTextEncode', title: '正向提示词', widgets: ['game item icon, single object, centered, clean thick outline, flat shading, plain white background, sticker, masterpiece, best quality'], inputs: [{ name: 'clip', link: 2, type: 'CLIP' }], outputs: [{ name: 'CONDITIONING', type: 'CONDITIONING', links: [4] }] },
+      { id: 3, type: 'CLIPTextEncode', title: '负向提示词', widgets: [`${BASE_NEGATIVE_WORKFLOW}, multiple objects, frame, human, character`], inputs: [{ name: 'clip', link: 3, type: 'CLIP' }], outputs: [{ name: 'CONDITIONING', type: 'CONDITIONING', links: [5] }] },
+      { id: 4, type: 'EmptyLatentImage', title: '尺寸', widgets: [512, 512, 1], outputs: [{ name: 'LATENT', type: 'LATENT', links: [6] }] },
+      {
+        id: 5, type: 'KSampler', title: '采样',
+        widgets: [0, 'randomize', 22, 7, 'dpmpp_2m', 'karras', 1],
+        inputs: [{ name: 'model', link: 1, type: 'MODEL' }, { name: 'positive', link: 4, type: 'CONDITIONING' }, { name: 'negative', link: 5, type: 'CONDITIONING' }, { name: 'latent_image', link: 6, type: 'LATENT' }],
+        outputs: [{ name: 'LATENT', type: 'LATENT', links: [7] }],
+      },
+      { id: 6, type: 'VAEDecode', title: '解码', inputs: [{ name: 'samples', link: 7, type: 'LATENT' }, { name: 'vae', link: 9, type: 'VAE' }], outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [8] }] },
+      { id: 7, type: 'SaveImage', title: '保存', widgets: ['gig/icon'], inputs: [{ name: 'images', link: 8, type: 'IMAGE' }] },
+    ],
+    links: [
+      [1, 1, 0, 5, 0, 'MODEL'],
+      [2, 1, 1, 2, 0, 'CLIP'],
+      [3, 1, 1, 3, 0, 'CLIP'],
+      [4, 2, 0, 5, 1, 'CONDITIONING'],
+      [5, 3, 0, 5, 2, 'CONDITIONING'],
+      [6, 4, 0, 5, 3, 'LATENT'],
+      [7, 5, 0, 6, 0, 'LATENT'],
+      [8, 6, 0, 7, 0, 'IMAGE'],
+      [9, 1, 2, 6, 1, 'VAE'],
+    ],
+  },
+  {
+    id: 'seamless-tile',
+    name: '无缝瓦片（768²）',
+    description: '瓦片类提示词要点：seamless tileable / top down / even lighting / no shadow。出图后接 image_cutout 或让插件做无缝平铺。',
+    category: 'tile',
+    nodes: [
+      { id: 1, type: 'CheckpointLoaderSimple', title: '底模', widgets: ['anything-v5.safetensors'], outputs: [{ name: 'MODEL', type: 'MODEL', links: [1] }, { name: 'CLIP', type: 'CLIP', links: [2, 3] }, { name: 'VAE', type: 'VAE', links: [9] }] },
+      { id: 2, type: 'CLIPTextEncode', title: '正向提示词', widgets: ['seamless tileable texture, top down, video game tileset, even lighting, no shadow, no border, high detail'], inputs: [{ name: 'clip', link: 2, type: 'CLIP' }], outputs: [{ name: 'CONDITIONING', type: 'CONDITIONING', links: [4] }] },
+      { id: 3, type: 'CLIPTextEncode', title: '负向提示词', widgets: [`${BASE_NEGATIVE_WORKFLOW}, seam, border, frame, vignette, perspective, character`], inputs: [{ name: 'clip', link: 3, type: 'CLIP' }], outputs: [{ name: 'CONDITIONING', type: 'CONDITIONING', links: [5] }] },
+      { id: 4, type: 'EmptyLatentImage', title: '尺寸', widgets: [768, 768, 1], outputs: [{ name: 'LATENT', type: 'LATENT', links: [6] }] },
+      {
+        id: 5, type: 'KSampler', title: '采样',
+        widgets: [0, 'randomize', 24, 7, 'dpmpp_2m', 'karras', 1],
+        inputs: [{ name: 'model', link: 1, type: 'MODEL' }, { name: 'positive', link: 4, type: 'CONDITIONING' }, { name: 'negative', link: 5, type: 'CONDITIONING' }, { name: 'latent_image', link: 6, type: 'LATENT' }],
+        outputs: [{ name: 'LATENT', type: 'LATENT', links: [7] }],
+      },
+      { id: 6, type: 'VAEDecode', title: '解码', inputs: [{ name: 'samples', link: 7, type: 'LATENT' }, { name: 'vae', link: 9, type: 'VAE' }], outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [8] }] },
+      { id: 7, type: 'SaveImage', title: '保存', widgets: ['gig/tile'], inputs: [{ name: 'images', link: 8, type: 'IMAGE' }] },
+    ],
+    links: [
+      [1, 1, 0, 5, 0, 'MODEL'],
+      [2, 1, 1, 2, 0, 'CLIP'],
+      [3, 1, 1, 3, 0, 'CLIP'],
+      [4, 2, 0, 5, 1, 'CONDITIONING'],
+      [5, 3, 0, 5, 2, 'CONDITIONING'],
+      [6, 4, 0, 5, 3, 'LATENT'],
+      [7, 5, 0, 6, 0, 'LATENT'],
+      [8, 6, 0, 7, 0, 'IMAGE'],
+      [9, 1, 2, 6, 1, 'VAE'],
+    ],
+  },
+  {
+    id: 'upscale-4x',
+    name: '放大（R-ESRGAN 4x+ Anime6B）',
+    description: '把 LoadImage 的图用动漫向 Real-ESRGAN 放大。先把要放大的图上传到 ComfyUI 的 input 目录，或改 LoadImage 的 image 值。',
+    category: 'texture',
+    nodes: [
+      { id: 1, type: 'LoadImage', title: '源图', widgets: ['example.png'], outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [1] }, { name: 'MASK', type: 'MASK', links: [] }] },
+      { id: 2, type: 'UpscaleModelLoader', title: '放大模型', widgets: ['RealESRGAN_x4plus_anime_6B.pth'], outputs: [{ name: 'UPSCALE_MODEL', type: 'UPSCALE_MODEL', links: [2] }] },
+      { id: 3, type: 'ImageUpscaleWithModel', title: '放大', inputs: [{ name: 'upscale_model', link: 2, type: 'UPSCALE_MODEL' }, { name: 'image', link: 1, type: 'IMAGE' }], outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [3] }] },
+      { id: 4, type: 'SaveImage', title: '保存', widgets: ['gig/upscaled'], inputs: [{ name: 'images', link: 3, type: 'IMAGE' }] },
+    ],
+    links: [
+      [1, 1, 0, 3, 1, 'IMAGE'],
+      [2, 2, 0, 3, 0, 'UPSCALE_MODEL'],
+      [3, 3, 0, 4, 0, 'IMAGE'],
+    ],
+  },
+  {
+    id: 'img2img-refine',
+    name: '图生图精修（VAEEncode + KSampler denoise）',
+    description: '对已有图做低 denoise 精修（0.3–0.5）。改 LoadImage 的源图与 KSampler 的 denoise。',
+    category: 'concept',
+    nodes: [
+      { id: 1, type: 'CheckpointLoaderSimple', title: '底模', widgets: ['anything-v5.safetensors'], outputs: [{ name: 'MODEL', type: 'MODEL', links: [1] }, { name: 'CLIP', type: 'CLIP', links: [2, 3] }, { name: 'VAE', type: 'VAE', links: [9, 10] }] },
+      { id: 2, type: 'LoadImage', title: '源图', widgets: ['example.png'], outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [4] }, { name: 'MASK', type: 'MASK', links: [] }] },
+      { id: 3, type: 'CLIPTextEncode', title: '正向提示词', widgets: ['masterpiece, best quality, '], inputs: [{ name: 'clip', link: 2, type: 'CLIP' }], outputs: [{ name: 'CONDITIONING', type: 'CONDITIONING', links: [5] }] },
+      { id: 4, type: 'CLIPTextEncode', title: '负向提示词', widgets: [BASE_NEGATIVE_WORKFLOW], inputs: [{ name: 'clip', link: 3, type: 'CLIP' }], outputs: [{ name: 'CONDITIONING', type: 'CONDITIONING', links: [6] }] },
+      { id: 5, type: 'VAEEncode', title: '编码源图', inputs: [{ name: 'pixels', link: 4, type: 'IMAGE' }, { name: 'vae', link: 9, type: 'VAE' }], outputs: [{ name: 'LATENT', type: 'LATENT', links: [7] }] },
+      {
+        id: 6, type: 'KSampler', title: '采样（低 denoise）',
+        widgets: [0, 'randomize', 20, 7, 'dpmpp_2m', 'karras', 0.4],
+        inputs: [{ name: 'model', link: 1, type: 'MODEL' }, { name: 'positive', link: 5, type: 'CONDITIONING' }, { name: 'negative', link: 6, type: 'CONDITIONING' }, { name: 'latent_image', link: 7, type: 'LATENT' }],
+        outputs: [{ name: 'LATENT', type: 'LATENT', links: [8] }],
+      },
+      { id: 7, type: 'VAEDecode', title: '解码', inputs: [{ name: 'samples', link: 8, type: 'LATENT' }, { name: 'vae', link: 10, type: 'VAE' }], outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [11] }] },
+      { id: 8, type: 'SaveImage', title: '保存', widgets: ['gig/refined'], inputs: [{ name: 'images', link: 11, type: 'IMAGE' }] },
+    ],
+    links: [
+      [1, 1, 0, 6, 0, 'MODEL'],
+      [2, 1, 1, 3, 0, 'CLIP'],
+      [3, 1, 1, 4, 0, 'CLIP'],
+      [4, 2, 0, 5, 0, 'IMAGE'],
+      [5, 3, 0, 6, 1, 'CONDITIONING'],
+      [6, 4, 0, 6, 2, 'CONDITIONING'],
+      [7, 5, 0, 6, 3, 'LATENT'],
+      [8, 6, 0, 7, 0, 'LATENT'],
+      [9, 1, 2, 5, 1, 'VAE'],
+      [10, 1, 2, 7, 1, 'VAE'],
+      [11, 7, 0, 8, 0, 'IMAGE'],
+    ],
+  },
+]
+
+/** Read `WorkflowMeta` off a graph, falling back to a synthesized record. */
+function readMeta(graph: UiWorkflow, id: string): WorkflowMeta {
+  const extra = graph.extra as Record<string, unknown> | undefined
+  const raw = extra?.[WORKFLOW_META_KEY]
+  const now = new Date().toISOString()
+  const fallback: WorkflowMeta = {
+    id, name: id, description: '', category: 'concept', tags: [], createdAt: now, updatedAt: now, source: 'import',
+  }
+  if (raw === null || typeof raw !== 'object') return fallback
+  const value = raw as Partial<WorkflowMeta>
+  return {
+    id,
+    name: typeof value.name === 'string' && value.name !== '' ? value.name : id,
+    description: typeof value.description === 'string' ? value.description : '',
+    category: typeof value.category === 'string' && value.category !== '' ? value.category : 'concept',
+    tags: Array.isArray(value.tags) ? value.tags.filter((t): t is string => typeof t === 'string') : [],
+    createdAt: typeof value.createdAt === 'string' ? value.createdAt : now,
+    updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : now,
+    source: value.source === 'template' || value.source === 'agent' || value.source === 'canvas' ? value.source : 'import',
+  }
+}
+
+/** Stamp meta onto a graph (returns a new document). */
+function withMeta(graph: UiWorkflow, meta: WorkflowMeta): UiWorkflow {
+  const next = JSON.parse(JSON.stringify(graph)) as UiWorkflow
+  next.extra = { ...(next.extra ?? {}), [WORKFLOW_META_KEY]: meta }
+  return next
+}
+
+/** The plugin-local workflow library: plain JSON files under the data root. */
+export interface WorkflowLibrary {
+  root: string
+  /** Create the directory and seed the built-in templates on first use. */
+  ensure(): Promise<void>
+  list(): Promise<WorkflowSummary[]>
+  read(id: string): Promise<{ meta: WorkflowMeta; graph: UiWorkflow }>
+  save(id: string, graph: UiWorkflow, patch?: Partial<WorkflowMeta>): Promise<WorkflowMeta>
+  create(input: { name: string; description?: string; category?: string; from?: string; graph?: UiWorkflow }): Promise<{ id: string; meta: WorkflowMeta }>
+  remove(id: string): Promise<boolean>
+}
+
+/**
+ * Create the workflow library.
+ *
+ * Files, not a KV unit, on purpose: workflows are documents the user may want to
+ * inspect, copy or diff, and this mirrors how ComfyUI itself stores them. It also
+ * means phase 2 can sync INTO the ComfyUI install from a single source of truth
+ * that this plugin owns — nothing under `D:\AKI open\` is ever the original.
+ */
+export function createWorkflowLibrary(cfg: ImagegenConfig): WorkflowLibrary {
+  const root = `${cfg.dataRoot}/workflows`
+  let seeded: Promise<void> | undefined
+
+  const fileOf = (id: string): string => join(root, `${id}.json`)
+
+  function slugFor(name: string): string {
+    const base = slugify(name).toLowerCase() || 'workflow'
+    return base
+  }
+
+  async function uniqueId(base: string): Promise<string> {
+    let candidate = base
+    let n = 2
+    while (fileExists(fileOf(candidate))) {
+      candidate = `${base}-${n}`
+      n += 1
+    }
+    return candidate
+  }
+
+  async function listIds(): Promise<string[]> {
+    try {
+      const entries = await readdir(root, { withFileTypes: true })
+      return entries.filter((e) => e.isFile() && e.name.endsWith('.json')).map((e) => e.name.slice(0, -'.json'.length))
+    } catch {
+      return []
+    }
+  }
+
+  async function read(id: string): Promise<{ meta: WorkflowMeta; graph: UiWorkflow }> {
+    const path = fileOf(id)
+    let raw: string
+    try {
+      raw = await readFile(path, 'utf8')
+    } catch {
+      throw new Error(`工作流库中没有 "${id}"（预期文件：${path}）`)
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch (error) {
+      throw new Error(`工作流 "${id}" 不是合法 JSON（${path}）：${(error as Error).message}`)
+    }
+    const graph = normalizeUiWorkflow(parsed)
+    return { meta: readMeta(graph, id), graph }
+  }
+
+  async function save(id: string, graph: UiWorkflow, patch?: Partial<WorkflowMeta>): Promise<WorkflowMeta> {
+    await mkdir(root, { recursive: true })
+    const previous = fileExists(fileOf(id)) ? readMeta(normalizeUiWorkflow(JSON.parse(await readFile(fileOf(id), 'utf8'))), id) : undefined
+    const now = new Date().toISOString()
+    const meta: WorkflowMeta = {
+      id,
+      name: patch?.name ?? previous?.name ?? id,
+      description: patch?.description ?? previous?.description ?? '',
+      category: patch?.category ?? previous?.category ?? 'concept',
+      tags: patch?.tags ?? previous?.tags ?? [],
+      createdAt: previous?.createdAt ?? now,
+      updatedAt: now,
+      source: patch?.source ?? previous?.source ?? 'agent',
+    }
+    await writeFile(fileOf(id), `${JSON.stringify(withMeta(graph, meta), null, 2)}\n`, 'utf8')
+    return meta
+  }
+
+  async function ensure(): Promise<void> {
+    if (seeded === undefined) {
+      seeded = (async () => {
+        await mkdir(root, { recursive: true })
+        // Seed once. `listIds` doubles as the "already seeded?" check, so a user
+        // who deletes a template does not get it resurrected on every boot.
+        if ((await listIds()).length > 0) return
+        for (const template of WORKFLOW_TEMPLATES) {
+          const now = new Date().toISOString()
+          const meta: WorkflowMeta = {
+            id: template.id,
+            name: template.name,
+            description: template.description,
+            category: template.category,
+            tags: ['内置模板'],
+            createdAt: now,
+            updatedAt: now,
+            source: 'template',
+          }
+          await writeFile(fileOf(template.id), `${JSON.stringify(withMeta(templateToGraph(template), meta), null, 2)}\n`, 'utf8')
+        }
+      })()
+    }
+    return seeded
+  }
+
+  return {
+    root,
+    ensure,
+    async list(): Promise<WorkflowSummary[]> {
+      await ensure()
+      const out: WorkflowSummary[] = []
+      for (const id of await listIds()) {
+        try {
+          const { meta, graph } = await read(id)
+          const classCounts: Record<string, number> = {}
+          for (const node of graph.nodes) classCounts[node.type] = (classCounts[node.type] ?? 0) + 1
+          out.push({ id, meta, nodeCount: graph.nodes.length, classCounts })
+        } catch {
+          // A malformed file must not hide the rest of the library; it is
+          // reported as a stub the caller can surface.
+          out.push({
+            id,
+            meta: {
+              id, name: id, description: '（该文件无法解析，已跳过）', category: 'concept', tags: [],
+              createdAt: '', updatedAt: '', source: 'import',
+            },
+            nodeCount: 0,
+            classCounts: {},
+          })
+        }
+      }
+      return out.sort((a, b) => a.meta.name.localeCompare(b.meta.name))
+    },
+    read,
+    save,
+    async create(input) {
+      await ensure()
+      const base = slugFor(input.name)
+      const id = await uniqueId(base)
+      let graph: UiWorkflow
+      let source: WorkflowMeta['source'] = 'agent'
+      if (input.graph !== undefined) {
+        graph = normalizeUiWorkflow(input.graph)
+      } else if (input.from !== undefined && input.from !== '' && input.from !== 'blank') {
+        const fromTemplate = WORKFLOW_TEMPLATES.find((t) => t.id === input.from || `template:${t.id}` === input.from)
+        if (fromTemplate !== undefined) {
+          graph = templateToGraph(fromTemplate)
+          source = 'template'
+        } else {
+          const existing = await read(input.from)
+          graph = existing.graph
+          source = 'agent'
+        }
+      } else {
+        graph = { nodes: [], links: [], groups: [], config: {}, extra: {}, version: 0.4 }
+      }
+      const now = new Date().toISOString()
+      const meta: WorkflowMeta = {
+        id,
+        name: input.name,
+        description: input.description ?? '',
+        category: input.category ?? 'concept',
+        tags: [],
+        createdAt: now,
+        updatedAt: now,
+        source,
+      }
+      await mkdir(root, { recursive: true })
+      await writeFile(fileOf(id), `${JSON.stringify(withMeta(graph, meta), null, 2)}\n`, 'utf8')
+      return { id, meta }
+    },
+    async remove(id) {
+      if (!fileExists(fileOf(id))) return false
+      await rm(fileOf(id), { force: true })
+      return true
+    },
+  }
+}
+
+/** The persisted `/object_info` layout cache, so editing works with the backend down. */
+export interface LayoutCache {
+  path: string
+  load(): Promise<Record<string, WidgetSpec[]> | undefined>
+  store(layouts: Record<string, WidgetSpec[]>, backend: string): Promise<void>
+}
+
+/** Create the layout cache reader/writer. */
+export function createLayoutCache(cfg: ImagegenConfig): LayoutCache {
+  const path = `${cfg.dataRoot}/object-info.json`
+  return {
+    path,
+    async load() {
+      try {
+        const parsed = JSON.parse(await readFile(path, 'utf8')) as { layouts?: Record<string, WidgetSpec[]> }
+        const layouts = parsed.layouts
+        if (layouts === undefined || layouts === null || typeof layouts !== 'object') return undefined
+        return Object.keys(layouts).length === 0 ? undefined : layouts
+      } catch {
+        return undefined
+      }
+    },
+    async store(layouts, backend) {
+      await mkdir(cfg.dataRoot, { recursive: true })
+      await writeFile(
+        path,
+        `${JSON.stringify({ fetchedAt: new Date().toISOString(), backend, classes: Object.keys(layouts).length, layouts }, null, 2)}\n`,
+        'utf8',
+      )
+    },
+  }
 }
 
 // ─────────────────────────── model tools ───────────────────────────
