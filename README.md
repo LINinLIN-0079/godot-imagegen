@@ -350,11 +350,13 @@ image_workflow  action="patch" id="item-icon" edits=[…] to_canvas=true   # 改
 
 ```powershell
 cd D:\deepseek\my-imagegen            # 本仓库根目录
-npm test                              # = 下面五条"离线"套件（885 条；ComfyUI 开着则 907 条，见下）
+npm test                              # = 下面五条"离线"套件（889 条；ComfyUI 开着则 911 条，见下）
 node tests/test-workflow.mjs          # 62 条（ComfyUI 开着 65 条）：工作流层，含 10 个真实 ComfyUI 导出文件
 node tests/test-workflow-library.mjs  # 252 条（ComfyUI 开着 271 条）：工作流库、6 套模板、布局缓存
 node tests/test-imagegen.mjs          # 187 条（10 个工具 + REST + 真实 Python 后处理）
-node tests/test-extension.mjs         # 176 条（桥接：备份/清单/卸载/令牌/中继/心跳/零残留/真跑扩展/启动同步）
+node tests/test-extension.mjs         # 180 条（桥接：备份/清单/卸载/令牌/中继/心跳/零残留/真跑扩展/启动同步）
+node tests/test-canvas-e2e.mjs        # 39 条：端到端——用**本机真实安装的那个 .js** 走真实宿主路由，
+                                      #   跑通心跳/推送/拒绝/回执，并复现"16 秒后是否掉线"；只读
 node tests/test-render-imagegen.mjs   # 208 条（客户端面板渲染，含三态窗口、浮窗几何补丁，真的跑一遍画布中继与心跳，
                                       #   并断言 启动/停止 真的挂在面板上、点下去真的打到宿主）
 node tests/test-imagegen-live.mjs          # 29 条断言：真实 SD WebUI 端到端（后端没起时自动跳过）
@@ -369,9 +371,20 @@ node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"  
 **断言条数会随 ComfyUI 是否在跑而变化**（这是设计，不是漏测）：`test-workflow.mjs` 与
 `test-workflow-library.mjs` 在后端应答时会**顺手拿真实的 1212 类 `/object_info`** 再验一遍
 「真实工作流的 UI→API 转换」和「模板能否在本机跑」，各多出 3 条与 19 条；后端没起时它会打印
-一行 `NOTE ... skipped`，而不是假装通过。所以离线总数是 **885（后端关）→ 907（ComfyUI 开）**。
+一行 `NOTE ... skipped`，而不是假装通过。所以离线总数是 **889（后端关）→ 911（ComfyUI 开）**。
 
-后端都起着时总计 **984 条断言**（907 离线 + 29 SD WebUI + 23 ComfyUI + 25 桥接实时）。
+后端都起着时总计 **1027 条断言**（911 离线 + 39 画布端到端 + 29 SD WebUI + 23 ComfyUI + 25 桥接实时 + 8 真机副本）。
+
+**画布扩展的测试分层**（每层都跑在能跑到的最真实的一层）：
+
+| 层 | 谁在测 | 覆盖 |
+| --- | --- | --- |
+| 管理器 | `test-extension.mjs` | 备份内容、清单、令牌复用、越界拒删、既有目录不回收、零残留（含 `__pycache__`）、启动前同步、在线窗口 |
+| 宿主路由 | `test-extension.mjs` | 心跳信封、指令队列与 ack、失败上报、卸载后不再 ping、`409` 拒绝无去处的推送 |
+| 扩展本体 | `test-extension.mjs` | 把**装进 ComfyUI 的那个 .js** 丢进 `node:vm`：错 origin/错令牌/无令牌/垃圾载荷都不载入，正确信封真的调到 `app.loadGraphData`，拒绝时回 `ok:false` |
+| 面板中继 | `test-render-imagegen.mjs` | 真的跑 effect：信封以 `postMessage` 投进 iframe（targetOrigin 是 ComfyUI 源）、回包搭下一次轮询上行、心跳在**空转 tick** 上照样发出、冒充窗口的消息被丢弃 |
+| 端到端 | `test-canvas-e2e.mjs` | 真实安装的 `.js` + 真实宿主路由 + 真实工作流库：心跳→在线、推送→`loadGraphData`→回执→清队列、拒绝→错误可见、16 秒不掉线；**只读**（断言清单与扩展的 mtime 未变） |
+| 真机写路径 | `test-extension-live.mjs` | 真的写进 `D:\AKI open\` 再真的卸干净、全树扫描无残片。**已装好时自动改为对副本验证**：复制真实安装（含 `__pycache__`）到临时目录、改写清单路径后卸载，并断言真实目录与清单分毫未动 |
 
 - **离线套件**用两个真实 HTTP 服务冒充 A1111 与 ComfyUI（覆盖 `/sdapi/v1/*`、`/controlnet/model_list`、
   `/tagger/v1/*`、`/prompt`、`/history`、`/view`），并用**真实的秋叶 Python** 跑抠图与放大，

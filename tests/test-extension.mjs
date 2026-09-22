@@ -629,6 +629,15 @@ async function main() {
     messages: [{ __gig: liveManifest.token, type: 'canvas.state', state: { nodeCount: 5 } }],
   })
   assert(afterUninstall.body.accepted === 0 && afterUninstall.body.rejected.length === 1, 'once uninstalled, no canvas message is accepted')
+  // ...and an instruction with nowhere to go is refused up front, rather than
+  // queueing a graph that can never be delivered.
+  const loadAfterUninstall = await callRoute(webServer, 'POST', '/gig/canvas/load', { id: 'item-icon' })
+  assert(loadAfterUninstall.status === 409 && /还没安装/.test(loadAfterUninstall.body.note),
+    'and POST /gig/canvas/load refuses with 409 and says the bridge is not installed')
+  const pollAfterUninstall = await callRoute(webServer, 'POST', '/gig/ui/poll', {})
+  assert(pollAfterUninstall.body.canvasMessages.length === 0, 'no orphaned instruction is left queued for the canvas')
+  assert(pollAfterUninstall.body.canvasStatus.pending === 0, 'and the canvas queue depth is zero')
+  assert(pollAfterUninstall.body.canvasPing === null, 'and the poll stops carrying the heartbeat, so an uninstalled bridge is never pinged')
 
   // ── the liveness window ────────────────────────────────────────────────────
   //

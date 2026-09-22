@@ -26,11 +26,11 @@
  * Run with:  node tests/test-extension-live.mjs            (install/uninstall only)
  *            node tests/test-extension-live.mjs --serve    (also boot ComfyUI and fetch the file)
  */
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { existsSync, readdirSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import * as plugin from '../godot-imagegen.ts'
 
 let failures = 0
@@ -47,6 +47,8 @@ function assert(cond, label) {
 
 const COMFY_ROOT = process.env.GIG_COMFY_ROOT || 'D:/AKI open/ComfyUI-aki-v2'
 const COMFY_APP = join(COMFY_ROOT, 'ComfyUI').replace(/\\/g, '/')
+/** The package directory name inside custom_nodes. */
+const EXT_PKG = 'godot-imagegen-bridge'
 const COMFY_PYTHON = join(COMFY_ROOT, 'python', 'python.exe')
 const COMFY_PORT = Number(process.env.GIG_COMFY_PORT || 8188)
 const DSH_HOME = process.env.DSH_HOME || join(process.env.USERPROFILE || process.cwd(), '.dsh')
@@ -82,11 +84,12 @@ async function main() {
   // A throwaway data root keeps the live run out of the user's real plugin data
   // (their workflow library, settings and existing installed-files.json).
   const dataRoot = await mkdtemp(join(tmpdir(), 'gig-ext-live-'))
-  const manager = plugin.createExtensionManager({
+  const cfg = {
     unitName: 'godot_imagegen_live_ext',
     comfyRoot: COMFY_ROOT.replace(/\\/g, '/'),
     dataRoot,
-  })
+  }
+  const manager = plugin.createExtensionManager(cfg)
   const targetDir = manager.targetDir
   const manifestPath = join(dataRoot, 'installed-files.json')
 
@@ -98,11 +101,73 @@ async function main() {
   console.log(`INFO  ${status.detail}`)
   assert(status.sourcePresent === true, '扩展源码在本仓库里可读')
   if (existsSync(targetDir) && !existsSync(manifestPath)) {
-    console.error(`ABORT 目标目录已存在且没有安装记录：${targetDir}`)
-    console.error('       那不是本插件写的，拒绝覆盖。目录内容：')
-    for (const rel of walk(targetDir)) console.error(`         ${rel}`)
-    console.error('       确认过之后自行删除该目录再重跑（若只有 __pycache__，那是某次旧版本卸载残留的字节码）。')
-    process.exit(1)
+    // The bridge is installed FOR REAL (through the panel), and this script uses a
+    // throwaway data root, so it has no record it could prove ownership with. It
+    // must not overwrite — but the write path being unavailable does not mean the
+    // uninstall path is untestable: it can be run against a COPY of the real tree,
+    // which is where the interesting bytes are (the manifest's paths are rewritten
+    // to the copy, so nothing can reach the original).
+    const realManifestPath = join(DSH_HOME, 'godot-imagegen', 'installed-files.json')
+    const realInstall = existsSync(realManifestPath)
+    const realFilesBefore = walk(targetDir)
+    const realManifestStatBefore = realInstall ? await stat(realManifestPath) : null
+    console.log(`SKIP  写路径：目标目录已存在且本脚本没有它的安装记录（${targetDir}）`)
+    console.log(realInstall
+      ? '      看起来是通过面板正式安装的；本脚本用一次性 dataRoot，所以拒绝覆盖真实安装。'
+      : '      目录不是本插件写的，拒绝覆盖。')
+    for (const rel of realFilesBefore) console.log(`      目录内容：${rel}`)
+
+    if (realInstall) {
+      console.log('\n—— 用真实安装的副本验证「一键卸载不留残留」（不碰真实目录）——')
+      const shadowRoot = await mkdtemp(join(tmpdir(), 'gig-ext-shadow-'))
+      const shadowData = join(shadowRoot, 'data')
+      await mkdir(shadowData, { recursive: true })
+      const realManifest = JSON.parse(await readFile(realManifestPath, 'utf8'))
+      const shadowComfy = join(shadowRoot, 'ComfyUI-aki-v2')
+      const shadowTarget = join(shadowComfy, 'ComfyUI', 'custom_nodes', EXT_PKG).replace(/\\/g, '/')
+      // Copy the installed tree byte-for-byte (the .pyc ComfyUI generated included),
+      // then rewrite the record so every path points inside the copy: nothing the
+      // uninstall does can reach the original.
+      for (const rel of realFilesBefore) {
+        const destination = join(shadowTarget, rel)
+        await mkdir(dirname(destination), { recursive: true })
+        await copyFile(join(targetDir, rel), destination)
+      }
+      const expectedPyc = realFilesBefore.filter((rel) => rel.includes('__pycache__')).length
+      // Both the recorded paths AND the target dir must be normalized before the
+      // swap: install() records `join()` results (backslashes on Windows) while
+      // the directory list carries forward slashes, so a naive replace silently
+      // leaves the paths pointing at the ORIGINAL install — which the uninstall
+      // then correctly refuses as "outside the target directory".
+      const normalizedTarget = targetDir.replace(/\\/g, '/')
+      const rewrite = (p) => String(p).replace(/\\/g, '/').replace(normalizedTarget, shadowTarget)
+      const shadowManifest = {
+        ...realManifest,
+        comfyRoot: shadowComfy.replace(/\\/g, '/'),
+        files: realManifest.files.map((f) => ({ ...f, path: rewrite(f.path) })),
+        directories: realManifest.directories.map(rewrite),
+      }
+      await writeFile(join(shadowData, 'installed-files.json'), `${JSON.stringify(shadowManifest, null, 2)}\n`, 'utf8')
+
+      const shadow = plugin.createExtensionManager({ ...cfg, comfyRoot: shadowComfy.replace(/\\/g, '/'), dataRoot: shadowData })
+      const result = await shadow.uninstall()
+      assert(result.reason === 'ok', `对真实安装的副本卸载干净（${result.detail}）`)
+      assert(result.removed.length === realManifest.files.length, `删除了记录里的 ${realManifest.files.length} 个文件`)
+      assert(result.derived.length === expectedPyc, `ComfyUI 生成的 ${expectedPyc} 个字节码缓存也一并清掉（实得 ${result.derived.length}）`)
+      assert(!existsSync(shadowTarget), '副本目录整个消失，没有残留')
+      assert(result.leftovers.length === 0, '也没有任何非本插件文件被误删或遗留')
+      const realFilesAfter = walk(targetDir)
+      assert(realFilesAfter.join('|') === realFilesBefore.join('|'), '而真实安装目录一个文件都没动')
+      const realManifestStatAfter = await stat(realManifestPath)
+      assert(realManifestStatAfter.mtimeMs === realManifestStatBefore.mtimeMs && realManifestStatAfter.size === realManifestStatBefore.size,
+        '真实清单的 mtime 与大小原样保留')
+      await rm(shadowRoot, { recursive: true, force: true })
+    } else {
+      console.error('       确认过之后自行删除该目录再重跑（若只有 __pycache__，那是某次旧版本卸载残留的字节码）。')
+    }
+
+    console.log(`\n${passes} passed, ${failures} failed`)
+    process.exit(failures === 0 ? 0 : 1)
   }
 
   let startedByUs = false

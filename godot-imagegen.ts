@@ -4405,8 +4405,13 @@ export function createExtensionManager(cfg: ImagegenConfig, sourceOverride?: str
       const files: InstalledFile[] = []
       const now = new Date().toISOString()
       for (const [target, text] of wanted) {
-        await writeFile(join(targetDir, target), text, 'utf8')
-        files.push({ path: join(targetDir, target), pkg: EXTENSION_PACKAGE, installedAt: now })
+        const installedPath = join(targetDir, target).replace(/\\/g, '/')
+        await writeFile(installedPath, text, 'utf8')
+        // Recorded normalized, so the manifest is internally consistent (the
+        // directory list is normalized too) and a reader can compare paths with
+        // the config they came from without remembering which separator join()
+        // happened to pick on this platform.
+        files.push({ path: installedPath, pkg: EXTENSION_PACKAGE, installedAt: now })
       }
       // Only count directories this plugin actually brought into existence.
       const directories = wantedDirs.filter((dir) => !existedBefore.has(dir) || previous?.directories.includes(dir) === true)
