@@ -334,12 +334,12 @@ image_workflow  action="patch" id="item-icon" edits=[…] to_canvas=true   # 改
 
 ```powershell
 cd D:\deepseek\my-imagegen            # 本仓库根目录
-npm test                              # = 下面五条离线套件（842 条断言）
+npm test                              # = 下面五条离线套件（844 条断言）
 node tests/test-workflow.mjs          # 62 条断言（工作流层，含真实 ComfyUI 导出文件）
 node tests/test-workflow-library.mjs  # 252 条断言（工作流库、6 套模板、布局缓存）
 node tests/test-imagegen.mjs          # 187 条断言（10 个工具 + REST + 真实 Python 后处理）
 node tests/test-extension.mjs         # 161 条断言（桥接：备份/清单/卸载/令牌/中继/零残留/真跑扩展/启动同步）
-node tests/test-render-imagegen.mjs   # 180 条断言（客户端面板渲染，含三态窗口、浮窗几何补丁，并真的跑一遍画布中继）
+node tests/test-render-imagegen.mjs   # 182 条断言（客户端面板渲染，含三态窗口、浮窗几何补丁，并真的跑一遍画布中继）
 node tests/test-imagegen-live.mjs          # 29 条断言：真实 SD WebUI 端到端（后端没起时自动跳过）
 node tests/test-imagegen-live-comfy.mjs    # 23 条断言：真实 ComfyUI 端到端，含真跑内置模板（没起时跳过）
 node tests/test-extension-live.mjs         # 17 条断言：真实 ComfyUI 安装→卸载→零残留
@@ -349,7 +349,7 @@ node --check lib/client.js
 node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"   # 技能 frontmatter / 行尾校验
 ```
 
-后端都起着时总计 **919 条断言**（842 离线 + 29 SD WebUI + 23 ComfyUI + 25 桥接实时）。
+后端都起着时总计 **921 条断言**（844 离线 + 29 SD WebUI + 23 ComfyUI + 25 桥接实时）。
 
 - **离线套件**用两个真实 HTTP 服务冒充 A1111 与 ComfyUI（覆盖 `/sdapi/v1/*`、`/controlnet/model_list`、
   `/tagger/v1/*`、`/prompt`、`/history`、`/view`），并用**真实的秋叶 Python** 跑抠图与放大，
@@ -371,6 +371,15 @@ node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"  
   桥接的实时套件则真的写进 `D:\AKI open\ComfyUI-aki-v2`，再真的卸干净并全树扫描确认无残片。
   `--serve` 只有在"先安装、再由它启动 ComfyUI"的顺序下才能验证「ComfyUI 把扩展 serve 出来」——
   它会自己启动、自己关掉；发现 ComfyUI 已经开着时**跳过**这两项并说明原因，而不是假装失败或假装通过。
+
+**已实测的关键前提**（用浏览器实际会发的请求头打真实 ComfyUI）：
+
+| 请求 | 结果 | 含义 |
+| --- | --- | --- |
+| iframe 导航到 `:8188/`（`sec-fetch-site: cross-site` + DSH referer） | **200**，无 `X-Frame-Options`、无 CSP | 画布**可以**被内嵌 |
+| 从 DSH 页取 `:8188/extensions/...`（无 `Origin`） | 200（装好后）/ 404（没装） | 扩展脚本**能**在页面里加载 |
+| 从 DSH 页 `fetch(':8188/...')`（带 `Origin: DSH`） | **403**（`origin_only_middleware`） | 面板**不能**直接跟 ComfyUI 说话——所以工作流层必须走宿主 |
+| 画布内部同源 API 调用 | 200 | 画布自身功能正常 |
 
 ## 11. 已知限制
 

@@ -746,7 +746,11 @@ assert(lastPoll.inbound[0].state.nodeCount === 9 && lastPoll.inbound[0].state.ti
 assert(!JSON.stringify(lastPoll.inbound).includes('spoofed'), 'a message from another window is dropped, not relayed')
 
 const bridgeCard = renderTree(React.createElement(plugin.BridgeCard, {
-  bridge: { installed: true, files: 2, detail: '已安装到 …', canvas: { online: true, nodeCount: 9, title: 'item-icon', missingClasses: ['SomeCustomNode'] } },
+  bridge: {
+    installed: true, files: 2, detail: '已安装到 …', targetDir: 'D:/AKI open/…/godot-imagegen-bridge',
+    canvas: { online: true, nodeCount: 9, title: 'item-icon', missingClasses: ['SomeCustomNode'] },
+    errors: [{ at: '2026-09-22T13:00:00.000Z', seq: 'ui_9', error: 'loadGraphData 炸了' }],
+  },
   busy: false, canPush: true, onInstall() {}, onUninstall() {}, onPush() {}, onRefresh() {},
 }))
 assert(bridgeCard.includes('扩展已安装'), 'BridgeCard reports an installed extension')
@@ -754,6 +758,9 @@ assert(bridgeCard.includes('画布已连接'), 'and a canvas that is answering')
 assert(bridgeCard.includes('9 个节点'), 'with what the canvas reports')
 assert(bridgeCard.includes('item-icon'), 'including the workflow it is editing')
 assert(bridgeCard.includes('SomeCustomNode'), 'and warns about node classes this ComfyUI does not have')
+assert(bridgeCard.includes('画布拒绝了最近 1 次载入') && bridgeCard.includes('loadGraphData 炸了'),
+  'and surfaces a graph the canvas refused, instead of a push that silently did nothing')
+assert(bridgeCard.includes('godot-imagegen-bridge'), 'and names the directory it writes into')
 const bridgeOffline = renderTree(React.createElement(plugin.BridgeCard, {
   bridge: { installed: true, files: 2, detail: '已安装', stale: true, canvas: { online: false } },
   busy: false, canPush: false, onInstall() {}, onUninstall() {}, onPush() {}, onRefresh() {},
