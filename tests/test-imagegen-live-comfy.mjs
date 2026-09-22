@@ -71,6 +71,29 @@ function makeStorageBackend() {
 const byName = (list, name) => list.find((tool) => tool.name === name)
 const exec = (tool, args) => tool.execute(args, { signal: { aborted: false } })
 
+// ── a minimal host for the /gig routes, so the panel's own paths are covered ──
+
+function makeWebServer() {
+  const routes = []
+  return { routes, register(opts) { routes.push(opts); return () => {} } }
+}
+async function callRoute(webServer, method, pathname, body) {
+  const route = webServer.routes.find((r) => r.path === '/gig')
+  const captured = {}
+  const res = {
+    writeHead(status, headers) { captured.status = status; captured.headers = headers },
+    end(payload) { captured.body = payload },
+  }
+  await route.handler({
+    method,
+    url: pathname,
+    async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify(body ?? {}), 'utf8') },
+  }, res)
+  let parsed = null
+  if (typeof captured.body === 'string') { try { parsed = JSON.parse(captured.body) } catch { parsed = captured.body } }
+  return { status: captured.status, body: parsed }
+}
+
 async function listening(port) {
   try {
     const controller = new AbortController()
@@ -99,11 +122,15 @@ async function main() {
 
   const registered = []
   const disposers = []
+  const webServer = makeWebServer()
   const ctx = {
     tools: { register(definition) { registered.push(definition); return () => {} } },
     storage: { backend: makeStorageBackend() },
-    get() { return undefined },
-    inject() { return () => {} },
+    get(name) { return name === 'webServer' ? webServer : undefined },
+    inject(deps, callback) {
+      if (deps.includes('webServer')) callback(Object.assign(Object.create(ctx), { webServer }))
+      return () => {}
+    },
     effect(callback) {
       const cleanup = callback()
       if (typeof cleanup === 'function') disposers.push(cleanup)
@@ -115,6 +142,9 @@ async function main() {
     comfyPort: COMFY_PORT,
     sdwebuiPort: SD_PORT,
     godotProject,
+    // A throwaway data root: this suite must not touch the user's real workflow
+    // library (the plugin seeds one on first use).
+    dataRoot: join(workRoot, 'data'),
     defaultBackend: 'comfyui',
     requestTimeoutMs: 30 * 60 * 1000,
   })
@@ -274,6 +304,35 @@ async function main() {
   assert(patchedBytes.length > 20_000, 'the patched template really re-rendered on the server')
 
   await rm(libDir, { recursive: true, force: true }).catch(() => undefined)
+
+  // ── real step progress over ComfyUI's WebSocket ──
+  //
+  // The frames are parsed from ComfyUI's own /ws, so this is the one place that can
+  // prove the REAL frame shapes match what the plugin expects (the offline suite
+  // feeds it synthetic ones). It drives the panel's own route and watches the JOB,
+  // because the job message is the only thing the user ever sees.
+  {
+    console.log('\n— ComfyUI 执行进度（真实 WebSocket）—')
+    const started = await callRoute(webServer, 'POST', '/gig/workflow/run', { id: 'sd15-basic', category: 'concept', projectId: 'progress' })
+    assert(typeof started.body.jobId === 'string', 'the canvas route starts a real ComfyUI run')
+    const seen = []
+    const deadline = Date.now() + 4 * 60 * 1000
+    let job
+    while (Date.now() < deadline) {
+      job = (await callRoute(webServer, 'GET', '/gig/jobs')).body.jobs.find((j) => j.id === started.body.jobId)
+      if (job !== undefined && (seen.length === 0 || seen[seen.length - 1] !== job.message)) seen.push(job.message)
+      if (job !== undefined && job.status !== 'running') break
+      await new Promise((r) => setTimeout(r, 250))
+    }
+    assert(job !== undefined && job.status === 'done', `the run completed on the real server (${job && job.status})`)
+    const sampling = seen.filter((m) => /采样 \d+\/\d+/.test(m))
+    const nodeFrames = seen.filter((m) => /执行节点 \d+\/\d+|开始执行/.test(m))
+    for (const message of seen) console.log(`  · ${message}`)
+    assert(nodeFrames.length > 0, `real ComfyUI frames produced a node counter (${nodeFrames[0] ?? '—'})`)
+    assert(sampling.length > 0, `and a real step counter (${sampling[0] ?? '—'} … ${sampling[sampling.length - 1] ?? '—'})`)
+    assert(sampling.some((m) => /剩余约 \d+s/.test(m)), 'with our own remaining-time estimate')
+    assert(seen[seen.length - 1].includes('完成'), 'and the run ends with the completion message')
+  }
 
   console.log(`\n— 实测 —\n  txt2img 512²/12 步 : ${secs(ms)}\n  img2img 512²/12 步 : ${secs(editMs)}\n  模板 sd15-basic    : ${secs(basicMs)}`)
   console.log(`  (产物保留在 ${workRoot})`)

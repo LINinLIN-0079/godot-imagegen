@@ -450,6 +450,7 @@ try {
     jobs: [
       { id: 'job_1', kind: 'generate', label: '文生图 · potion', status: 'running', progress: 0.42, message: '采样 12/28，剩余约 5s', preview: 'data:image/png;base64,AAAA', startedAt: '2026-01-01T00:00:00Z' },
       { id: 'job_2', kind: 'cutout', label: '抠图 · potion', status: 'error', progress: null, message: 'rembg failed', error: 'rembg failed', images: [], startedAt: '2026-01-01T00:00:00Z' },
+      { id: 'job_3', kind: 'generate', label: '工作流 · sdxl', status: 'running', progress: 0.2, message: '采样 4/20，剩余约 90s', advisory: '⚠ 这张卡只有 8GB 显存…会逐步换页', images: [], startedAt: '2026-01-01T00:00:00Z' },
     ],
     onCancel() {},
   }))
@@ -461,6 +462,11 @@ assert(jobsText.includes('文生图 · potion'), 'JobsStrip renders the job labe
 assert(jobsText.includes('采样 12/28'), 'JobsStrip renders the live progress message')
 assert(jobsText.includes('rembg failed'), 'JobsStrip renders the failure message')
 assert(jobsText.includes('取消'), 'JobsStrip renders a cancel control for running jobs')
+// The warning is its own line because a message would be overwritten by the next
+// progress update within milliseconds — a warning nobody can read is not a warning.
+assert(jobsText.includes('8GB 显存') && jobsText.includes('会逐步换页'),
+  'JobsStrip shows a run advisory for the whole render')
+assert(jobsText.includes('采样 4/20'), 'and keeps the live progress message beside it')
 
 // Lightbox — the full detail overlay including one-click asset registration.
 let boxText = ''

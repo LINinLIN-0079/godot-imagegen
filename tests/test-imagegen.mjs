@@ -205,8 +205,40 @@ function startFakeA1111(port, requests) {
 
 // ─────────────────────────── fake ComfyUI backend ───────────────────────────
 
+/**
+ * How many /history polls a fake ComfyUI run stays unfinished for. Zero (default)
+ * completes immediately; a positive value lets a test observe what the JOB reports
+ * while a render is still running — the only thing the user ever sees.
+ */
+let fakeComfyHoldPolls = 0
+
+/** Every WebSocket the plugin opened, with a handle to feed it frames. */
+const fakeSockets = []
+class FakeWebSocket {
+  constructor(url) {
+    this.url = url
+    this.handlers = {}
+    this.closed = false
+    fakeSockets.push(this)
+  }
+  addEventListener(type, listener) {
+    if (this.handlers[type] === undefined) this.handlers[type] = []
+    this.handlers[type].push(listener)
+  }
+  close() { this.closed = true }
+  /** Deliver one ComfyUI frame, exactly as the real socket would. */
+  emit(message) {
+    for (const listener of this.handlers.message ?? []) listener({ data: JSON.stringify(message) })
+  }
+  /** Deliver a frame that is not even valid JSON. */
+  emitRaw(text) {
+    for (const listener of this.handlers.message ?? []) listener({ data: text })
+  }
+}
+
 function startFakeComfy(port, requests) {
   const history = new Map()
+  const pending = new Map()
   const server = createServer(async (req, res) => {
     const chunks = []
     for await (const chunk of req) chunks.push(chunk)
@@ -217,7 +249,14 @@ function startFakeComfy(port, requests) {
       res.end(JSON.stringify(value))
     }
     const url = req.url.split('?')[0]
-    if (req.method === 'GET' && url === '/system_stats') return json({ system: { comfyui_version: 'test' } })
+    if (req.method === 'GET' && url === '/system_stats') {
+      // A real card's shape: the plugin reads vram_total to warn before a run that
+      // would page (8 GB here, like the machine this was written on).
+      return json({
+        system: { comfyui_version: 'test' },
+        devices: [{ name: 'cuda:0', vram_total: 8_500_000_000, vram_free: 8_000_000_000 }],
+      })
+    }
     if (req.method === 'GET' && url === '/object_info/CheckpointLoaderSimple') {
       return json({ CheckpointLoaderSimple: { input: { required: { ckpt_name: [['anything-v5.safetensors']] } } } })
     }
@@ -264,15 +303,27 @@ function startFakeComfy(port, requests) {
       return json({ UpscaleModelLoader: { input: { required: { model_name: [['RealESRGAN_x4plus_anime_6B.pth', '4x-AnimeSharp.pth']] } } } })
     }
     if (req.method === 'POST' && url === '/prompt') {
-      const id = 'prompt-' + (history.size + 1)
-      history.set(id, {
+      const id = 'prompt-' + (history.size + pending.size + 1)
+      const result = {
         outputs: { '9': { images: [{ filename: 'ComfyUI_test.png', subfolder: '', type: 'output' }] } },
         status: { status_str: 'success', completed: true },
-      })
+      }
+      // Held runs stay "not in /history yet" for N polls, which is what a real
+      // render looks like from the REST side: nothing to report until it ends.
+      if (fakeComfyHoldPolls > 0) pending.set(id, { result, pollsLeft: fakeComfyHoldPolls })
+      else history.set(id, result)
       return json({ prompt_id: id })
     }
     if (req.method === 'GET' && url.startsWith('/history/')) {
       const id = url.slice('/history/'.length)
+      const held = pending.get(id)
+      if (held !== undefined) {
+        held.pollsLeft -= 1
+        if (held.pollsLeft > 0) return json({})
+        pending.delete(id)
+        history.set(id, held.result)
+        return json({ [id]: held.result })
+      }
       return json(history.has(id) ? { [id]: history.get(id) } : {})
     }
     if (req.method === 'GET' && url === '/view') {
@@ -1105,6 +1156,116 @@ async function main() {
     'and its output is filed as a normal asset with a res:// path')
   const badRun = await callRoute(webServer, 'POST', '/gig/workflow/run', { id: 'does-not-exist' })
   assert(badRun.status === 400, 'running a missing workflow over REST is a 400')
+
+  // ── ComfyUI step progress over the WebSocket ──
+  //
+  // The REST API has no step counter, so before this the job said nothing but
+  // "ComfyUI 执行中（Ns）" for the whole render — which is how a 13-minute SDXL run
+  // looked frozen to the user. ComfyUI's own UI reads these frames from /ws.
+  {
+    const realWebSocket = globalThis.WebSocket
+    globalThis.WebSocket = FakeWebSocket
+    fakeComfyHoldPolls = 3
+    const socketsBefore = fakeSockets.length
+    const started = await callRoute(webServer, 'POST', '/gig/workflow/run', { id: 'sd15-basic', category: 'concept', projectId: 'progress' })
+    await new Promise((r) => setTimeout(r, 400))
+    const socket = fakeSockets[socketsBefore]
+    assert(socket !== undefined, 'a ComfyUI run opens a progress socket')
+    assert(/\/ws\?clientId=/.test(socket.url), `keyed by the client id it sent with /prompt (${socket.url})`)
+
+    const jobMessage = async () => {
+      const jobs = await callRoute(webServer, 'GET', '/gig/jobs')
+      const job = jobs.body.jobs.find((j) => j.id === started.body.jobId)
+      return job === undefined ? undefined : { message: job.message, progress: job.progress }
+    }
+
+    socket.emit({ type: 'execution_start', data: { prompt_id: 'p' } })
+    socket.emit({ type: 'executing', data: { node: '4' } })
+    const executing = await jobMessage()
+    assert(executing !== undefined && /执行节点 1\/7/.test(executing.message),
+      `an executing frame becomes a node counter the user can watch (${executing && executing.message})`)
+
+    socket.emit({ type: 'progress', data: { value: 3, max: 12 } })
+    const sampling = await jobMessage()
+    assert(sampling !== undefined && /采样 3\/12/.test(sampling.message), `a progress frame becomes a step counter (${sampling && sampling.message})`)
+    assert(sampling !== undefined && sampling.progress === 0.25, `and a real 0..1 ratio for the progress bar (${sampling && sampling.progress})`)
+    assert(sampling !== undefined && /剩余约 \d+s/.test(sampling.message), 'with our own remaining-time estimate')
+
+    socket.emit({ type: 'progress', data: { value: 6, max: 12 } })
+    const later = await jobMessage()
+    assert(later !== undefined && /采样 6\/12/.test(later.message), 'and it keeps up as the render advances')
+
+    // Frames the plugin does not understand (or cannot parse) must be ignored, not
+    // thrown: a progress socket must never be able to break a render.
+    socket.emit({ type: 'progress', data: { value: 'nan', max: 12 } })
+    socket.emit({ type: 'progress', data: {} })
+    socket.emitRaw('this is not json')
+    socket.emit({ type: 'unknown-frame', data: {} })
+    const stillFine = await jobMessage()
+    assert(stillFine !== undefined && /采样 6\/12/.test(stillFine.message), 'junk frames change nothing and break nothing')
+
+    // Let the held run finish, then check the socket is closed with it.
+    const deadline = Date.now() + 15_000
+    let finished = null
+    while (Date.now() < deadline) {
+      const jobs = await callRoute(webServer, 'GET', '/gig/jobs')
+      finished = jobs.body.jobs.find((j) => j.id === started.body.jobId)
+      if (finished !== undefined && finished.status !== 'running') break
+      await new Promise((r) => setTimeout(r, 300))
+    }
+    assert(finished !== null && finished.status === 'done', `the run still completes normally (${finished && finished.status})`)
+    assert(socket.closed === true, 'and the progress socket is closed when the run ends, so nothing leaks')
+    globalThis.WebSocket = realWebSocket
+    fakeComfyHoldPolls = 0
+  }
+
+  // ── the VRAM advisory ──
+  //
+  // The measured cliff on an 8 GB card: SDXL at 0.88 MP took 80s for 10 steps, and
+  // at 1.01 MP did not finish in 13 minutes. Waiting 13 minutes to discover that is
+  // the failure mode, so the warning has to arrive BEFORE the run and be visible
+  // while it runs.
+  {
+    const big = await exec(workflowTool, { action: 'run', id: 'sdxl-basic', category: 'character', project_id: 'vram' })
+    assert(big.images.length === 1 && big.images[0].resPath !== undefined, 'an SDXL workflow still runs')
+    assert(/8GB 显存/.test(big.note), `and the result carries the VRAM warning (${String(big.note).split('\n').pop()})`)
+    assert(/1\.01MP/.test(big.note) && /换页/.test(big.note), 'naming the exact canvas size and what happens to it')
+    assert(/降到 ≤0\.9MP/.test(big.note), 'and what to do about it')
+
+    // The panel-side path: the warning must be in the job while it runs. The run is
+    // held open for a few polls because the point is what the panel shows DURING a
+    // render (an instant fake would finish before the warning could be read).
+    fakeComfyHoldPolls = 4
+    const started = await callRoute(webServer, 'POST', '/gig/workflow/run', { id: 'sdxl-basic', category: 'character', projectId: 'vram' })
+    let liveJob
+    const warnedBy = Date.now() + 900
+    while (Date.now() < warnedBy) {
+      liveJob = (await callRoute(webServer, 'GET', '/gig/jobs')).body.jobs.find((j) => j.id === started.body.jobId)
+      if (liveJob !== undefined && /8GB 显存/.test(liveJob.message)) break
+      await new Promise((r) => setTimeout(r, 40))
+    }
+    assert(liveJob !== undefined && /8GB 显存/.test(String(liveJob.advisory)),
+      'the panel gets the advisory as its OWN field, so it survives the progress updates that overwrite the message')
+    assert(liveJob !== undefined && !/8GB 显存/.test(liveJob.message),
+      `while the message carries the live progress (${liveJob && liveJob.message.slice(0, 30)}…)`)
+    const deadline2 = Date.now() + 15_000
+    while (Date.now() < deadline2) {
+      const j = (await callRoute(webServer, 'GET', '/gig/jobs')).body.jobs.find((x) => x.id === started.body.jobId)
+      if (j !== undefined && j.status !== 'running') break
+      await new Promise((r) => setTimeout(r, 300))
+    }
+
+    // The control: an SD1.5 workflow at 512² must stay quiet, or the warning is noise.
+    const small = await exec(workflowTool, { action: 'run', id: 'sd15-basic', category: 'concept', project_id: 'vram' })
+    assert(small.images.length === 1, 'an SD1.5 workflow runs')
+    assert(!/显存/.test(small.note), `and gets no VRAM warning at all (${String(small.note).split('\n').pop()})`)
+    const smallStarted = await callRoute(webServer, 'POST', '/gig/workflow/run', { id: 'sd15-basic', category: 'concept', projectId: 'vram' })
+    const smallJob = (await callRoute(webServer, 'GET', '/gig/jobs')).body.jobs.find((j) => j.id === smallStarted.body.jobId)
+    assert(smallJob !== undefined && !/显存/.test(smallJob.message), 'nor in its job message')
+    assert(smallJob !== undefined && smallJob.advisory === null, 'and no advisory is attached to it')
+    fakeComfyHoldPolls = 0
+    await new Promise((r) => setTimeout(r, 600))
+  }
 
   // ── P1: persistence across a plugin restart ──
   assert(disposers.length >= 2, 'the plugin registers disposers for its jobs and storage unit')

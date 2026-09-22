@@ -144,6 +144,11 @@ interface Job {
   message: string
   /** Live preview as a base64 PNG, when the backend provides one. */
   preview?: string
+  /**
+   * A warning raised before the work started (e.g. "this canvas will page on an
+   * 8GB card"). Kept on the job so the panel and the tools can both surface it.
+   */
+  advisory?: string
   images: GalleryImage[]
   error?: string
   startedAt: string
@@ -477,6 +482,24 @@ function isInside(parent: string, child: string): boolean {
   const a = resolve(parent).replace(/[\\/]+$/, '').toLowerCase()
   const b = resolve(child).replace(/[\\/]+$/, '').toLowerCase()
   return b === a || b.startsWith(a + sep) || b.startsWith(a + '/')
+}
+
+/**
+ * The literal value of one node input in an API-format graph, or undefined.
+ *
+ * API graphs carry `{ "<id>": { class_type, inputs } }`, and an input is either a
+ * literal or a `[nodeId, slot]` link — links are skipped, because "- it is wired to
+ * something" is not an answer to "what size will this render at".
+ */
+function literalInput(graph: Record<string, unknown>, classType: string, key: string): unknown {
+  for (const node of Object.values(graph)) {
+    const candidate = node as { class_type?: unknown; inputs?: Record<string, unknown> }
+    if (candidate.class_type !== classType) continue
+    const value = candidate.inputs?.[key]
+    if (value === undefined || Array.isArray(value)) continue
+    return value
+  }
+  return undefined
 }
 
 /** A compact, human-readable size. */
@@ -1683,6 +1706,138 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
   }
 
   /** Run a ComfyUI graph and fetch every image it produced. */
+  /**
+   * Step progress for a ComfyUI run, read from ComfyUI's WebSocket.
+   *
+   * The REST API exposes no step counter, so before this a long SDXL render
+   * reported nothing but "执行中（Ns）" — indistinguishable from a freeze, which is
+   * exactly how a 13-minute render looked to the user. ComfyUI's own frontend gets
+   * its progress bar from `/ws`, and those messages are keyed by the `client_id`
+   * we already send with `/prompt`.
+   *
+   * Best effort by design: no WebSocket, a failed connection, or a malformed frame
+   * all degrade to the elapsed-seconds message. Progress must never be able to
+   * break a render.
+   */
+  function openComfyProgress(
+    clientId: string,
+    totalNodes: number,
+    onProgress: ProgressFn | undefined,
+    signal: AbortSignal | undefined,
+  ): { close: () => void } | undefined {
+    if (onProgress === undefined) return undefined
+    // Structural view of the browser/undici WebSocket: enough for what is used
+    // here, and swapped for a fake in tests without depending on DOM lib types.
+    interface WsLike {
+      addEventListener(type: string, listener: (event: { data?: unknown }) => void): void
+      close(): void
+    }
+    const Ws = (globalThis as unknown as { WebSocket?: new (url: string) => WsLike }).WebSocket
+    if (Ws === undefined) return undefined
+    let socket: WsLike
+    try {
+      socket = new Ws(`ws://127.0.0.1:${cfg.comfyPort}/ws?clientId=${encodeURIComponent(clientId)}`)
+    } catch {
+      return undefined
+    }
+    let closed = false
+    let executed = 0
+    let firstStepAt: number | undefined
+    let previousStep = 0
+    const onMessage = (event: { data?: unknown }): void => {
+      if (closed || typeof event.data !== 'string') return
+      let message: { type?: unknown; data?: Record<string, unknown> }
+      try {
+        message = JSON.parse(event.data) as { type?: unknown; data?: Record<string, unknown> }
+      } catch {
+        return
+      }
+      try {
+        const data = message.data ?? {}
+        if (message.type === 'progress') {
+          const value = typeof data.value === 'number' ? data.value : undefined
+          const max = typeof data.max === 'number' ? data.max : undefined
+          if (value === undefined || max === undefined || max <= 0) return
+          // Our own remaining-time estimate, for the same reason as the SD WebUI
+          // path: the backend gives a step count, not a duration.
+          if (value < previousStep) firstStepAt = undefined
+          previousStep = value
+          let eta = ''
+          if (value > 0) {
+            firstStepAt ??= Date.now()
+            const perStep = (Date.now() - firstStepAt) / 1000 / value
+            eta = `，剩余约 ${Math.max(1, Math.round(perStep * (max - value)))}s`
+          } else {
+            eta = '（正在准备，换模型时这一步会久一些）'
+          }
+          onProgress(clamp(value / max, 0, 1), `采样 ${value}/${max}${eta}`)
+          return
+        }
+        if (message.type === 'executing') {
+          const node = data.node
+          if (typeof node === 'string' && node !== '') {
+            executed += 1
+            onProgress(undefined, `执行节点 ${Math.min(executed, totalNodes)}/${totalNodes}`)
+          }
+          return
+        }
+        if (message.type === 'execution_start') {
+          onProgress(undefined, `开始执行（共 ${totalNodes} 个节点）`)
+        }
+      } catch {
+        // A progress message must never be able to fail the render that produced it.
+      }
+    }
+    try {
+      socket.addEventListener('message', onMessage)
+      socket.addEventListener('error', () => undefined)
+    } catch {
+      return undefined
+    }
+    const onAbort = (): void => { close() }
+    const close = (): void => {
+      if (closed) return
+      closed = true
+      signal?.removeEventListener('abort', onAbort)
+      try {
+        socket.close()
+      } catch {
+        /* already gone */
+      }
+    }
+    signal?.addEventListener('abort', onAbort)
+    return { close }
+  }
+
+  /**
+   * Warn BEFORE a run this machine cannot do at speed.
+   *
+   * Measured on the 8 GB card here: an SDXL workflow at 1152×768 (0.88 MP) took 80
+   * seconds for 10 steps, while the SAME model at 1216×832 (1.01 MP) did not finish
+   * in 13 minutes — a 13% larger canvas crossed the point where the weights plus the
+   * activations no longer fit, and every step began paging. Saying so up front (in
+   * the job, while it runs, and in the result) is the difference between waiting and
+   * concluding it hung.
+   */
+  async function comfyVramAdvisory(graph: Record<string, unknown>): Promise<string | undefined> {
+    const checkpoint = literalInput(graph, 'CheckpointLoaderSimple', 'ckpt_name')
+    if (typeof checkpoint !== 'string' || !/xl|sdxl|illustrious|sd_xl/i.test(checkpoint)) return undefined
+    const width = literalInput(graph, 'EmptyLatentImage', 'width')
+    const height = literalInput(graph, 'EmptyLatentImage', 'height')
+    if (typeof width !== 'number' || typeof height !== 'number') return undefined
+    const pixels = width * height
+    if (pixels <= 900_000) return undefined
+    const stats = (await probeJson(`${comfyBase}/system_stats`, 4000)) as
+      | { devices?: Array<{ vram_total?: number }> }
+      | undefined
+    const total = stats?.devices?.[0]?.vram_total
+    if (typeof total !== 'number' || total <= 0) return undefined
+    const gb = total / 1024 ** 3
+    if (gb >= 12) return undefined
+    return `⚠ 这张卡只有 ${gb.toFixed(0)}GB 显存，而 ${checkpoint} 在 ${width}×${height}（${(pixels / 1e6).toFixed(2)}MP）上会超显存并逐步换页：`
+      + '本机实测 0.88MP 时 10 步 80 秒，1.01MP 时 13 分钟都没跑完。建议降到 ≤0.9MP、换 SD1.5，或分张出图再拼。'
+  }
+
   async function comfyRun(params: {
     graph: Record<string, unknown>
     signal?: AbortSignal
@@ -1701,48 +1856,55 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
     }
     const deadline = Date.now() + cfg.requestTimeoutMs
     const started = Date.now()
-    while (Date.now() < deadline) {
-      if (params.signal?.aborted === true) {
-        await postJsonVoid(`${comfyBase}/interrupt`, {}, 5000).catch(() => undefined)
-        throw new Error('cancelled')
-      }
-      const history = (await probeJson(`${comfyBase}/history/${promptId}`, 8000)) as
-        | Record<string, { outputs?: Record<string, { images?: Array<{ filename: string; subfolder: string; type: string }>; status?: string }>; status?: { status_str?: string; completed?: boolean } }>
-        | undefined
-      const entry = history?.[promptId]
-      if (entry !== undefined) {
-        if (entry.status?.status_str === 'error' || entry.status?.completed === false) {
-          throw new Error(`ComfyUI 执行失败：${entry.status?.status_str ?? 'unknown'}`)
+    // ComfyUI reports step progress only over its WebSocket; the REST poll below
+    // stays the source of truth for completion.
+    const progress = openComfyProgress(clientId, Object.keys(params.graph).length, params.onProgress, params.signal)
+    try {
+      while (Date.now() < deadline) {
+        if (params.signal?.aborted === true) {
+          await postJsonVoid(`${comfyBase}/interrupt`, {}, 5000).catch(() => undefined)
+          throw new Error('cancelled')
         }
-        const refs: Array<{ filename: string; subfolder: string; type: string }> = []
-        for (const output of Object.values(entry.outputs ?? {})) {
-          for (const image of output.images ?? []) refs.push(image)
-        }
-        // A workflow that finished successfully but saved nothing (no SaveImage /
-        // PreviewImage node) would otherwise keep this loop spinning until the
-        // 30-minute timeout. Say so now instead.
-        if (refs.length === 0 && entry.status?.completed === true) {
-          throw new Error('ComfyUI 执行完成但没有产出任何图片：这个工作流没有 SaveImage / PreviewImage 这类输出节点。请加一个保存节点再运行。')
-        }
-        if (refs.length > 0) {
-          const out: BackendImage[] = []
-          for (const ref of refs) {
-            const url = `${comfyBase}/view?filename=${encodeURIComponent(ref.filename)}&subfolder=${encodeURIComponent(ref.subfolder)}&type=${encodeURIComponent(ref.type)}`
-            const response = await httpRaw(url, {
-              timeoutMs: 120_000,
-              ...(params.signal === undefined ? {} : { signal: params.signal }),
-            })
-            if (response.status < 200 || response.status >= 300) {
-              throw new Error(`ComfyUI /view → HTTP ${response.status}`)
-            }
-            out.push({ bytes: response.body, backend: 'comfyui' })
+        const history = (await probeJson(`${comfyBase}/history/${promptId}`, 8000)) as
+          | Record<string, { outputs?: Record<string, { images?: Array<{ filename: string; subfolder: string; type: string }>; status?: string }>; status?: { status_str?: string; completed?: boolean } }>
+          | undefined
+        const entry = history?.[promptId]
+        if (entry !== undefined) {
+          if (entry.status?.status_str === 'error' || entry.status?.completed === false) {
+            throw new Error(`ComfyUI 执行失败：${entry.status?.status_str ?? 'unknown'}`)
           }
-          return out
+          const refs: Array<{ filename: string; subfolder: string; type: string }> = []
+          for (const output of Object.values(entry.outputs ?? {})) {
+            for (const image of output.images ?? []) refs.push(image)
+          }
+          // A workflow that finished successfully but saved nothing (no SaveImage /
+          // PreviewImage node) would otherwise keep this loop spinning until the
+          // 30-minute timeout. Say so now instead.
+          if (refs.length === 0 && entry.status?.completed === true) {
+            throw new Error('ComfyUI 执行完成但没有产出任何图片：这个工作流没有 SaveImage / PreviewImage 这类输出节点。请加一个保存节点再运行。')
+          }
+          if (refs.length > 0) {
+            const out: BackendImage[] = []
+            for (const ref of refs) {
+              const url = `${comfyBase}/view?filename=${encodeURIComponent(ref.filename)}&subfolder=${encodeURIComponent(ref.subfolder)}&type=${encodeURIComponent(ref.type)}`
+              const response = await httpRaw(url, {
+                timeoutMs: 120_000,
+                ...(params.signal === undefined ? {} : { signal: params.signal }),
+              })
+              if (response.status < 200 || response.status >= 300) {
+                throw new Error(`ComfyUI /view → HTTP ${response.status}`)
+              }
+              out.push({ bytes: response.body, backend: 'comfyui' })
+            }
+            return out
+          }
         }
+        const elapsed = Math.round((Date.now() - started) / 1000)
+        params.onProgress?.(undefined, `ComfyUI 执行中（${elapsed}s）`)
+        await delay(1200, params.signal)
       }
-      const elapsed = Math.round((Date.now() - started) / 1000)
-      params.onProgress?.(undefined, `ComfyUI 执行中（${elapsed}s）`)
-      await delay(1200, params.signal)
+    } finally {
+      progress?.close()
     }
     throw new Error('ComfyUI 执行超时')
   }
@@ -1820,6 +1982,7 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
     sdUpscale: (params: Parameters<typeof sdUpscale>[0]) => interruptOnFailure('sdwebui', () => sdUpscale(params)),
     sdInterrogate,
     comfyRun: (params: Parameters<typeof comfyRun>[0]) => interruptOnFailure('comfyui', () => comfyRun(params)),
+    comfyVramAdvisory,
     comfyGraph,
     comfyUpload,
     /**
@@ -2865,7 +3028,12 @@ function createOps(deps: OpsDeps) {
   ): Promise<GalleryImage[]> {
     const plan = await outputPlan(input.outDir)
     const nodeCount = Object.keys(input.apiGraph).length
-    job.message = `ComfyUI 执行工作流（${nodeCount} 个节点）`
+    // The advisory goes into the job's message BEFORE the run starts, because that
+    // is the moment it can still change someone's mind — after 13 minutes of paging
+    // it is only an explanation.
+    const advisory = await backends.comfyVramAdvisory(input.apiGraph).catch(() => undefined)
+    job.message = advisory ?? `ComfyUI 执行工作流（${nodeCount} 个节点）`
+    if (advisory !== undefined) job.advisory = advisory
     const produced = await backends.comfyRun({
       graph: input.apiGraph,
       signal: job.controller.signal,
@@ -5631,18 +5799,25 @@ function registerImageTools(
           throw new Error(`工作流 ${id} 没有任何可执行节点（是否所有节点都被静音/绕过了？）`)
         }
         const name = optionalString(args, 'name', 'name') ?? meta.name
-        const images = await runJob('generate', `工作流 · ${name}`, exec, (job) => runWorkflow({
-          apiGraph,
-          name: slugify(name),
-          category,
-          projectId,
-          transparent: optionalBoolean(args, 'transparent', 'transparent') === true,
-          seamless: optionalBoolean(args, 'seamless', 'seamless') === true,
-        }, job))
+        // Captured so the run's own advisory (raised before it started, and shown
+        // in the panel while it ran) can also be repeated back to the caller.
+        let ranJob: Job | undefined
+        const images = await runJob('generate', `工作流 · ${name}`, exec, (job) => {
+          ranJob = job
+          return runWorkflow({
+            apiGraph,
+            name: slugify(name),
+            category,
+            projectId,
+            transparent: optionalBoolean(args, 'transparent', 'transparent') === true,
+            seamless: optionalBoolean(args, 'seamless', 'seamless') === true,
+          }, job)
+        })
         return {
           action,
           images: images.map(wireImage),
-          note: `工作流 [${id}] 已执行（${Object.keys(apiGraph).length} 个节点）`,
+          note: `工作流 [${id}] 已执行（${Object.keys(apiGraph).length} 个节点）`
+            + (ranJob?.advisory === undefined ? '' : `\n${ranJob.advisory}`),
         }
       }
 
@@ -5975,6 +6150,7 @@ function wireJob(job: Job): Record<string, unknown> {
     progress: job.progress ?? null,
     message: job.message,
     preview: job.preview === undefined ? null : `data:image/png;base64,${job.preview}`,
+    advisory: job.advisory ?? null,
     error: job.error ?? null,
     startedAt: job.startedAt,
     finishedAt: job.finishedAt ?? null,
