@@ -485,6 +485,49 @@ function isInside(parent: string, child: string): boolean {
 }
 
 /**
+ * The node id a node input is LINKED to, when it is a link rather than a literal.
+ *
+ * API graphs express a wire as `["<nodeId>", <slot>]`, which is how a KSampler
+ * points at the CLIPTextEncode holding its prompt.
+ */
+function linkTarget(graph: Record<string, unknown>, classType: string, key: string): string | undefined {
+  for (const node of Object.values(graph)) {
+    const candidate = node as { class_type?: unknown; inputs?: Record<string, unknown> }
+    if (candidate.class_type !== classType) continue
+    const value = candidate.inputs?.[key]
+    return Array.isArray(value) && typeof value[0] === 'string' ? value[0] : undefined
+  }
+  return undefined
+}
+
+/** The words a template's prompt may legitimately consist of with no subject. */
+const QUALITY_ONLY_RE = /\b(masterpiece|best quality|high quality|highres|absurdres|very aesthetic|detailed|amazing quality)\b/gi
+
+/**
+ * Warn when a workflow's positive prompt has no SUBJECT.
+ *
+ * `sd15-basic`, `sdxl-basic` and `img2img-refine` ship a deliberate skeleton
+ * ("masterpiece, best quality, ") that callers are expected to patch, and running
+ * one unmodified renders whatever the model feels like. That reads as "the plugin
+ * produced nonsense" rather than "the prompt was never filled in" — measured: an
+ * unfilled item-icon prompt produced an unlabelled purple ring instead of the
+ * potion its description promised.
+ */
+function comfyPromptAdvisory(graph: Record<string, unknown>): string | undefined {
+  const positiveId = linkTarget(graph, 'KSampler', 'positive')
+  if (positiveId === undefined) return undefined
+  const node = graph[positiveId] as { class_type?: unknown; inputs?: Record<string, unknown> } | undefined
+  // A prompt routed through a custom node cannot be judged from here, so stay quiet.
+  if (node === undefined || node.class_type !== 'CLIPTextEncode') return undefined
+  const text = typeof node.inputs?.text === 'string' ? node.inputs.text : undefined
+  if (text === undefined) return undefined
+  const stripped = text.replace(QUALITY_ONLY_RE, '').replace(/[\s,]+/g, ' ').trim()
+  if (stripped !== '') return undefined
+  return '⚠ 这个工作流的正向提示词只有质量标签、没有主体，跑出来是模型自由发挥。'
+    + '先用 image_workflow action="patch" 把主体写进 CLIPTextEncode 的 text（例如 (potion bottle:1.2)）再跑。'
+}
+
+/**
  * The literal value of one node input in an API-format graph, or undefined.
  *
  * API graphs carry `{ "<id>": { class_type, inputs } }`, and an input is either a
@@ -3028,12 +3071,16 @@ function createOps(deps: OpsDeps) {
   ): Promise<GalleryImage[]> {
     const plan = await outputPlan(input.outDir)
     const nodeCount = Object.keys(input.apiGraph).length
-    // The advisory goes into the job's message BEFORE the run starts, because that
-    // is the moment it can still change someone's mind — after 13 minutes of paging
-    // it is only an explanation.
-    const advisory = await backends.comfyVramAdvisory(input.apiGraph).catch(() => undefined)
-    job.message = advisory ?? `ComfyUI 执行工作流（${nodeCount} 个节点）`
-    if (advisory !== undefined) job.advisory = advisory
+    // Advisories go into the job's message BEFORE the run starts, because that is
+    // the moment they can still change someone's mind — after 13 minutes of paging
+    // (or after a purple ring that was supposed to be a potion) they are only an
+    // explanation.
+    const advisories = [
+      comfyPromptAdvisory(input.apiGraph),
+      await backends.comfyVramAdvisory(input.apiGraph).catch(() => undefined),
+    ].filter((text): text is string => text !== undefined)
+    if (advisories.length > 0) job.advisory = advisories.join('\n')
+    job.message = job.advisory ?? `ComfyUI 执行工作流（${nodeCount} 个节点）`
     const produced = await backends.comfyRun({
       graph: input.apiGraph,
       signal: job.controller.signal,
@@ -3795,11 +3842,18 @@ export const WORKFLOW_TEMPLATES: WorkflowTemplate[] = [
   {
     id: 'item-icon',
     name: '道具图标（512²，白底便于抠图）',
-    description: '出图后接 image_cutout 抠成透明 PNG。白底 + 单物件 + 厚描边是这套提示词的要点。',
+    description: '出图后接 image_cutout 抠成透明 PNG。白底 + 单物件 + 厚描边是这套提示词的要点；'
+      + '提示词里默认是 (potion bottle:1.2)，换成你要的道具即可（agent 用 image_workflow action="patch" 改正向提示词）。',
     category: 'item',
     nodes: [
       { id: 1, type: 'CheckpointLoaderSimple', title: '底模', widgets: ['anything-v5.safetensors'], outputs: [{ name: 'MODEL', type: 'MODEL', links: [1] }, { name: 'CLIP', type: 'CLIP', links: [2, 3] }, { name: 'VAE', type: 'VAE', links: [9] }] },
-      { id: 2, type: 'CLIPTextEncode', title: '正向提示词', widgets: ['game item icon, single object, centered, clean thick outline, flat shading, plain white background, sticker, masterpiece, best quality'], inputs: [{ name: 'clip', link: 2, type: 'CLIP' }], outputs: [{ name: 'CONDITIONING', type: 'CONDITIONING', links: [4] }] },
+      // The subject MUST be in the prompt: this template shipped with only the
+      // format (game item icon / single object / thick outline / white background),
+      // so running it unmodified produced whatever the model felt like — an
+      // unlabelled purple ring, in a measured case. Every other txt2img template
+      // names its subject (1girl, a grass field), and the panel's 道具图标 preset
+      // always did too.
+      { id: 2, type: 'CLIPTextEncode', title: '正向提示词', widgets: ['game item icon, (potion bottle:1.2), single object, centered, clean thick outline, vibrant colors, flat shading, plain white background, sticker, masterpiece, best quality'], inputs: [{ name: 'clip', link: 2, type: 'CLIP' }], outputs: [{ name: 'CONDITIONING', type: 'CONDITIONING', links: [4] }] },
       { id: 3, type: 'CLIPTextEncode', title: '负向提示词', widgets: [`${BASE_NEGATIVE_WORKFLOW}, multiple objects, frame, human, character`], inputs: [{ name: 'clip', link: 3, type: 'CLIP' }], outputs: [{ name: 'CONDITIONING', type: 'CONDITIONING', links: [5] }] },
       { id: 4, type: 'EmptyLatentImage', title: '尺寸', widgets: [512, 512, 1], outputs: [{ name: 'LATENT', type: 'LATENT', links: [6] }] },
       {

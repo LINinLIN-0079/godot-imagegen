@@ -1262,9 +1262,46 @@ async function main() {
     const smallStarted = await callRoute(webServer, 'POST', '/gig/workflow/run', { id: 'sd15-basic', category: 'concept', projectId: 'vram' })
     const smallJob = (await callRoute(webServer, 'GET', '/gig/jobs')).body.jobs.find((j) => j.id === smallStarted.body.jobId)
     assert(smallJob !== undefined && !/显存/.test(smallJob.message), 'nor in its job message')
-    assert(smallJob !== undefined && smallJob.advisory === null, 'and no advisory is attached to it')
+    assert(smallJob !== undefined && !/显存/.test(String(smallJob.advisory)), 'and its advisory (if any) is not about VRAM')
     fakeComfyHoldPolls = 0
     await new Promise((r) => setTimeout(r, 600))
+  }
+
+  // ── the empty-prompt advisory ──
+  //
+  // sd15-basic / sdxl-basic / img2img-refine ship a deliberate prompt SKELETON
+  // ("masterpiece, best quality, ") that callers are expected to patch. Running one
+  // unmodified renders whatever the model feels like, which reads as "the plugin
+  // made nonsense" — measured: an unfilled item-icon prompt produced an unlabelled
+  // purple ring instead of the potion its description promised. item-icon now names
+  // a default subject, so the two make a clean pair.
+  {
+    // A self-contained probe: the suite itself patches sd15-basic's prompt early
+    // on, so the skeleton has to be reproduced rather than borrowed.
+    const probe = await exec(workflowTool, { action: 'create', name: '空提示词探针', from: 'sd15-basic', category: 'concept' })
+    await exec(workflowTool, {
+      action: 'patch',
+      id: probe.workflow.id,
+      edits: [{ classType: 'CLIPTextEncode', title: '正向提示词', set: { text: 'masterpiece, best quality, ' } }],
+    })
+    const empty = await exec(workflowTool, { action: 'run', id: probe.workflow.id, category: 'concept', project_id: 'prompt' })
+    assert(empty.images.length === 1, 'a skeleton-prompt workflow still runs')
+    assert(/没有主体/.test(empty.note), `and says the prompt has no subject (${String(empty.note).split('\n').pop()})`)
+    assert(/action="patch"/.test(empty.note), 'pointing at the tool action that fills it in')
+    await exec(workflowTool, { action: 'delete', id: probe.workflow.id })
+
+    const filled = await exec(workflowTool, { action: 'run', id: 'item-icon', category: 'item', project_id: 'prompt' })
+    assert(filled.images.length === 1, 'the icon template runs')
+    assert(!/没有主体/.test(filled.note), `and is NOT flagged, because it now names a default subject (${String(filled.note).split('\n').pop()})`)
+
+    const icon = (await exec(workflowTool, { action: 'read', id: 'item-icon' })).workflow
+    const positive = icon.nodes.find((n) => n.title === '正向提示词')
+    assert(/potion bottle/.test(JSON.stringify(positive.widgets)),
+      `the item-icon template names a subject in its prompt (${JSON.stringify(positive.widgets).slice(0, 70)}…)`)
+    const iconMeta = await callRoute(webServer, 'GET', '/gig/workflows')
+    const iconEntry = iconMeta.body.workflows.find((w) => w.id === 'item-icon')
+    assert(iconEntry !== undefined && /potion bottle/.test(iconEntry.description),
+      'and its description says which part to replace')
   }
 
   // ── P1: persistence across a plugin restart ──
