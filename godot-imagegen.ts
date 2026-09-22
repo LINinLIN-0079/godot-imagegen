@@ -1652,6 +1652,12 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
         for (const output of Object.values(entry.outputs ?? {})) {
           for (const image of output.images ?? []) refs.push(image)
         }
+        // A workflow that finished successfully but saved nothing (no SaveImage /
+        // PreviewImage node) would otherwise keep this loop spinning until the
+        // 30-minute timeout. Say so now instead.
+        if (refs.length === 0 && entry.status?.completed === true) {
+          throw new Error('ComfyUI 执行完成但没有产出任何图片：这个工作流没有 SaveImage / PreviewImage 这类输出节点。请加一个保存节点再运行。')
+        }
         if (refs.length > 0) {
           const out: BackendImage[] = []
           for (const ref of refs) {
@@ -1771,7 +1777,7 @@ function parseA1111Info(raw: string | undefined): Record<string, unknown> {
   }
 }
 
-// ─────────────────────────── Python post-processing bridge ───────────────────────────
+// ────────────────────── Python post-processing bridge (driver) ──────────────────────
 
 /** The post-processing surface handed to the backend manager. */
 interface PostBridge {
@@ -2766,9 +2772,63 @@ function createOps(deps: OpsDeps) {
     return { caption: result.caption, model: result.model, backend: 'sdwebui' }
   }
 
+  /**
+   * Execute an already-converted ComfyUI API graph and archive what it produced.
+   *
+   * This is what turns a user's own workflow into a normal art asset: the output
+   * goes through the same save/record path as `image_generate`, so it lands in
+   * `assets/generated/<category>/` with a `res://` path and a gallery record.
+   */
+  async function runWorkflow(
+    input: {
+      apiGraph: Record<string, unknown>
+      name: string
+      category: ArtCategory
+      projectId: string
+      outDir?: string
+      transparent?: boolean
+      seamless?: boolean
+    },
+    job: Job,
+  ): Promise<GalleryImage[]> {
+    const plan = await outputPlan(input.outDir)
+    const nodeCount = Object.keys(input.apiGraph).length
+    job.message = `ComfyUI 执行工作流（${nodeCount} 个节点）`
+    const produced = await backends.comfyRun({
+      graph: input.apiGraph,
+      signal: job.controller.signal,
+      onProgress: (progress, message) => {
+        job.progress = progress
+        job.message = message
+      },
+    })
+    const images: GalleryImage[] = []
+    for (const item of produced) {
+      const saved = await saveImage(item.bytes, plan, input.category, input.name, '-wf')
+      let method: string | undefined
+      if (input.transparent === true) {
+        const result = await makeTransparent(saved.filePath, 'auto')
+        method = result.method
+      }
+      if (input.seamless === true) await makeSeamless(saved.filePath)
+      images.push(await record(saved, {
+        name: input.name,
+        category: input.category,
+        op: 'generate',
+        backend: 'comfyui',
+        ...(method === undefined ? {} : { method }),
+        projectId: input.projectId,
+        meta: { workflow: true, nodes: nodeCount },
+      }))
+    }
+    if (images.length === 0) throw new Error('工作流执行完成但没有产出任何图片')
+    return images
+  }
+
   return {
     generate,
     edit,
+    runWorkflow,
     upscale,
     cutout,
     interrogate,
@@ -3692,7 +3752,9 @@ export function createWorkflowLibrary(cfg: ImagegenConfig): WorkflowLibrary {
     try {
       raw = await readFile(path, 'utf8')
     } catch {
-      throw new Error(`工作流库中没有 "${id}"（预期文件：${path}）`)
+      // A caller-supplied id that does not exist is the caller's mistake, not a
+      // server fault — mark it so the REST layer answers 400, not 500.
+      throw new ClientRouteError(`工作流库中没有 "${id}"（预期文件：${path}）`)
     }
     let parsed: unknown
     try {
@@ -3855,6 +3917,119 @@ export function createLayoutCache(cfg: ImagegenConfig): LayoutCache {
   }
 }
 
+// ─────────────────── UI command queue (host → 美术工坊 panel) ───────────────────
+//
+// The agent runs host-side; the panel runs in the browser. Rather than invent a
+// transport, the panel piggybacks on the poll it already runs for job progress:
+// one POST carries its own state up and pulls the queued instructions down. That
+// keeps the whole feature to a single round-trip and needs no new socket.
+
+/** What the panel is doing right now, as last reported by the panel itself. */
+export interface PanelState {
+  /** The form the user is editing (prompt, size, category, backend…). */
+  form?: Record<string, unknown>
+  /** Gallery image the user has selected, when any. */
+  selectedImageId?: string
+  /** Workflow the panel currently has loaded. */
+  activeWorkflowId?: string
+  /** What the embedded ComfyUI canvas reports (phase 2 fills this from the extension). */
+  canvas?: { workflowId?: string; nodeCount?: number; missingClasses?: string[] }
+  /** Which section the panel is showing. */
+  section?: string
+  updatedAt: string
+}
+
+/** One instruction queued for the panel. */
+export interface UiCommand {
+  id: string
+  kind: 'form.fill' | 'workshop.focus' | 'gallery.select' | 'workflow.load' | 'toast'
+  /** Human-readable summary, so the panel's log reads like a conversation. */
+  label: string
+  payload: Record<string, unknown>
+  createdAt: string
+}
+
+/**
+ * Commands older than this are dropped. A panel that is not open must not
+ * receive a stale flood of instructions the moment it finally appears.
+ */
+const UI_COMMAND_TTL_MS = 10 * 60 * 1000
+
+/** A panel counts as connected when it polled within this window. */
+const UI_PANEL_ONLINE_MS = 15_000
+
+/** The host-side instruction queue and the panel's self-report. */
+export interface UiQueue {
+  push(kind: UiCommand['kind'], label: string, payload: Record<string, unknown>): UiCommand
+  /** Unacknowledged, unexpired commands, oldest first. */
+  pending(): UiCommand[]
+  /** Drop the given ids (the panel applied them); returns how many were dropped. */
+  ack(ids: string[]): number
+  /** Record what the panel reports about itself. */
+  report(state: Omit<PanelState, 'updatedAt'>): void
+  /** The last reported panel state, or undefined when no panel ever reported. */
+  state(): PanelState | undefined
+  online(): boolean
+  /** Queue depth + connection facts, for the tools and the REST surface. */
+  status(): { pending: number; online: boolean; lastPollSecondsAgo: number | null; reportedAt: string | null }
+}
+
+/** Create the UI command queue. In-memory on purpose: instructions are for the
+ *  live panel, not a durable log — a restart should not replay old keystrokes. */
+export function createUiQueue(): UiQueue {
+  const commands = new Map<string, UiCommand>()
+  let lastState: PanelState | undefined
+  let lastPoll = 0
+
+  function prune(): void {
+    const cutoff = Date.now() - UI_COMMAND_TTL_MS
+    for (const [id, command] of commands) {
+      if (new Date(command.createdAt).getTime() < cutoff) commands.delete(id)
+    }
+  }
+
+  const isOnline = (): boolean => lastPoll > 0 && Date.now() - lastPoll < UI_PANEL_ONLINE_MS
+
+  return {
+    push(kind, label, payload) {
+      prune()
+      const command: UiCommand = {
+        id: `ui_${randomUUID().slice(0, 8)}`,
+        kind,
+        label,
+        payload,
+        createdAt: new Date().toISOString(),
+      }
+      commands.set(command.id, command)
+      return command
+    },
+    pending() {
+      prune()
+      return [...commands.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    },
+    ack(ids) {
+      let removed = 0
+      for (const id of ids) if (commands.delete(id)) removed += 1
+      prune()
+      return removed
+    },
+    report(state) {
+      lastPoll = Date.now()
+      lastState = { ...state, updatedAt: new Date().toISOString() }
+    },
+    state: () => lastState,
+    online: isOnline,
+    status() {
+      return {
+        pending: commands.size,
+        online: isOnline(),
+        lastPollSecondsAgo: lastPoll === 0 ? null : Math.round((Date.now() - lastPoll) / 1000),
+        reportedAt: lastState?.updatedAt ?? null,
+      }
+    },
+  }
+}
+
 // ─────────────────────────── model tools ───────────────────────────
 
 /** Wire shape of a gallery image returned by the tools. */
@@ -3932,8 +4107,20 @@ function describeImage(image: GalleryImage): string {
  * @param tools - the tool registry.
  * @param ops - the wired operations.
  */
-function registerImageTools(tools: ToolsSurface, ops: ReturnType<typeof createOps>): void {
-  const { cfg, jobs, gallery, backends, post } = ops
+function registerImageTools(
+  tools: ToolsSurface,
+  ops: ReturnType<typeof createOps>,
+  deps: {
+    /** The plugin-local workflow library. */
+    library: WorkflowLibrary
+    /** Host → panel instruction queue. */
+    queue: UiQueue
+    /** Cached node layouts, refreshed from ComfyUI on demand. */
+    layouts: (force?: boolean) => Promise<Record<string, WidgetSpec[]> | undefined>
+  },
+): void {
+  const { cfg, jobs, gallery, backends, post, runWorkflow } = ops
+  const { library, queue, layouts } = deps
   const projectIdParam = { type: 'string', description: '图库归属的项目 id（可选，默认 default；与 Godot 资产管理器的项目对应）。' }
 
   /** Watch a tool's abort flag and cancel the matching job. */
@@ -4534,6 +4721,492 @@ function registerImageTools(tools: ToolsSurface, ops: ReturnType<typeof createOp
       return { action, images: filtered.slice(0, limit).map(wireImage), removed: 0 }
     },
   })
+
+  // ---- Tool 9: ComfyUI workflows ----
+
+  /** Read the layouts needed to address widgets by name, refreshing if asked. */
+  async function requireLayouts(force: boolean): Promise<Record<string, WidgetSpec[]>> {
+    const found = await layouts(force)
+    if (found === undefined) {
+      throw new Error(
+        '还没有节点定义（/object_info），无法按名字读写工作流参数。'
+        + '请先启动 ComfyUI（image_backend_status action="start"）—— 插件会读取一次并缓存，之后即使后端关闭也能继续编辑。',
+      )
+    }
+    return found
+  }
+
+  tools.register({
+    name: 'image_workflow',
+    description: 'Author and run ComfyUI workflows as first-class objects. action="list" shows the plugin\'s own workflow library (six game-art templates are seeded on first use); "read" returns one workflow with every node\'s editable parameters; "create" makes a new workflow (from a template, an existing one, or a graph you supply); "patch" edits parameters BY NAME (e.g. set CLIPTextEncode.text or KSampler.steps) without touching node ids or widget indices; "save" stores a full graph you authored; "to-api"/"to-ui" convert between the canvas format and the format the server executes; "run" executes a workflow on ComfyUI and files the result in the gallery like any other generated art; "open" loads it into the 美术工坊 canvas; "delete" removes it. Node widgets are addressed by name, which needs the node definitions from ComfyUI — the plugin reads them once and caches them.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['list', 'read', 'create', 'patch', 'save', 'to-api', 'to-ui', 'run', 'open', 'delete'], description: 'What to do.' },
+        id: { type: 'string', description: 'Workflow id in the plugin library (action=read/patch/save/run/open/delete, or the source for create).' },
+        name: { type: 'string', description: 'Display name (action=create).' },
+        description: { type: 'string', description: 'What the workflow is for (action=create/save).' },
+        category: { type: 'string', enum: ART_CATEGORIES, description: 'Art category; decides the output subfolder for action=run.' },
+        from: { type: 'string', description: 'action=create: a template id (sd15-basic, sdxl-basic, item-icon, seamless-tile, upscale-4x, img2img-refine), an existing workflow id to copy, or "blank".' },
+        edits: {
+          type: 'array',
+          description: 'action=patch: name-addressed edits. Each item targets nodes by class and optionally title/index, then sets widget values by name.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              classType: { type: 'string', description: 'Node class, e.g. CLIPTextEncode or KSampler.' },
+              title: { type: 'string', description: 'Optional case-insensitive substring of the node title.' },
+              index: { type: 'number', description: 'Optional 0-based pick when several nodes match.' },
+              set: { type: 'object', additionalProperties: true, description: 'Widget values keyed by widget name.' },
+              setTitle: { type: 'string', description: 'Also rename the node.' },
+              setMode: { type: 'number', description: 'Also set the node mode (0 active / 2 muted / 4 bypassed).' },
+            },
+            required: ['classType'],
+          },
+        },
+        graph: { type: 'object', additionalProperties: true, description: 'A full workflow document (action=save), or the graph to store (action=create). UI format or API format — the format is detected.' },
+        project_id: { type: 'string', description: 'Gallery project for action=run (default default).' },
+        transparent: { type: 'boolean', description: 'action=run: cut the result out to a transparent PNG.' },
+        seamless: { type: 'boolean', description: 'action=run: make the result a seamless tile.' },
+        force_layout_refresh: { type: 'boolean', description: 'Re-read node definitions from ComfyUI before editing (needed after installing a custom node).' },
+      },
+      required: ['action'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          action: { type: 'string' },
+          workflows: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                id: { type: 'string' },
+                name: { type: 'string' },
+                description: { type: 'string' },
+                category: { type: 'string' },
+                source: { type: 'string' },
+                nodeCount: { type: 'number' },
+                classes: { type: 'array', items: { type: 'string' } },
+              },
+              required: ['id', 'name', 'description', 'category', 'source', 'nodeCount', 'classes'],
+            },
+          },
+          workflow: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              id: { type: 'string' },
+              name: { type: 'string' },
+              description: { type: 'string' },
+              category: { type: 'string' },
+              source: { type: 'string' },
+              nodeCount: { type: 'number' },
+              linkCount: { type: 'number' },
+              nodes: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            },
+            required: ['id', 'name', 'description', 'category', 'source', 'nodeCount', 'linkCount', 'nodes'],
+          },
+          applied: { type: 'array', items: { type: 'string' } },
+          graph: { type: 'object', additionalProperties: true },
+          images: { type: 'array', items: imageOutputSchema() },
+          /** Whether a connected panel took the instruction (action=open/patch). */
+          delivered: { type: 'boolean' },
+          queued: { type: 'number' },
+          note: { type: 'string' },
+        },
+        required: ['action'],
+      },
+      render: (_args, value) => {
+        const v = value as {
+          action: string
+          workflows?: Array<{ id: string; name: string; description: string; category: string; source: string; nodeCount: number; classes: string[] }>
+          workflow?: { id: string; name: string; nodeCount: number; linkCount: number; nodes: Array<Record<string, unknown>> }
+          applied?: string[]
+          images?: GalleryImage[]
+          delivered?: boolean
+          queued?: number
+          note?: string
+        }
+        const tail = v.note === undefined ? '' : `\n${v.note}`
+        const panel = v.delivered === undefined
+          ? ''
+          : v.delivered ? `\n✓ 已送达美术工坊面板（队列剩余 ${v.queued ?? 0}）` : `\n⚠ 面板未连接，指令已排队（${v.queued ?? 0} 条）`
+        if (v.action === 'list' && v.workflows !== undefined) {
+          if (v.workflows.length === 0) return [{ type: 'text', text: `工作流库为空。${tail}` }]
+          const lines = v.workflows.map((w) =>
+            `• [${w.id}] ${w.name} — ${w.nodeCount} 节点（${w.classes.slice(0, 5).join(', ')}${w.classes.length > 5 ? '…' : ''}）· ${w.source}\n    ${w.description}`)
+          return [{ type: 'text', text: `工作流库 ${v.workflows.length} 个：\n${lines.join('\n')}${tail}` }]
+        }
+        if (v.workflow !== undefined) {
+          const nodes = v.workflow.nodes.map((n) => {
+            const widgets = (n.widgets ?? {}) as Record<string, unknown>
+            const parts = Object.entries(widgets).map(([k, val]) => `${k}=${JSON.stringify(val)}`)
+            const title = n.title === undefined ? '' : ` "${n.title}"`
+            return `  #${n.id} ${n.type}${title}${n.mode !== 0 ? ` [mode ${n.mode}]` : ''}${parts.length === 0 ? '' : `\n      ${parts.join(', ')}`}`
+          })
+          return [{
+            type: 'text',
+            text: `工作流 [${v.workflow.id}] ${v.workflow.name} — ${v.workflow.nodeCount} 节点 / ${v.workflow.linkCount} 连线\n${nodes.join('\n')}${tail}`,
+          }]
+        }
+        if (v.images !== undefined) {
+          const lines = v.images.map((i) => `• ${describeImage(i)}`)
+          return [{ type: 'text', text: `工作流执行完成，产出 ${v.images.length} 张：\n${lines.join('\n')}${tail}` }]
+        }
+        if (v.applied !== undefined) return [{ type: 'text', text: `已改：${v.applied.join('、')}${panel}${tail}` }]
+        return [{ type: 'text', text: `${v.action} 完成${panel}${tail}` }]
+      },
+    },
+    async execute(args, exec) {
+      const action = requireString(args, 'action', 'action')
+      const category = requireCategory(args)
+      const projectId = optionalString(args, 'project_id', 'project_id') ?? 'default'
+      const force = optionalBoolean(args, 'force_layout_refresh', 'force_layout_refresh') === true
+
+      const summaryOf = (w: WorkflowSummary): Record<string, unknown> => ({
+        id: w.id,
+        name: w.meta.name,
+        description: w.meta.description,
+        category: w.meta.category,
+        source: w.meta.source,
+        nodeCount: w.nodeCount,
+        classes: Object.keys(w.classCounts).sort(),
+      })
+
+      if (action === 'list') {
+        const all = await library.list()
+        return { action, workflows: all.map(summaryOf) }
+      }
+
+      if (action === 'read') {
+        const id = requireString(args, 'id', 'id')
+        const { meta, graph } = await library.read(id)
+        const summary = summarizeWorkflow(graph, await layouts(false).catch(() => undefined)) as {
+          nodeCount: number; linkCount: number; nodes: Array<Record<string, unknown>>
+        }
+        return {
+          action,
+          workflow: {
+            id,
+            name: meta.name,
+            description: meta.description,
+            category: meta.category,
+            source: meta.source,
+            nodeCount: summary.nodeCount,
+            linkCount: summary.linkCount,
+            nodes: summary.nodes,
+          },
+        }
+      }
+
+      if (action === 'create') {
+        const name = requireString(args, 'name', 'name')
+        const graphArg = args.graph
+        const created = await library.create({
+          name,
+          ...(optionalString(args, 'description', 'description') === undefined ? {} : { description: optionalString(args, 'description', 'description') as string }),
+          category,
+          ...(optionalString(args, 'from', 'from') === undefined ? {} : { from: optionalString(args, 'from', 'from') as string }),
+          ...(graphArg === undefined ? {} : { graph: graphArg }),
+        })
+        const createdGraph = (await library.read(created.id)).graph
+        return {
+          action,
+          workflow: {
+            id: created.id,
+            name: created.meta.name,
+            description: created.meta.description,
+            category: created.meta.category,
+            source: created.meta.source,
+            nodeCount: createdGraph.nodes.length,
+            linkCount: linkTable(createdGraph).size,
+            nodes: [],
+          },
+          note: `已创建工作流 [${created.id}]，共 ${createdGraph.nodes.length} 个节点。用 action="read" 看节点明细，用 action="patch" 改参数。`,
+        }
+      }
+
+      if (action === 'save') {
+        const id = requireString(args, 'id', 'id')
+        if (args.graph === undefined) throw new Error('action=save 需要 graph 参数')
+        const rawGraph = args.graph as Record<string, unknown>
+        // Accept either format: an agent-authored graph is usually API-shaped.
+        const graph = isApiWorkflow(rawGraph)
+          ? apiToUi(rawGraph, await layouts(false).catch(() => undefined))
+          : normalizeUiWorkflow(rawGraph)
+        const meta = await library.save(id, graph, {
+          ...(optionalString(args, 'name', 'name') === undefined ? {} : { name: optionalString(args, 'name', 'name') as string }),
+          ...(optionalString(args, 'description', 'description') === undefined ? {} : { description: optionalString(args, 'description', 'description') as string }),
+          category,
+          source: 'agent',
+        })
+        return { action, workflow: { id, name: meta.name, description: meta.description, category: meta.category, source: meta.source, nodeCount: graph.nodes.length, linkCount: linkTable(graph).size, nodes: [] } }
+      }
+
+      if (action === 'patch') {
+        const id = requireString(args, 'id', 'id')
+        const rawEdits = args.edits
+        if (!Array.isArray(rawEdits) || rawEdits.length === 0) throw new Error('action=patch 需要非空的 edits 数组')
+        const edits: WorkflowEdit[] = rawEdits.map((entry) => {
+          if (entry === null || typeof entry !== 'object') throw new Error('edits 的每一项都必须是对象')
+          const item = entry as Record<string, unknown>
+          return {
+            classType: requireString(item, 'classType', 'edits[].classType'),
+            ...(optionalString(item, 'title', 'edits[].title') === undefined ? {} : { title: optionalString(item, 'title', 'edits[].title') as string }),
+            ...(optionalNumber(item, 'index', 'edits[].index', 0, 1000) === undefined ? {} : { index: optionalNumber(item, 'index', 'edits[].index', 0, 1000) as number }),
+            ...(item.set === undefined ? {} : { set: item.set as Record<string, unknown> }),
+            ...(optionalString(item, 'setTitle', 'edits[].setTitle') === undefined ? {} : { setTitle: optionalString(item, 'setTitle', 'edits[].setTitle') as string }),
+            ...(optionalNumber(item, 'setMode', 'edits[].setMode', 0, 4) === undefined ? {} : { setMode: optionalNumber(item, 'setMode', 'edits[].setMode', 0, 4) as number }),
+          }
+        })
+        const { graph } = await library.read(id)
+        const patched = patchWorkflow(graph, edits, await requireLayouts(force))
+        const meta = await library.save(id, patched.graph, { source: 'agent' })
+        // Keep an open canvas in sync so the user SEES the edit.
+        const status = queue.status()
+        if (status.online) queue.push('workflow.patch', `代理改写了工作流 ${meta.name}`, { id, graph: patched.graph })
+        return {
+          action,
+          delivered: status.online,
+          queued: queue.status().pending,
+          applied: patched.applied,
+          ...(status.online ? {} : { note: '改动已存到工作流库，但当前没有打开的美术工坊面板，画布上看不到；打开面板后用 action="open" 载入。' }),
+        }
+      }
+
+      if (action === 'delete') {
+        const id = requireString(args, 'id', 'id')
+        const removed = await library.remove(id)
+        return { action, note: removed ? `已删除工作流 ${id}` : `工作流库中没有 ${id}` }
+      }
+
+      if (action === 'open') {
+        const id = requireString(args, 'id', 'id')
+        const { meta, graph } = await library.read(id)
+        queue.push('workflow.load', `代理载入工作流 ${meta.name}`, { id, name: meta.name, graph })
+        const status = queue.status()
+        return {
+          action,
+          delivered: status.online,
+          queued: status.pending,
+          note: status.online
+            ? `已让画布载入 ${meta.name}`
+            : `指令已排队（${meta.name}）。当前没有打开的美术工坊面板，用户打开后会自动载入。`,
+        }
+      }
+
+      if (action === 'to-api' || action === 'to-ui') {
+        const id = requireString(args, 'id', 'id')
+        const { graph } = await library.read(id)
+        const layoutMap = await requireLayouts(force)
+        const graphOut = action === 'to-api' ? uiToApi(graph, layoutMap) : apiToUi(uiToApi(graph, layoutMap), layoutMap)
+        return { action, graph: graphOut }
+      }
+
+      if (action === 'run') {
+        const id = requireString(args, 'id', 'id')
+        const { meta, graph } = await library.read(id)
+        const layoutMap = await requireLayouts(force)
+        const apiGraph = uiToApi(graph, layoutMap)
+        if (Object.keys(apiGraph).length === 0) {
+          throw new Error(`工作流 ${id} 没有任何可执行节点（是否所有节点都被静音/绕过了？）`)
+        }
+        const name = optionalString(args, 'name', 'name') ?? meta.name
+        const images = await runJob('generate', `工作流 · ${name}`, exec, (job) => runWorkflow({
+          apiGraph,
+          name: slugify(name),
+          category,
+          projectId,
+          transparent: optionalBoolean(args, 'transparent', 'transparent') === true,
+          seamless: optionalBoolean(args, 'seamless', 'seamless') === true,
+        }, job))
+        return {
+          action,
+          images: images.map(wireImage),
+          note: `工作流 [${id}] 已执行（${Object.keys(apiGraph).length} 个节点）`,
+        }
+      }
+
+      throw new Error(`image_workflow 不支持 action="${action}"`)
+    },
+  })
+
+  // ---- Tool 10: drive the 美术工坊 panel from the conversation ----
+
+  tools.register({
+    name: 'image_workshop',
+    description: 'Drive the 美术工坊 (Art Studio) panel from the conversation, so the user does not have to retype what you already decided. action="fill-form" puts a prompt and parameters into the panel\'s form; "focus" brings a section forward; "select-image" highlights a produced image; "toast" shows a note in the panel; "read-state" returns what the user is currently looking at (their unsaved form, selected image, loaded workflow); "status" reports whether a panel is connected and how deep the queue is. Instructions are delivered on the panel\'s next poll (about 1.5s) and only while the panel is open — "status"/"read-state" tell you whether it is.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['fill-form', 'focus', 'select-image', 'toast', 'read-state', 'status'], description: 'What to do.' },
+        prompt: { type: 'string', description: 'action=fill-form: the positive prompt to place in the form.' },
+        negative_prompt: { type: 'string', description: 'action=fill-form: the negative prompt.' },
+        category: { type: 'string', enum: ART_CATEGORIES, description: 'action=fill-form: art category (also switches the form\'s defaults).' },
+        width: { type: 'number', description: 'action=fill-form: width.' },
+        height: { type: 'number', description: 'action=fill-form: height.' },
+        steps: { type: 'number', description: 'action=fill-form: sampling steps.' },
+        cfg_scale: { type: 'number', description: 'action=fill-form: CFG scale.' },
+        seed: { type: 'number', description: 'action=fill-form: seed (-1 for random).' },
+        model: { type: 'string', description: 'action=fill-form: checkpoint name.' },
+        backend: { type: 'string', enum: ['auto', 'sdwebui', 'comfyui'], description: 'action=fill-form: backend.' },
+        transparent: { type: 'boolean', description: 'action=fill-form: transparent background.' },
+        seamless: { type: 'boolean', description: 'action=fill-form: seamless tiling.' },
+        section: { type: 'string', description: 'action=focus: which section to bring forward (form, gallery, canvas, workflows).' },
+        image: { type: 'string', description: 'action=select-image: gallery id, res:// path or absolute path.' },
+        text: { type: 'string', description: 'action=toast: the message to show.' },
+        level: { type: 'string', enum: ['info', 'ok', 'error'], description: 'action=toast: severity (default info).' },
+        autostart: { type: 'boolean', description: 'action=fill-form: also press generate once the form is filled.' },
+      },
+      required: ['action'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          action: { type: 'string' },
+          delivered: { type: 'boolean' },
+          queued: { type: 'number' },
+          note: { type: 'string' },
+          state: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              updatedAt: { type: 'string' },
+              lastPollSecondsAgo: { type: 'number' },
+              section: { type: 'string' },
+              activeWorkflowId: { type: 'string' },
+              selectedImageId: { type: 'string' },
+              formDescription: { type: 'string' },
+              canvasNodes: { type: 'number' },
+            },
+            required: ['updatedAt'],
+          },
+        },
+        required: ['action', 'delivered', 'queued'],
+      },
+      render: (_args, value) => {
+        const v = value as {
+          action: string
+          delivered: boolean
+          queued: number
+          note?: string
+          state?: { updatedAt: string; lastPollSecondsAgo?: number; section?: string; activeWorkflowId?: string; selectedImageId?: string; formDescription?: string; canvasNodes?: number }
+        }
+        const lines: string[] = []
+        lines.push(v.delivered
+          ? `✓ 已送达美术工坊面板（队列剩余 ${v.queued}）`
+          : `⚠ 面板当前未连接，指令已排队（${v.queued} 条）。用户打开美术工坊后会自动执行。`)
+        if (v.state !== undefined) {
+          lines.push(`面板状态（${v.state.lastPollSecondsAgo ?? '?'} 秒前上报）：`)
+          if (v.state.section !== undefined) lines.push(`  正在看：${v.state.section}`)
+          if (v.state.formDescription !== undefined) lines.push(`  表单：${v.state.formDescription}`)
+          if (v.state.activeWorkflowId !== undefined) lines.push(`  已载入工作流：${v.state.activeWorkflowId}`)
+          if (v.state.selectedImageId !== undefined) lines.push(`  选中图片：${v.state.selectedImageId}`)
+          if (v.state.canvasNodes !== undefined) lines.push(`  画布节点数：${v.state.canvasNodes}`)
+        }
+        if (v.note !== undefined) lines.push(v.note)
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    async execute(args) {
+      const action = requireString(args, 'action', 'action')
+      const status = queue.status()
+
+      if (action === 'status') {
+        return {
+          action,
+          delivered: status.online,
+          queued: status.pending,
+          note: status.online
+            ? `面板在线（${status.lastPollSecondsAgo} 秒前轮询过）。`
+            : `面板未连接${status.lastPollSecondsAgo === null ? '（本次会话从未上报过）' : `（最后轮询在 ${status.lastPollSecondsAgo} 秒前）`}。`,
+          ...(queue.state() === undefined ? {} : {
+            state: {
+              updatedAt: queue.state()?.updatedAt ?? '',
+              ...(status.lastPollSecondsAgo === null ? {} : { lastPollSecondsAgo: status.lastPollSecondsAgo }),
+            },
+          }),
+        }
+      }
+
+      if (action === 'read-state') {
+        const state = queue.state()
+        if (state === undefined) {
+          return { action, delivered: false, queued: status.pending, note: '面板还没有上报过状态（用户尚未打开过美术工坊面板）。' }
+        }
+        const form = state.form ?? {}
+        const formBits = ['prompt', 'category', 'width', 'height', 'steps', 'backend', 'model', 'transparent']
+          .filter((key) => form[key] !== undefined && form[key] !== '')
+          .map((key) => `${key}=${JSON.stringify(form[key])}`)
+        return {
+          action,
+          delivered: true,
+          queued: status.pending,
+          state: {
+            updatedAt: state.updatedAt,
+            ...(status.lastPollSecondsAgo === null ? {} : { lastPollSecondsAgo: status.lastPollSecondsAgo }),
+            ...(state.section === undefined ? {} : { section: state.section }),
+            ...(state.activeWorkflowId === undefined ? {} : { activeWorkflowId: state.activeWorkflowId }),
+            ...(state.selectedImageId === undefined ? {} : { selectedImageId: state.selectedImageId }),
+            ...(formBits.length === 0 ? {} : { formDescription: formBits.join(', ') }),
+            ...(state.canvas?.nodeCount === undefined ? {} : { canvasNodes: state.canvas.nodeCount }),
+          },
+        }
+      }
+
+      // The remaining actions all queue an instruction.
+      const payload: Record<string, unknown> = {}
+      let label = ''
+      if (action === 'fill-form') {
+        const form: Record<string, unknown> = {}
+        if (optionalString(args, 'prompt', 'prompt') !== undefined) form.prompt = optionalString(args, 'prompt', 'prompt')
+        if (optionalString(args, 'negative_prompt', 'negative_prompt') !== undefined) form.negativePrompt = optionalString(args, 'negative_prompt', 'negative_prompt')
+        if (optionalString(args, 'category', 'category') !== undefined) form.category = optionalString(args, 'category', 'category')
+        for (const key of ['width', 'height', 'steps', 'cfg_scale', 'seed'] as const) {
+          const value = optionalNumber(args, key, key, -1, 100000)
+          if (value !== undefined) form[key === 'cfg_scale' ? 'cfgScale' : key] = value
+        }
+        if (optionalString(args, 'model', 'model') !== undefined) form.model = optionalString(args, 'model', 'model')
+        if (optionalString(args, 'backend', 'backend') !== undefined) form.backend = optionalString(args, 'backend', 'backend')
+        if (optionalBoolean(args, 'transparent', 'transparent') !== undefined) form.transparent = optionalBoolean(args, 'transparent', 'transparent')
+        if (optionalBoolean(args, 'seamless', 'seamless') !== undefined) form.seamless = optionalBoolean(args, 'seamless', 'seamless')
+        if (Object.keys(form).length === 0) throw new Error('action=fill-form 至少要给出一个要填的字段（prompt / width / steps / …）')
+        if (optionalBoolean(args, 'autostart', 'autostart') === true) form.autostart = true
+        Object.assign(payload, { form })
+        label = `代理填入表单${form.prompt === undefined ? '' : `：${String(form.prompt).slice(0, 40)}`}`
+      } else if (action === 'focus') {
+        payload.section = optionalString(args, 'section', 'section') ?? 'form'
+        label = `代理切到「${String(payload.section)}」`
+      } else if (action === 'select-image') {
+        payload.image = requireString(args, 'image', 'image')
+        label = `代理选中图片 ${String(payload.image)}`
+      } else if (action === 'toast') {
+        payload.text = requireString(args, 'text', 'text')
+        payload.level = optionalString(args, 'level', 'level') ?? 'info'
+        label = `代理提示：${String(payload.text).slice(0, 40)}`
+      } else {
+        throw new Error(`image_workshop 不支持 action="${action}"`)
+      }
+
+      queue.push(action === 'fill-form' ? 'form.fill' : action === 'focus' ? 'workshop.focus' : action === 'select-image' ? 'gallery.select' : 'toast', label, payload)
+      const after = queue.status()
+      return {
+        action,
+        delivered: after.online,
+        queued: after.pending,
+        ...(after.online ? {} : { note: '面板未连接：指令会保留 10 分钟，用户打开美术工坊后自动执行。' }),
+      }
+    },
+  })
 }
 
 // ─────────────────────────── REST surface (/gig) ───────────────────────────
@@ -4606,8 +5279,31 @@ export function apply(ctx: Context, config: unknown): void {
 
   const gallery = createGalleryStore(openUnit, cfg)
   const ops = createOps({ cfg, backends, post, gallery, jobs })
+  const library = createWorkflowLibrary(cfg)
+  const layoutCache = createLayoutCache(cfg)
+  const uiQueue = createUiQueue()
 
-  registerImageTools(tools, ops)
+  /**
+   * The node layouts that let a workflow's widgets be addressed by name.
+   *
+   * Read from the cache first so editing keeps working with the backend down;
+   * `force` (or a cold cache) fetches the live `/object_info` and re-caches it —
+   * which is also how a newly installed custom node becomes editable.
+   */
+  async function layouts(force = false): Promise<Record<string, WidgetSpec[]> | undefined> {
+    if (!force) {
+      const cached = await layoutCache.load()
+      if (cached !== undefined) return cached
+    }
+    const info = await backends.comfyObjectInfo()
+    if (info === undefined) return force ? undefined : layoutCache.load()
+    const compact = compactLayouts(info)
+    if (Object.keys(compact).length === 0) return layoutCache.load()
+    await layoutCache.store(compact, 'comfyui')
+    return compact
+  }
+
+  registerImageTools(tools, ops, { library, queue: uiQueue, layouts })
 
   // Disposal must cancel in-flight work AND release the gallery unit: a KV unit
   // allows exactly one live handle per backend, so leaking it would make a later
@@ -4675,7 +5371,75 @@ export function apply(ctx: Context, config: unknown): void {
             categories: ART_CATEGORIES,
             controlTypes: Object.keys(CONTROL_PRESETS),
             gallery: { total: images.length, byCategory: counts },
+            ui: uiQueue.status(),
+            workflows: { root: library.root },
           })
+          return
+        }
+
+        // The panel's single round-trip: it reports what it is doing and takes
+        // away the instructions the agent queued for it.
+        if (method === 'POST' && pathname === '/gig/ui/poll') {
+          const body = await readJsonBody(req)
+          if (Array.isArray(body.ack)) {
+            uiQueue.ack(body.ack.filter((id): id is string => typeof id === 'string'))
+          }
+          if (body.state !== null && typeof body.state === 'object' && !Array.isArray(body.state)) {
+            uiQueue.report(body.state as Omit<PanelState, 'updatedAt'>)
+          } else {
+            // A poll with no state still counts as "the panel is alive".
+            uiQueue.report(uiQueue.state() ?? {})
+          }
+          sendJson(res, 200, { commands: uiQueue.pending(), status: uiQueue.status() })
+          return
+        }
+
+        if (method === 'GET' && pathname === '/gig/ui/queue') {
+          sendJson(res, 200, { commands: uiQueue.pending(), status: uiQueue.status(), state: uiQueue.state() ?? null })
+          return
+        }
+
+        if (method === 'GET' && pathname === '/gig/workflows') {
+          const all = await library.list()
+          sendJson(res, 200, {
+            root: library.root,
+            workflows: all.map((w) => ({
+              id: w.id,
+              name: w.meta.name,
+              description: w.meta.description,
+              category: w.meta.category,
+              source: w.meta.source,
+              nodeCount: w.nodeCount,
+              classes: Object.keys(w.classCounts).sort(),
+            })),
+          })
+          return
+        }
+
+        if (method === 'GET' && pathname === '/gig/workflow') {
+          const id = url.searchParams.get('id') ?? ''
+          if (id === '') throw new ClientRouteError('缺少 id 查询参数')
+          const { meta, graph } = await library.read(id)
+          sendJson(res, 200, { meta, graph })
+          return
+        }
+
+        // The canvas saving the user's own edits back into the library.
+        if (method === 'POST' && pathname === '/gig/workflow/save') {
+          const body = await readJsonBody(req)
+          const id = requireString(body, 'id', 'id')
+          if (body.graph === undefined) throw new ClientRouteError('缺少 graph 字段')
+          const rawGraph = body.graph as Record<string, unknown>
+          const graph = isApiWorkflow(rawGraph)
+            ? apiToUi(rawGraph, await layouts().catch(() => undefined))
+            : normalizeUiWorkflow(rawGraph)
+          const meta = await library.save(id, graph, {
+            source: 'canvas',
+            ...(optionalString(body, 'name', 'name') === undefined ? {} : { name: optionalString(body, 'name', 'name') as string }),
+            ...(optionalString(body, 'description', 'description') === undefined ? {} : { description: optionalString(body, 'description', 'description') as string }),
+            ...(optionalString(body, 'category', 'category') === undefined ? {} : { category: optionalString(body, 'category', 'category') as string }),
+          })
+          sendJson(res, 200, { meta, nodeCount: graph.nodes.length })
           return
         }
 

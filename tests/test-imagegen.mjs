@@ -204,7 +204,38 @@ function startFakeComfy(port, requests) {
       return json({ CheckpointLoaderSimple: { input: { required: { ckpt_name: [['anything-v5.safetensors']] } } } })
     }
     if (req.method === 'GET' && url === '/object_info') {
-      return json({ KSampler: {}, CheckpointLoaderSimple: {}, LayeredDiffusionApply: {}, LayeredDiffusionDecodeRGBA: {} })
+      // The classes the built-in workflow templates use, in the real slot shapes.
+      // KSampler's seed carries control_after_generate, i.e. TWO serialised slots.
+      return json({
+        CheckpointLoaderSimple: { input: { required: { ckpt_name: [['anything-v5.safetensors', 'waiIllustriousSDXL_v150.safetensors']] } } },
+        CLIPTextEncode: { input: { required: { text: ['STRING', { multiline: true }], clip: ['CLIP'] } } },
+        EmptyLatentImage: { input: { required: { width: ['INT', { default: 512 }], height: ['INT', { default: 512 }], batch_size: ['INT', { default: 1 }] } } },
+        KSampler: {
+          input: {
+            required: {
+              model: ['MODEL'],
+              seed: ['INT', { default: 0, control_after_generate: true }],
+              steps: ['INT', { default: 20 }],
+              cfg: ['FLOAT', { default: 8 }],
+              sampler_name: [['euler', 'dpmpp_2m']],
+              scheduler: [['normal', 'karras']],
+              positive: ['CONDITIONING'],
+              negative: ['CONDITIONING'],
+              latent_image: ['LATENT'],
+              denoise: ['FLOAT', { default: 1 }],
+            },
+          },
+        },
+        VAEDecode: { input: { required: { samples: ['LATENT'], vae: ['VAE'] } } },
+        VAEEncode: { input: { required: { pixels: ['IMAGE'], vae: ['VAE'] } } },
+        SaveImage: { input: { required: { images: ['IMAGE'], filename_prefix: ['STRING', { default: 'ComfyUI' }] } } },
+        PreviewImage: { input: { required: { images: ['IMAGE'] } } },
+        LoadImage: { input: { required: { image: [['example.png']] } } },
+        UpscaleModelLoader: { input: { required: { model_name: [['RealESRGAN_x4plus_anime_6B.pth']] } } },
+        ImageUpscaleWithModel: { input: { required: { upscale_model: ['UPSCALE_MODEL'], image: ['IMAGE'] } } },
+        LayeredDiffusionApply: { input: { required: { model: ['MODEL'], config: [['SD15', 'SDXL']], weight: ['FLOAT', { default: 1 }] } } },
+        LayeredDiffusionDecodeRGBA: { input: { required: { samples: ['LATENT'], images: ['IMAGE'], config: [['SD15', 'SDXL']], _version: ['INT', { default: 16 }] } } },
+      })
     }
     // Mirrors the real install, where extra_model_paths.yaml points ComfyUI at
     // the SD WebUI model directories.
@@ -447,6 +478,8 @@ async function main() {
     defaultBackend: 'sdwebui',
     requestTimeoutMs: 60000,
     startTimeoutMs: 5000,
+    // Never let a test seed the workflow library into the user's real data root.
+    dataRoot: join(workRoot, 'data'),
   }
 
   const storage = makeStorageBackend()
@@ -460,8 +493,9 @@ async function main() {
   const expectedTools = [
     'image_backend_status', 'image_generate', 'image_edit', 'image_variants',
     'image_upscale', 'image_cutout', 'image_interrogate', 'image_gallery',
+    'image_workflow', 'image_workshop',
   ]
-  assert(registered.length === 8, `registers exactly 8 tools (got ${registered.length})`)
+  assert(registered.length === 10, `registers exactly 10 tools (got ${registered.length})`)
   for (const toolName of expectedTools) {
     assert(byName(registered, toolName) !== undefined, `registers ${toolName}`)
   }
@@ -849,6 +883,145 @@ async function main() {
   const knownGapRoutes = ['/gap/assets', '/gap/state']
   assert(gapRoutes.length > 0 && gapRoutes.every((route) => knownGapRoutes.includes(route)),
     `the panel only calls verified godot-asset-planner routes (${gapRoutes.join(', ')})`)
+
+  // ── T17: image_workflow — author, patch and run a ComfyUI workflow ──
+  const workflowTool = byName(registered, 'image_workflow')
+  const listResult = unwrap(await exec(workflowTool, { action: 'list' }))
+  assert(listResult.workflows.length === 6, `the library seeds the 6 built-in templates (${listResult.workflows.length})`)
+  assert(listResult.workflows.some((w) => w.id === 'sd15-basic'), 'the SD1.5 template is listed')
+  assert(listResult.workflows.every((w) => w.nodeCount > 0), 'every listed template has nodes')
+  assert(listResult.workflows.every((w) => w.classes.length > 0), 'every listing carries its class inventory')
+
+  const readResult = unwrap(await exec(workflowTool, { action: 'read', id: 'sd15-basic' }))
+  assert(readResult.workflow.nodeCount === 7, 'action=read reports the node count')
+  assert(readResult.workflow.linkCount === 9, 'action=read reports the link count')
+  const samplerRead = readResult.workflow.nodes.find((n) => n.type === 'KSampler')
+  assert(samplerRead.widgets.steps === 20 && samplerRead.widgets.sampler_name === 'dpmpp_2m',
+    'action=read decodes the KSampler widgets by name (the two-slot seed did not shift them)')
+
+  // Patch by name; the layouts come from the fake server's /object_info, cached.
+  const patchResult = unwrap(await exec(workflowTool, {
+    action: 'patch',
+    id: 'sd15-basic',
+    edits: [
+      { classType: 'CLIPTextEncode', title: '正向提示词', set: { text: 'a red potion, game icon' } },
+      { classType: 'KSampler', set: { steps: 9, seed: 1234 } },
+    ],
+  }))
+  assert(patchResult.applied.length === 2, `action=patch reports what it changed (${patchResult.applied.join('、')})`)
+  const afterPatch = unwrap(await exec(workflowTool, { action: 'read', id: 'sd15-basic' }))
+  assert(afterPatch.workflow.nodes.find((n) => n.title === '正向提示词').widgets.text === 'a red potion, game icon',
+    'the patched prompt reads back by name')
+  const patchedSamplerRead = afterPatch.workflow.nodes.find((n) => n.type === 'KSampler')
+  assert(patchedSamplerRead.widgets.steps === 9 && patchedSamplerRead.widgets.seed === 1234,
+    'the patched sampler reads back with no slot drift')
+  assert(patchedSamplerRead.widgets.sampler_name === 'dpmpp_2m' && patchedSamplerRead.widgets.denoise === 1,
+    'the widgets AFTER the seed kept their values')
+  assert(patchedSamplerRead.mode === 0, 'each node reports its mode')
+
+  await rejects(() => exec(workflowTool, { action: 'patch', id: 'sd15-basic', edits: [{ classType: 'KSampler', set: { nope: 1 } }] }),
+    /没有这些参数：nope/, 'patching an unknown widget name lists the available names')
+  await rejects(() => exec(workflowTool, { action: 'read', id: 'no-such-workflow' }), /工作流库中没有/, 'reading a missing workflow is actionable')
+  await rejects(() => exec(workflowTool, { action: 'patch', id: 'sd15-basic' }), /非空的 edits/, 'patch without edits is rejected')
+  await rejects(() => exec(workflowTool, { action: 'nope' }), /不支持 action/, 'an unknown action is rejected')
+
+  // Run it: the fake ComfyUI answers with a PNG that must land as a real asset.
+  const runResult = unwrap(await exec(workflowTool, { action: 'run', id: 'sd15-basic', category: 'item', project_id: 'testproj' }))
+  assert(runResult.images.length === 1, 'action=run produced one image')
+  const wfImage = runResult.images[0]
+  assert(wfImage.backend === 'comfyui', 'the workflow ran on ComfyUI')
+  assert(wfImage.filePath.includes(join('assets', 'generated', 'item')), 'the workflow output lands in assets/generated/item')
+  assert(typeof wfImage.resPath === 'string' && wfImage.resPath.startsWith('res://'), 'the workflow output has a res:// path')
+  assert(existsSync(wfImage.filePath), 'the workflow output exists on disk')
+
+  const createdWf = unwrap(await exec(workflowTool, { action: 'create', name: 'my workflow', from: 'item-icon', category: 'item' }))
+  assert(createdWf.workflow.id === 'my-workflow', `action=create slugs the id (${createdWf.workflow.id})`)
+  assert(createdWf.workflow.nodeCount === 7 && createdWf.workflow.linkCount === 9, 'action=create copies the source template')
+  const toApi = unwrap(await exec(workflowTool, { action: 'to-api', id: 'my-workflow' }))
+  assert(Object.values(toApi.graph).some((n) => n.class_type === 'KSampler'),
+    'action=to-api converts the canvas graph into an executable API graph')
+  const toUi = unwrap(await exec(workflowTool, { action: 'to-ui', id: 'sd15-basic' }))
+  assert(Array.isArray(toUi.graph.nodes) && toUi.graph.nodes.length === 7, 'action=to-ui returns a canvas graph')
+  assert(/已删除/.test(unwrap(await exec(workflowTool, { action: 'delete', id: 'my-workflow' })).note), 'action=delete removes it')
+  await rejects(() => exec(workflowTool, { action: 'read', id: 'my-workflow' }), /工作流库中没有/, 'the deleted workflow is gone')
+
+  // ── T18: image_workshop — driving the panel from the conversation ──
+  const workshopTool = byName(registered, 'image_workshop')
+  const status0 = unwrap(await exec(workshopTool, { action: 'status' }))
+  assert(status0.delivered === false && status0.queued === 0, 'with no panel connected, status is offline and the queue is empty')
+  assert(/从未上报过/.test(status0.note), 'status says the panel has never polled')
+  const noState = unwrap(await exec(workshopTool, { action: 'read-state' }))
+  assert(noState.delivered === false && /尚未打开/.test(noState.note), 'read-state says the panel never reported')
+
+  const filled = unwrap(await exec(workshopTool, { action: 'fill-form', prompt: 'a blue slime', width: 512, steps: 12, transparent: true }))
+  assert(filled.queued === 1 && filled.delivered === false, 'fill-form queues the instruction and reports the panel offline')
+  assert(/面板未连接/.test(filled.note), 'and says it is queued rather than applied')
+  assert(unwrap(await exec(workshopTool, { action: 'status' })).queued === 1, 'the queue depth reflects the pending instruction')
+  const openedOffline = unwrap(await exec(workflowTool, { action: 'open', id: 'sd15-basic' }))
+  assert(openedOffline.delivered === false && /指令已排队/.test(openedOffline.note), 'action=open queues the load instruction while offline')
+  await rejects(() => exec(workshopTool, { action: 'fill-form' }), /至少要给出一个要填的字段/, 'fill-form with no fields is rejected')
+  await rejects(() => exec(workshopTool, { action: 'toast' }), /text must be a non-empty string/, 'toast without text is rejected')
+
+  // ── R-ui: the panel's single poll round-trip (state up, instructions down) ──
+  const poll1 = await callRoute(webServer, 'POST', '/gig/ui/poll', { state: { section: 'form', form: { prompt: 'draft in progress', steps: 12 } } })
+  assert(poll1.status === 200 && Array.isArray(poll1.body.commands), 'POST /gig/ui/poll returns a command array')
+  assert(poll1.body.commands.length === 2, `both queued instructions are delivered (${poll1.body.commands.length})`)
+  const kinds = poll1.body.commands.map((c) => c.kind).sort()
+  assert(kinds[0] === 'form.fill' && kinds[1] === 'workflow.load', `the instruction kinds are preserved (${kinds.join(', ')})`)
+  const fillCommand = poll1.body.commands.find((c) => c.kind === 'form.fill')
+  assert(fillCommand.payload.form.prompt === 'a blue slime' && fillCommand.payload.form.width === 512,
+    'the instruction carries the payload verbatim')
+  assert(typeof fillCommand.label === 'string' && fillCommand.label !== '', 'each instruction carries a human-readable label')
+  assert(poll1.body.status.online === true, 'the poll marks the panel as online')
+
+  const stateNow = unwrap(await exec(workshopTool, { action: 'read-state' }))
+  assert(stateNow.delivered === true && stateNow.state.formDescription.includes('draft in progress'),
+    'read-state returns what the user is editing, including the unsaved draft')
+  assert(stateNow.state.section === 'form', 'and which section they are looking at')
+
+  const acked = await callRoute(webServer, 'POST', '/gig/ui/poll', {
+    ack: poll1.body.commands.map((c) => c.id),
+    state: { section: 'form', form: { prompt: 'draft in progress' } },
+  })
+  assert(acked.body.commands.length === 0, 'acknowledging instructions clears them from the queue')
+  const status2 = unwrap(await exec(workshopTool, { action: 'status' }))
+  assert(status2.queued === 0 && status2.delivered === true, 'the queue is empty and the panel is online')
+
+  const openedOnline = unwrap(await exec(workflowTool, { action: 'open', id: 'item-icon' }))
+  assert(openedOnline.delivered === true && /已让画布载入/.test(openedOnline.note), 'once a panel polls, action=open delivers immediately')
+  const poll2 = await callRoute(webServer, 'POST', '/gig/ui/poll', {})
+  assert(poll2.body.commands.length === 1 && poll2.body.commands[0].kind === 'workflow.load', 'the workflow.load instruction reaches the panel')
+  assert(poll2.body.commands[0].payload.graph.nodes.length === 7, 'the instruction carries the whole graph for the canvas')
+  await callRoute(webServer, 'POST', '/gig/ui/poll', { ack: [poll2.body.commands[0].id] })
+
+  // A patch while the panel is open must push the edit so the user SEES it.
+  const livePatch = unwrap(await exec(workflowTool, { action: 'patch', id: 'item-icon', edits: [{ classType: 'KSampler', set: { steps: 5 } }] }))
+  assert(livePatch.applied.length === 1 && livePatch.note === undefined, 'patching while the panel is open needs no offline warning')
+  const poll3 = await callRoute(webServer, 'POST', '/gig/ui/poll', {})
+  assert(poll3.body.commands.some((c) => c.kind === 'workflow.patch'), 'a live patch is pushed to the canvas')
+  await callRoute(webServer, 'POST', '/gig/ui/poll', { ack: poll3.body.commands.map((c) => c.id) })
+
+  const queueRoute = await callRoute(webServer, 'GET', '/gig/ui/queue')
+  assert(queueRoute.status === 200 && Array.isArray(queueRoute.body.commands), 'GET /gig/ui/queue exposes the queue for diagnostics')
+
+  // ── R-workflows: the panel reading and saving the library ──
+  const wfRoute = await callRoute(webServer, 'GET', '/gig/workflows')
+  assert(wfRoute.status === 200 && wfRoute.body.workflows.length >= 5, 'GET /gig/workflows lists the library')
+  assert(typeof wfRoute.body.root === 'string' && wfRoute.body.root.includes('workflows'), 'and reports where the library lives')
+  const oneWf = await callRoute(webServer, 'GET', '/gig/workflow?id=sd15-basic')
+  assert(oneWf.status === 200 && Array.isArray(oneWf.body.graph.nodes), 'GET /gig/workflow returns the full canvas document')
+  assert(oneWf.body.meta.name.includes('SD1.5'), 'and its metadata')
+  const savedWf = await callRoute(webServer, 'POST', '/gig/workflow/save', {
+    id: 'sd15-basic',
+    graph: oneWf.body.graph,
+    name: '用户改过的 SD1.5',
+  })
+  assert(savedWf.status === 200 && savedWf.body.nodeCount === 7, 'POST /gig/workflow/save stores canvas edits')
+  const reread = await callRoute(webServer, 'GET', '/gig/workflow?id=sd15-basic')
+  assert(reread.body.meta.name === '用户改过的 SD1.5' && reread.body.meta.source === 'canvas',
+    'the saved name persists and the source is recorded as the canvas')
+  const missingWf = await callRoute(webServer, 'GET', '/gig/workflow?id=does-not-exist')
+  assert(missingWf.status === 400, 'reading a missing workflow over REST is a 400')
 
   // ── P1: persistence across a plugin restart ──
   assert(disposers.length >= 2, 'the plugin registers disposers for its jobs and storage unit')

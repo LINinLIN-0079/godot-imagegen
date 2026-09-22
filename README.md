@@ -12,8 +12,10 @@
 
 | 层 | 内容 |
 | --- | --- |
-| 模型工具（8） | `image_backend_status` `image_generate` `image_edit` `image_variants` `image_upscale` `image_cutout` `image_interrogate` `image_gallery` |
-| REST（`/gig/*`） | 面板与宿主的同源通道：状态、图库、原图字节、生成/编辑/放大/抠图/反推任务、任务轮询与取消、后端启停、设置与预设 |
+| 模型工具（10） | `image_backend_status` `image_generate` `image_edit` `image_variants` `image_upscale` `image_cutout` `image_interrogate` `image_gallery` `image_workflow` `image_workshop` |
+| REST（`/gig/*`） | 面板与宿主的同源通道：状态、图库、原图字节、生成/编辑/放大/抠图/反推任务、任务轮询与取消、后端启停、设置与预设、工作流库读写、面板指令轮询 |
+| 工作流库 | 插件本地（`$DSH_HOME/godot-imagegen/workflows/`，**从不写入你的 ComfyUI**）：6 套游戏美术模板 + 任意新建/改写；元数据写在文档自身的 `extra` 里 |
+| 对话驱动 | 代理可通过 `image_workflow` / `image_workshop` 改写工作流、把提示词与参数填进面板、在面板里定位图片——你只需在对话里说
 | 浏览器面板 | better-sidebar tab「美术工坊」（order 63）：后端卡片、设置、提示词预设库、参数面板、任务进度（含后端实时预览图）、图库缩略图 + 灯箱（放大/抠图/反推/复制路径/注册资产/删除） |
 | DSH 技能 | `D:\游戏开发skill\game-art` —— 游戏美术提示词手册、分品类尺寸与透明规范、端到端工作流、21 条样例提示词、色键抠图脚本 |
 | 持久化 | 独立 KV 单元 `godot_imagegen`（图库记录 + 用户预设 + 设置） |
@@ -143,6 +145,35 @@
 
 `image` 参数接受三种形式：**绝对路径**、**`res://` 路径**、**图库 id**（如 `img_1a2b3c4d5e6f`）。
 
+### `image_workflow` — 把 ComfyUI 工作流当成可编辑对象
+
+`action`：`list` / `read` / `create` / `patch` / `save` / `to-api` / `to-ui` / `run` / `open` / `delete`
+
+关键是 **`patch` 按参数名改，而不是按下标**：
+
+```jsonc
+{ "action": "patch", "id": "sd15-basic",
+  "edits": [
+    { "classType": "CLIPTextEncode", "title": "正向提示词", "set": { "text": "a red potion, game icon" } },
+    { "classType": "KSampler", "set": { "steps": 9, "seed": 1234 } }
+  ] }
+```
+
+为什么这点很重要：UI 格式的 `widgets_values` 是**位置数组**，而 ComfyUI 给任何带
+`control_after_generate` 的 widget（也就是每个 `seed`）**多留一个槽位**。按下标改会让 seed
+之后的每个字段整体错位——**不报错，只是安静地出一张参数全乱的图**。本插件的布局是从
+`/object_info` 推导的，并且会缓存，所以后端关着也能继续编辑。
+
+`run` 会把工作流跑出来的图按普通生成物一样归档：落进 `<项目>/assets/generated/<品类>/`、
+拿到 `res://` 路径、进图库。工作流没有 SaveImage/PreviewImage 节点时会明确报错，而不是空转到超时。
+
+### `image_workshop` — 让代理直接操作面板
+
+`action`：`fill-form` / `focus` / `select-image` / `toast` / `read-state` / `status`
+
+面板在它已有的 1.5s 轮询里一次往返完成两件事：上报自己在看什么（含**未保存的草稿**），取走代理排队的指令。
+面板没打开时指令会排队（保留 10 分钟），工具会明确告诉你"已排队、未送达"，而不是假装成功。
+
 ## 6. 与 godot-asset-planner 的协作
 
 **不共享 storage。** `godot_asset_planner` 这个 KV 单元每个后端只允许一个活动句柄，归 godot-asset-planner 所有，
@@ -162,19 +193,26 @@
 - **绝不终止非本插件启动的进程**：`action=stop` 对你自己用绘世启动器拉起的实例会明确拒绝并说明原因。
 - 后端启动是**面板上点按钮才发生**，不会在你不知情时占显存。
 - 插件 dispose 时会 abort 在飞任务并关闭 KV 单元，避免热重载后 `unit is already open`。
+- **阶段一不写入你的 ComfyUI 安装目录**：工作流库、节点布局缓存、备份目录全部在
+  `$DSH_HOME/godot-imagegen/` 下。任何写入 `D:\AKI open\` 的动作（阶段二同步 web 扩展）都会先备份，
+  并维护可一键卸载的文件清单。
 
 ## 8. 验证
 
 ```powershell
 cd D:\deepseek\my-imagegen            # 本仓库根目录
-npm test                              # = 下面两条离线套件
-node tests/test-imagegen.mjs          # 120 条断言（离线，任何时候都能跑）
+npm test                              # = 下面四条离线套件
+node tests/test-workflow.mjs          # 65 条断言（工作流层，含 10 个真实 ComfyUI 导出文件）
+node tests/test-workflow-library.mjs  # 271 条断言（工作流库、6 套模板、布局缓存）
+node tests/test-imagegen.mjs          # 181 条断言（10 个工具 + REST + 真实 Python 后处理）
 node tests/test-render-imagegen.mjs   # 71 条断言（客户端面板渲染）
 node tests/test-imagegen-live.mjs          # 真实 SD WebUI 端到端（后端没起时自动跳过）
-node tests/test-imagegen-live-comfy.mjs    # 真实 ComfyUI 端到端（后端没起时自动跳过）
+node tests/test-imagegen-live-comfy.mjs    # 真实 ComfyUI 端到端，含真跑内置模板（没起时跳过）
 node --check lib/client.js
 node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"   # 技能 frontmatter / 行尾校验
 ```
+
+后端起来时总计 **611 条断言**（65 + 271 + 181 + 71 + 23）。
 
 - **离线套件**用两个真实 HTTP 服务冒充 A1111 与 ComfyUI（覆盖 `/sdapi/v1/*`、`/controlnet/model_list`、
   `/tagger/v1/*`、`/prompt`、`/history`、`/view`），并用**真实的秋叶 Python** 跑抠图与放大，
