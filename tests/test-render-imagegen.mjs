@@ -264,6 +264,31 @@ const fakeFrame = { postMessage: (message, origin) => { sentMessages.push({ mess
   assert(plugin.isCanvasMessage({ source: frame, data: null }, frame) === false, 'including a null payload')
 }
 
+// What the panel forwards down each tick: the queued commands plus the heartbeat.
+{
+  const load = { __gig: 't', type: 'canvas.load', seq: 's1' }
+  const ping = { __gig: 't', type: 'canvas.ping' }
+  const both = plugin.canvasEnvelopes({ canvasMessages: [load], canvasPing: ping })
+  assert(both.length === 2 && both[0] === load && both[1] === ping, 'canvasEnvelopes forwards the queue and the heartbeat')
+  assert(plugin.canvasEnvelopes({ canvasMessages: [], canvasPing: ping }).length === 1,
+    'an idle tick still forwards the heartbeat — that is what keeps the canvas connected')
+  assert(plugin.canvasEnvelopes({ canvasPing: ping }).length === 1, 'and it does not depend on the queue field being an array')
+  assert(plugin.canvasEnvelopes({ canvasMessages: [load] }).length === 1, 'with no bridge installed there is no heartbeat to send')
+  assert(plugin.canvasEnvelopes({}).length === 0, 'and an empty response forwards nothing')
+  assert(plugin.canvasEnvelopes(undefined).length === 0, 'not even when the host answered nothing at all')
+  assert(plugin.canvasEnvelopes({ canvasPing: 'nope', canvasMessages: [] }).length === 0, 'a junk heartbeat is dropped rather than posted')
+}
+
+// The three canvas states must read differently, or a user restarts a healthy
+// backend because one message covered all of them.
+{
+  assert(/画布已连接/.test(plugin.canvasStatusLine({ online: true, nodeCount: 9 }, 9, true)), 'a live canvas says so, with its node count')
+  const quiet = plugin.canvasStatusLine({ online: false, lastPollSecondsAgo: 42 }, undefined, false)
+  assert(/42 秒没应声/.test(quiet) && /「画布」/.test(quiet), 'a canvas that answered then went quiet reports the gap and points at the 画布 section')
+  const never = plugin.canvasStatusLine({ online: false }, undefined, false)
+  assert(/重启 ComfyUI/.test(never) && !/没应声/.test(never), 'a canvas that never answered points at the restart instead')
+}
+
 // ── step 3: apply() against a capturing betterSidebar ──
 
 const descriptors = []
@@ -716,13 +741,19 @@ globalThis.fetch = async (path, options) => {
   if (path === '/gig/extension') return jsonOk({ installed: true, files: 2, detail: '已安装', canvas: { online: true, nodeCount: 7 } })
   if (path === '/gig/ui/poll') {
     relayPollBodies.push(body)
+    // The instruction is offered only on the FIRST poll; the heartbeat rides every
+    // one. That is what lets the assertions below prove the ping is relayed even
+    // on a tick with nothing queued — the case where an idle canvas used to go
+    // quiet and the host's 15s liveness window expired.
+    const first = relayPollBodies.length === 1
     return jsonOk({
       commands: [],
       status: { online: true, pending: 0, lastPollSecondsAgo: 0, reportedAt: null },
-      canvasMessages: [{
+      canvasMessages: first ? [{
         __gig: 'tok', type: 'canvas.load', seq: 'ui_1', label: '代理载入工作流 道具图标',
         graph: { nodes: [{ id: 1, type: 'KSampler' }], links: [] },
-      }],
+      }] : [],
+      canvasPing: { __gig: 'tok', type: 'canvas.ping' },
       canvasStatus: { online: true },
       canvasErrors: [],
     })
@@ -771,11 +802,13 @@ assert(relayRequests.some((r) => r.path === '/gig/ui/poll'), 'running the effect
 assert(relayPollBodies.length === 1, 'exactly one poll per tick')
 assert(relayPollBodies[0].state.origin === 'http://127.0.0.1:43120',
   'the poll reports the origin the bridge install must bake in (taken from window.location)')
-assert(canvasPosts.length === 1, 'the queued canvas instruction was posted INTO the iframe')
+assert(canvasPosts.length === 2, `the queued instruction AND the heartbeat were posted into the iframe (got ${canvasPosts.length})`)
 assert(canvasPosts[0].origin === 'http://127.0.0.1:8188', 'pinned to the ComfyUI origin — never posted to "*"')
 assert(canvasPosts[0].message.seq === 'ui_1' && canvasPosts[0].message.graph.nodes.length === 1,
   'and it is the envelope the host stamped, delivered verbatim')
 assert(canvasPosts[0].message.__gig === 'tok', 'with the install token intact — the panel relays it without interpreting it')
+assert(canvasPosts[1].message.type === 'canvas.ping' && canvasPosts[1].message.__gig === 'tok',
+  'the heartbeat follows the instruction, stamped the same way')
 
 // The other direction: what the canvas says is buffered and carried up in the
 // NEXT poll, and only when it came from our own iframe.
@@ -793,6 +826,12 @@ assert(Array.isArray(lastPoll.inbound) && lastPoll.inbound.length === 1,
 assert(lastPoll.inbound[0].state.nodeCount === 9 && lastPoll.inbound[0].state.title === 'item-icon',
   'and it is the real canvas state, not the one posted by a foreign window')
 assert(!JSON.stringify(lastPoll.inbound).includes('spoofed'), 'a message from another window is dropped, not relayed')
+// The tick above had NO queued instruction, and the heartbeat still went out —
+// without this the host's liveness window would expire on an idle canvas.
+const postsBeforeIdleTick = canvasPosts.length - 1
+assert(canvasPosts[canvasPosts.length - 1].message.type === 'canvas.ping',
+  'on an idle tick the heartbeat is still relayed (this is what keeps the canvas connected)')
+assert(postsBeforeIdleTick === 2, 'and it is the only thing that needed to go')
 
 // ── the stop button in the MOUNTED workbench actually stops ──
 //

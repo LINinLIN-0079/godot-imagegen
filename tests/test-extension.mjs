@@ -434,6 +434,7 @@ async function main() {
     await settle()
     const state = runtime.posted[runtime.posted.length - 1].message
     assert(state.type === 'canvas.state' && state.state.nodeCount === 3, 'a ping is answered with the canvas state')
+    assert(state.seq === undefined, 'and the pong carries no seq, so the host never tries to acknowledge a heartbeat')
     assert(state.state.missingClasses.length === 0, 'with no missing node classes for a healthy graph')
 
     const graph = { nodes: [{ id: 1, type: 'KSampler' }], links: [] }
@@ -550,6 +551,29 @@ async function main() {
   assert(relay.graph.nodes.length > 0, 'carrying the whole graph')
   assert(typeof relay.seq === 'string' && typeof relay.label === 'string', 'with a seq to acknowledge and a human label')
 
+  // ── the heartbeat ──────────────────────────────────────────────────────────
+  //
+  // The extension speaks ONCE at boot and then only when spoken to. Without a
+  // periodic ping the host's 15s liveness window expires a few seconds after a
+  // successful connection, and the panel reports "not connected" on a canvas that
+  // is perfectly fine — which is exactly what the user saw. This is the guard.
+  assert(poll2.body.canvasPing !== null && typeof poll2.body.canvasPing === 'object',
+    'every panel poll carries a canvas heartbeat')
+  assert(poll2.body.canvasPing.__gig === liveManifest.token, 'stamped with the install token, like every other envelope')
+  assert(poll2.body.canvasPing.type === 'canvas.ping', 'and it is a ping')
+  assert(poll2.body.canvasPing.seq === undefined, 'carrying no seq — there is nothing to acknowledge')
+  assert(!(poll2.body.canvasMessages || []).some((m) => m.type === 'canvas.ping'),
+    'and it is NOT a queued command, so it never enters the ack bookkeeping')
+  assert(poll2.body.canvasStatus.pending === 1, 'the queue depth still counts only the real instruction')
+
+  // The canvas answering a ping (no seq) must count as liveness on its own.
+  const pong = await callRoute(webServer, 'POST', '/gig/canvas/inbound', {
+    messages: [{ __gig: liveManifest.token, type: 'canvas.state', state: { nodeCount: 7, title: 'item-icon' } }],
+  })
+  assert(pong.body.accepted === 1, 'a heartbeat reply is accepted')
+  assert(pong.body.canvas.online === true, 'and marks the canvas as live')
+  assert(poll2.body.canvasStatus.pending === 1, 'without touching the command queue')
+
   // Relaying it again while the canvas has not answered yet is deliberate: the
   // command stays queued until the canvas says what happened.
   const poll2b = await callRoute(webServer, 'POST', '/gig/ui/poll', {})
@@ -606,7 +630,29 @@ async function main() {
   })
   assert(afterUninstall.body.accepted === 0 && afterUninstall.body.rejected.length === 1, 'once uninstalled, no canvas message is accepted')
 
-  // ── L: the panel-side relay helpers are covered by the client render suite ──
+  // ── the liveness window ────────────────────────────────────────────────────
+  //
+  // The panel and the canvas are judged on different clocks: a hidden window makes
+  // Chromium throttle the shared poll timer to about once a minute, and a canvas
+  // that was fine a moment ago must not be reported as gone. Both windows are
+  // exercised here with a short one so the test stays fast.
+  {
+    const quick = plugin.createUiQueue({ onlineWindowMs: 60 })
+    assert(quick.online() === false, 'a queue with no report at all is offline')
+    quick.report({ section: 'canvas' })
+    assert(quick.online() === true, 'a fresh report makes it online')
+    await new Promise((resolve) => setTimeout(resolve, 90))
+    assert(quick.online() === false, 'and it goes offline once its own window has passed')
+    assert(quick.status().lastPollSecondsAgo === 0 || quick.status().lastPollSecondsAgo === null,
+      'while the reported age is still readable for the UI copy')
+
+    const defaulted = plugin.createUiQueue()
+    defaulted.report({})
+    await new Promise((resolve) => setTimeout(resolve, 90))
+    assert(defaulted.online() === true, 'the default window is far longer than that (the panel clock)')
+  }
+
+  // ── K: the panel-side relay helpers are covered by the client render suite ──
   // (relayToCanvas / isCanvasMessage live in lib/client.js, which only runs in a
   // browser-shaped environment; tests/test-render-imagegen.mjs exercises them.)
 

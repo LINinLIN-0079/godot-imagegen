@@ -4002,6 +4002,18 @@ const UI_COMMAND_TTL_MS = 10 * 60 * 1000
 /** A panel counts as connected when it polled within this window. */
 const UI_PANEL_ONLINE_MS = 15_000
 
+/**
+ * How long a canvas report stays credible.
+ *
+ * Deliberately four times the panel window: the panel and the canvas share one
+ * poll, and a hidden or minimized window makes Chromium throttle that timer
+ * (down to about once a minute). With a 15s window the card would then flip to
+ * "not connected" on a canvas that is perfectly alive — the exact symptom this
+ * heartbeat exists to prevent — so the canvas is judged on a looser clock, and
+ * the card reports how long the silence has actually been.
+ */
+const CANVAS_ONLINE_MS = 60_000
+
 /** The host-side instruction queue and the panel's self-report. */
 export interface UiQueue {
   push(kind: UiCommand['kind'], label: string, payload: Record<string, unknown>): UiCommand
@@ -4020,7 +4032,10 @@ export interface UiQueue {
 
 /** Create the UI command queue. In-memory on purpose: instructions are for the
  *  live panel, not a durable log — a restart should not replay old keystrokes. */
-export function createUiQueue(): UiQueue {
+export function createUiQueue(options?: { onlineWindowMs?: number }): UiQueue {
+  const onlineWindowMs = options?.onlineWindowMs !== undefined && options.onlineWindowMs > 0
+    ? options.onlineWindowMs
+    : UI_PANEL_ONLINE_MS
   const commands = new Map<string, UiCommand>()
   let lastState: PanelState | undefined
   let lastPoll = 0
@@ -4032,7 +4047,7 @@ export function createUiQueue(): UiQueue {
     }
   }
 
-  const isOnline = (): boolean => lastPoll > 0 && Date.now() - lastPoll < UI_PANEL_ONLINE_MS
+  const isOnline = (): boolean => lastPoll > 0 && Date.now() - lastPoll < onlineWindowMs
 
   return {
     push(kind, label, payload) {
@@ -5978,8 +5993,9 @@ export function apply(ctx: Context, config: unknown): void {
   const uiQueue = createUiQueue()
   // A second, independent queue for the embedded ComfyUI canvas. Separate on
   // purpose: the panel and the canvas come and go on their own schedules, and
-  // one being offline must never mark the other unreachable.
-  const canvasQueue = createUiQueue()
+  // one being offline must never mark the other unreachable. It also gets the
+  // looser liveness window (see CANVAS_ONLINE_MS).
+  const canvasQueue = createUiQueue({ onlineWindowMs: CANVAS_ONLINE_MS })
   // Why the canvas refused the last graphs. Kept in memory only, like the
   // queues: the agent needs to see "app.loadGraphData threw" instead of silently
   // retrying a graph that will never load.
@@ -6159,10 +6175,19 @@ export function apply(ctx: Context, config: unknown): void {
               label: command.label,
               graph: command.payload.graph,
             }))
+          // A heartbeat, and NOT part of the command queue: the extension only
+          // ever speaks when spoken to (plus one hello at boot), so without this
+          // the canvas's last report ages out of the 15s liveness window and the
+          // panel would show "not connected" a few seconds after a successful
+          // connection. It carries no seq, because there is nothing to ack.
+          const canvasPing = canvasToken === undefined
+            ? null
+            : { __gig: canvasToken, type: 'canvas.ping' }
           sendJson(res, 200, {
             commands: uiQueue.pending(),
             status: uiQueue.status(),
             canvasMessages,
+            canvasPing,
             canvasStatus: canvasQueue.status(),
             canvasInbound: inbound,
             canvasErrors,

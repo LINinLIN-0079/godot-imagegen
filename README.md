@@ -121,6 +121,16 @@
 仍然是旧副本，只能等下一次重启。而且**只有内容真的不一致时才写**：否则每次启动都会去动你的
 ComfyUI 安装目录、还多留一份备份，毫无意义。
 
+**心跳**：扩展只在两种时刻说话——启动时打个招呼，以及被问到的时候。所以宿主在**每次面板轮询**
+里都塞一条 `canvas.ping`（带令牌、不带 seq，因此不进指令队列、不需要确认），面板把它转进 iframe，
+扩展回一份画布摘要，面板再捎回宿主。没有这条心跳，"画布已连接"会在连上后十几秒变成"没连接"——
+报告过期了，而画布其实好好的。
+
+**两个时钟是故意分开的**：面板在线判定用 15 秒，画布用 **60 秒**。因为轮询是面板和画布共用的同一次
+往返，而**窗口最小化/被遮挡时 Chromium 会把定时器节流到大约每分钟一次**——用 15 秒判画布，就会出现
+"人切了个窗口，画布就显示掉线"。卡片上还会写明"已经 N 秒没应声"，并提示多半是「画布」小节没打开
+（面板窄时它默认折叠），而不是让你去重启一个本来正常的后端。
+
 还有一个实测发现的坑：ComfyUI 启动时 `import` 这个包，Python 会在包里写下
 `__pycache__/__init__.cpython-3xx.pyc`。**它也算残留**，所以卸载会一并删掉——但只删文件名词干
 与"本次安装过的文件"对得上的 `.pyc`，别人放进去的 `.pyc` 会保留并如实报告。
@@ -340,12 +350,12 @@ image_workflow  action="patch" id="item-icon" edits=[…] to_canvas=true   # 改
 
 ```powershell
 cd D:\deepseek\my-imagegen            # 本仓库根目录
-npm test                              # = 下面五条"离线"套件（857 条；ComfyUI 开着则 879 条，见下）
+npm test                              # = 下面五条"离线"套件（885 条；ComfyUI 开着则 907 条，见下）
 node tests/test-workflow.mjs          # 62 条（ComfyUI 开着 65 条）：工作流层，含 10 个真实 ComfyUI 导出文件
 node tests/test-workflow-library.mjs  # 252 条（ComfyUI 开着 271 条）：工作流库、6 套模板、布局缓存
 node tests/test-imagegen.mjs          # 187 条（10 个工具 + REST + 真实 Python 后处理）
-node tests/test-extension.mjs         # 161 条（桥接：备份/清单/卸载/令牌/中继/零残留/真跑扩展/启动同步）
-node tests/test-render-imagegen.mjs   # 195 条（客户端面板渲染，含三态窗口、浮窗几何补丁，真的跑一遍画布中继，
+node tests/test-extension.mjs         # 176 条（桥接：备份/清单/卸载/令牌/中继/心跳/零残留/真跑扩展/启动同步）
+node tests/test-render-imagegen.mjs   # 208 条（客户端面板渲染，含三态窗口、浮窗几何补丁，真的跑一遍画布中继与心跳，
                                       #   并断言 启动/停止 真的挂在面板上、点下去真的打到宿主）
 node tests/test-imagegen-live.mjs          # 29 条断言：真实 SD WebUI 端到端（后端没起时自动跳过）
 node tests/test-imagegen-live-comfy.mjs    # 23 条断言：真实 ComfyUI 端到端，含真跑内置模板（没起时跳过）
@@ -359,9 +369,9 @@ node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"  
 **断言条数会随 ComfyUI 是否在跑而变化**（这是设计，不是漏测）：`test-workflow.mjs` 与
 `test-workflow-library.mjs` 在后端应答时会**顺手拿真实的 1212 类 `/object_info`** 再验一遍
 「真实工作流的 UI→API 转换」和「模板能否在本机跑」，各多出 3 条与 19 条；后端没起时它会打印
-一行 `NOTE ... skipped`，而不是假装通过。所以离线总数是 **857（后端关）→ 879（ComfyUI 开）**。
+一行 `NOTE ... skipped`，而不是假装通过。所以离线总数是 **885（后端关）→ 907（ComfyUI 开）**。
 
-后端都起着时总计 **956 条断言**（879 离线 + 29 SD WebUI + 23 ComfyUI + 25 桥接实时）。
+后端都起着时总计 **984 条断言**（907 离线 + 29 SD WebUI + 23 ComfyUI + 25 桥接实时）。
 
 - **离线套件**用两个真实 HTTP 服务冒充 A1111 与 ComfyUI（覆盖 `/sdapi/v1/*`、`/controlnet/model_list`、
   `/tagger/v1/*`、`/prompt`、`/history`、`/view`），并用**真实的秋叶 Python** 跑抠图与放大，
