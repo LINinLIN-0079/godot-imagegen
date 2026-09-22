@@ -1023,6 +1023,19 @@ async function main() {
   const missingWf = await callRoute(webServer, 'GET', '/gig/workflow?id=does-not-exist')
   assert(missingWf.status === 400, 'reading a missing workflow over REST is a 400')
 
+  // The canvas runs a library workflow through its own route.
+  const runRoute = await callRoute(webServer, 'POST', '/gig/workflow/run', { id: 'sd15-basic', category: 'item', projectId: 'testproj' })
+  assert(runRoute.status === 200 && typeof runRoute.body.jobId === 'string', 'POST /gig/workflow/run starts a job')
+  assert(runRoute.body.nodeCount === 7, 'and reports how many nodes it is about to execute')
+  await new Promise((r) => setTimeout(r, 1200))
+  const canvasRunJob = (await callRoute(webServer, 'GET', '/gig/jobs')).body.jobs.find((j) => j.id === runRoute.body.jobId)
+  assert(canvasRunJob !== undefined && canvasRunJob.status === 'done',
+    `the canvas workflow run completes (status=${canvasRunJob && canvasRunJob.status} msg=${canvasRunJob && canvasRunJob.message})`)
+  assert(canvasRunJob.images.length === 1 && typeof canvasRunJob.images[0].resPath === 'string',
+    'and its output is filed as a normal asset with a res:// path')
+  const badRun = await callRoute(webServer, 'POST', '/gig/workflow/run', { id: 'does-not-exist' })
+  assert(badRun.status === 400, 'running a missing workflow over REST is a 400')
+
   // ── P1: persistence across a plugin restart ──
   assert(disposers.length >= 2, 'the plugin registers disposers for its jobs and storage unit')
   for (const dispose of disposers) dispose()

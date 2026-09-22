@@ -2,7 +2,7 @@
 
 **本地 AI 出图 → Godot 可用美术资产** 的 DSH 插件。
 
-它把本机已装好的两套秋叶出图后端接进 DeepSeek Harness：模型通过 8 个 `image_*` 工具在对话里直接出图，
+它把本机已装好的两套秋叶出图后端接进 DeepSeek Harness：模型通过 10 个 `image_*` 工具在对话里直接出图、改写并运行 ComfyUI 工作流、直接驱动右侧面板，
 你通过右侧边栏的 **「美术工坊」** 面板点选提示词、看图、抠图、放大；产物自动落进 Godot 项目的
 `assets/generated/<品类>/`，并给出 `res://` 路径，一键注册进 `godot-asset-planner` 的资产库。
 
@@ -16,13 +16,30 @@
 | REST（`/gig/*`） | 面板与宿主的同源通道：状态、图库、原图字节、生成/编辑/放大/抠图/反推任务、任务轮询与取消、后端启停、设置与预设、工作流库读写、面板指令轮询 |
 | 工作流库 | 插件本地（`$DSH_HOME/godot-imagegen/workflows/`，**从不写入你的 ComfyUI**）：6 套游戏美术模板 + 任意新建/改写；元数据写在文档自身的 `extra` 里 |
 | 对话驱动 | 代理可通过 `image_workflow` / `image_workshop` 改写工作流、把提示词与参数填进面板、在面板里定位图片——你只需在对话里说
-| 浏览器面板 | better-sidebar tab「美术工坊」（order 63）：后端卡片、设置、提示词预设库、参数面板、任务进度（含后端实时预览图）、图库缩略图 + 灯箱（放大/抠图/反推/复制路径/注册资产/删除） |
+| 浏览器面板 | better-sidebar tab「美术工坊」（order 63）。**三态**：侧边栏**入口态**（状态 + 启动后端 + 工作流速跑）、**浮窗态**（拖 tab 到主会话区，宽 ≥700px 时三分栏：图库 / ComfyUI 画布 / 参数）、**全屏态**（面板自绘「⛶ 全屏」/「⤡ 回浮窗」，只改浮窗几何）。含提示词预设、任务进度（含后端实时预览图）、图库灯箱（放大/抠图/反推/发送到对话/注册资产/删除） |
 | DSH 技能 | `D:\游戏开发skill\game-art` —— 游戏美术提示词手册、分品类尺寸与透明规范、端到端工作流、21 条样例提示词、色键抠图脚本 |
 | 持久化 | 独立 KV 单元 `godot_imagegen`（图库记录 + 用户预设 + 设置） |
 
 **每个产物都会带上**：绝对路径、`res://` 路径（落在 Godot 项目内时）、尺寸、seed、模型、后端、抠图/放大方法。
 
-## 2. 后端：本机实测的能力矩阵
+## 2. 面板怎么用（三态）
+
+侧边栏只有 ~430px 宽，放不下节点画布，所以面板会按它所在的**位置**改变形态：
+
+| 形态 | 什么时候 | 里面有什么 |
+| --- | --- | --- |
+| **入口态** | tab 停在侧边栏（默认） | 两个后端的状态与启动、工作流速跑、一个「在此展开完整工作台」 |
+| **浮窗态** | **你把 tab 拖到主会话区**（拖一次，按会话记住） | 宽 ≥700px 时三分栏：图库 / ComfyUI 画布 / 参数；窄时上下堆叠 |
+| **全屏态** | 浮窗态下点「⛶ 全屏」 | 同一套工作台，浮窗几何铺满视口；点「⤡ 回浮窗」还原 |
+
+浮窗**必须由你拖一次**：自动浮窗要把 tab 从面板树里摘出来，那会与 `dsh-better-sidebar` 的内部状态结构
+耦合，它一升级就可能坏掉。一旦浮起来，几何就是安全的（`store.reduce` 只改那一条 float 的 x/y/w/h，
+不动任何面板结构），所以全屏/还原完全可靠。
+
+面板里还能：选工作流 → 在画布上编辑或直接「运行工作流」→ 产物照常落进 Godot 项目并进图库。
+「发送到对话」把当前提示词与参数（或选中的图）送回输入框。
+
+## 3. 后端：本机实测的能力矩阵
 
 插件自动探测、可手动指定，`auto` 会优先用 `defaultBackend` 并自动回落。
 
@@ -60,7 +77,7 @@
 后处理（抠图 / 放大 / 无缝平铺）走秋叶自带的 Python，它已经装了
 **Pillow、numpy、OpenCV、scipy、rembg、onnxruntime**，所以插件不额外安装任何依赖。
 
-## 3. 安装与挂载
+## 4. 安装与挂载
 
 插件本体在 `D:\deepseek\my-imagegen\`（独立仓库），通过与 `godot-asset-planner` **完全相同的 bundle 通道**挂载：
 
@@ -86,7 +103,7 @@
 - 「美术工坊」出现在 better-sidebar（需要 `dsh-better-sidebar`，desktop / web profile 都有）；
 - 在面板「设置」里填 **Godot 项目根目录**，之后产物才会带 `res://` 路径。
 
-## 4. 配置项
+## 5. 配置项
 
 都写在 profile 的 `cordis.patch.yml` 里，作为 `godot-imagegen` 行的 `config`（全部可选，都有可用默认值）：
 
@@ -111,7 +128,7 @@
 
 `godotProject` 也可以直接在面板「设置」里填，会存进插件自己的 storage（跨会话保留），不必改配置。
 
-## 5. 工具速查
+## 6. 工具速查
 
 ### `image_generate` — 文生图
 
@@ -174,7 +191,7 @@
 面板在它已有的 1.5s 轮询里一次往返完成两件事：上报自己在看什么（含**未保存的草稿**），取走代理排队的指令。
 面板没打开时指令会排队（保留 10 分钟），工具会明确告诉你"已排队、未送达"，而不是假装成功。
 
-## 6. 与 godot-asset-planner 的协作
+## 7. 与 godot-asset-planner 的协作
 
 **不共享 storage。** `godot_asset_planner` 这个 KV 单元每个后端只允许一个活动句柄，归 godot-asset-planner 所有，
 所以本插件用自己的 `godot_imagegen` 单元，二者互不干扰。
@@ -187,7 +204,7 @@
    （`{ assetName, assetType:"image", filePath, projectId, linkedGoal? }`），不碰它的存储实现。
    面板顶部会显示从 `/gap/state` 读到的当前 planner 项目作为归属。
 
-## 7. 安全边界
+## 8. 安全边界
 
 - **只接管、不重复启动**：后端已在运行时 `action=start` 直接复用，绝不新起一个抢端口。
 - **绝不终止非本插件启动的进程**：`action=stop` 对你自己用绘世启动器拉起的实例会明确拒绝并说明原因。
@@ -197,7 +214,7 @@
   `$DSH_HOME/godot-imagegen/` 下。任何写入 `D:\AKI open\` 的动作（阶段二同步 web 扩展）都会先备份，
   并维护可一键卸载的文件清单。
 
-## 8. 验证
+## 9. 验证
 
 ```powershell
 cd D:\deepseek\my-imagegen            # 本仓库根目录
@@ -205,14 +222,14 @@ npm test                              # = 下面四条离线套件
 node tests/test-workflow.mjs          # 65 条断言（工作流层，含 10 个真实 ComfyUI 导出文件）
 node tests/test-workflow-library.mjs  # 271 条断言（工作流库、6 套模板、布局缓存）
 node tests/test-imagegen.mjs          # 181 条断言（10 个工具 + REST + 真实 Python 后处理）
-node tests/test-render-imagegen.mjs   # 71 条断言（客户端面板渲染）
+node tests/test-render-imagegen.mjs   # 144 条断言（客户端面板渲染，含三态窗口判定与浮窗几何补丁）
 node tests/test-imagegen-live.mjs          # 真实 SD WebUI 端到端（后端没起时自动跳过）
 node tests/test-imagegen-live-comfy.mjs    # 真实 ComfyUI 端到端，含真跑内置模板（没起时跳过）
 node --check lib/client.js
 node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"   # 技能 frontmatter / 行尾校验
 ```
 
-后端起来时总计 **611 条断言**（65 + 271 + 181 + 71 + 23）。
+后端起来时总计 **684 条断言**（65 + 271 + 181 + 144 + 23）。
 
 - **离线套件**用两个真实 HTTP 服务冒充 A1111 与 ComfyUI（覆盖 `/sdapi/v1/*`、`/controlnet/model_list`、
   `/tagger/v1/*`、`/prompt`、`/history`、`/view`），并用**真实的秋叶 Python** 跑抠图与放大，
@@ -222,7 +239,7 @@ node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"  
 - **实时套件**驱动真正安装的 SD WebUI：真实 SD1.5/SDXL 出图、真实 rembg 抠图、真实 R-ESRGAN 放大、
   真实 ControlNet 引导，并断言产物真的落在 Godot 项目的 `assets/generated/<品类>/` 且带 `res://` 路径。
 
-## 9. 已知限制
+## 10. 已知限制
 
 - **后端调用不使用全局 `fetch`**：undici 有 300s 的 `headersTimeout`/`bodyTimeout` 且无法在无 undici 包时调高，
   真实 SDXL 出图（7GB 换模型 + 采样）会超过它并抛 `UND_ERR_HEADERS_TIMEOUT`。插件改用 `node:http`，

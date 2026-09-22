@@ -60,11 +60,27 @@ const React = {
   },
 }
 
-/** Recursively invoke function components; collect rendered text. */
-function render(node, out) {
+/**
+ * Resolve a React element tree, invoking every function component on the way.
+ *
+ * Resolving once and then walking the result lets a test assert on ELEMENTS
+ * (e.g. that an <iframe> really points at the ComfyUI origin) and not just on the
+ * text a component happens to emit.
+ */
+function resolve(node) {
+  if (node === null || node === undefined || typeof node === 'boolean') return null
+  if (Array.isArray(node)) return node.map(resolve)
+  if (typeof node === 'string' || typeof node === 'number') return node
+  if (typeof node !== 'object' || node[ELEMENT] !== true) return null
+  const { type, props, children } = node
+  if (typeof type === 'function') return resolve(type(Object.assign({}, props, { children })))
+  return { [ELEMENT]: true, type, props, children: children.map(resolve) }
+}
+
+function flattenText(node, out) {
   if (node === null || node === undefined || typeof node === 'boolean') return
   if (Array.isArray(node)) {
-    for (const child of node) render(child, out)
+    for (const child of node) flattenText(child, out)
     return
   }
   if (typeof node === 'string' || typeof node === 'number') {
@@ -72,18 +88,26 @@ function render(node, out) {
     return
   }
   if (node[ELEMENT] !== true) return
-  const { type, props, children } = node
-  if (typeof type === 'function') {
-    render(type(Object.assign({}, props, { children })), out)
-    return
-  }
-  for (const child of children) render(child, out)
+  for (const child of node.children) flattenText(child, out)
 }
 
 function renderTree(node) {
   const out = []
-  render(node, out)
+  flattenText(resolve(node), out)
   return out.join(' ')
+}
+
+/** Every resolved element of the given tag/component name. */
+function findByType(node, type, out = []) {
+  if (node === null || node === undefined || typeof node === 'boolean') return out
+  if (Array.isArray(node)) {
+    for (const child of node) findByType(child, type, out)
+    return out
+  }
+  if (typeof node !== 'object' || node[ELEMENT] !== true) return out
+  if (node.type === type) out.push(node)
+  for (const child of node.children) findByType(child, type, out)
+  return out
 }
 
 // ── step 1: run the classic-script bundle ──
@@ -107,7 +131,11 @@ assert(plugin.name === 'godot-imagegen', 'plugin exports its name')
 assert(plugin.inject.includes('betterSidebar'), 'plugin injects betterSidebar')
 assert(typeof plugin.apply === 'function', 'plugin exports apply')
 assert(typeof plugin.ArtStudio === 'function', 'exposes the tab component as a test handle')
-for (const handle of ['BackendCard', 'SettingsCard', 'PromptForm', 'JobsStrip', 'Lightbox', 'categoryLabel', 'humanSize']) {
+for (const handle of [
+  'BackendCard', 'SettingsCard', 'PromptForm', 'JobsStrip', 'Lightbox', 'categoryLabel', 'humanSize',
+  'EntryView', 'WorkflowBar', 'CanvasPane', 'AgentHint', 'Section',
+  'readPlacement', 'patchFloatGeometry', 'sendToConversation',
+]) {
   assert(plugin[handle] !== undefined, `exposes test handle ${handle}`)
 }
 
@@ -307,6 +335,184 @@ assert(boxText.includes('item'), 'Lightbox labels the category')
 assert(renderTree(React.createElement(plugin.Lightbox, {
   image: null, plannerProject: 'default', busy: false, onClose() {}, onAction() {}, onRegister() {},
 })) === '', 'Lightbox renders nothing when no image is selected')
+
+// ── placement: docked / floating / unknown ──
+
+const dockedService = { getSnapshot: () => ({ state: { floats: [] } }) }
+const floatingService = { getSnapshot: () => ({ state: { floats: [{ id: 'float:2', tab: { id: 'godot-imagegen' } }] } }) }
+assert(plugin.readPlacement(dockedService, 'godot-imagegen').known === true, 'a state carrying a floats array counts as known')
+assert(plugin.readPlacement(dockedService, 'godot-imagegen').floating === false, 'an empty floats array means docked')
+assert(plugin.readPlacement(floatingService, 'godot-imagegen').floating === true, 'a float entry for our tab id means floating')
+assert(plugin.readPlacement({ getSnapshot: () => ({ state: { floats: [{ tab: { id: 'other' } }] } }) }, 'godot-imagegen').floating === false,
+  'a float for a different tab does not count')
+assert(plugin.readPlacement(undefined, 'x').known === false, 'no service means the placement is unknown')
+assert(plugin.readPlacement({}, 'x').known === false, 'a service without getSnapshot is unknown')
+assert(plugin.readPlacement({ getSnapshot: () => ({ state: {} }) }, 'x').known === false, 'a state without floats is unknown')
+assert(plugin.readPlacement({ getSnapshot() { throw new Error('boom') } }, 'x').known === false, 'a throwing snapshot degrades to unknown')
+assert(plugin.readPlacement({ getSnapshot: () => ({ state: { floats: [null, { tab: null }] } }) }, 'x').known === true, 'malformed float entries do not throw')
+
+// ── fullscreen geometry: only the matching float, never the input ──
+
+const floatState = () => ({
+  floats: [
+    { id: 'float:1', tab: { id: 'other-tab' }, x: 5, y: 5, w: 100, h: 100 },
+    { id: 'float:2', tab: { id: 'godot-imagegen' }, x: 40, y: 40, w: 390, h: 780 },
+  ],
+})
+const before = floatState()
+let reduced = null
+const store = { reduce(fn) { reduced = fn(before) } }
+assert(plugin.patchFloatGeometry(store, 'godot-imagegen', { x: 0, y: 0, w: 1600, h: 900 }) === true,
+  'patching a floating tab reports success')
+assert(reduced.floats[1].w === 1600 && reduced.floats[1].h === 900, 'the matching float receives the new geometry')
+assert(reduced.floats[0].w === 100 && reduced.floats[0].x === 5, 'the OTHER float is untouched')
+assert(reduced.floats[1].id === 'float:2' && reduced.floats[1].tab.id === 'godot-imagegen',
+  'the float id and tab identity are preserved')
+assert(before.floats[1].w === 390, 'the input state object is NOT mutated (the reducer returns a new state)')
+assert(reduced !== before, 'a changed state is a new object')
+
+const noMatch = floatState()
+let noMatchOut = null
+assert(plugin.patchFloatGeometry({ reduce(fn) { noMatchOut = fn(noMatch) } }, 'not-floating', { w: 1 }) === false,
+  'patching a tab that is not floating reports false')
+assert(noMatchOut === noMatch, 'and returns the very same state object, so nothing is written')
+assert(plugin.patchFloatGeometry({}, 'x', {}) === false, 'a store without reduce is handled')
+assert(plugin.patchFloatGeometry(null, 'x', {}) === false, 'a missing store is handled')
+assert(plugin.patchFloatGeometry({ reduce() { throw new Error('boom') } }, 'x', {}) === false, 'a throwing reducer is handled')
+assert(plugin.patchFloatGeometry({ reduce(fn) { fn(noMatch) } }, '', { w: 1 }) === false, 'a missing tab id is handled')
+
+// ── the entry view (what the sidebar shows) ──
+
+let entryText = ''
+try {
+  entryText = renderTree(React.createElement(plugin.EntryView, {
+    backends,
+    busy: false,
+    onStart() {}, onRefresh() {}, onOpenWorkbench() {}, onPick() {}, onRun() {},
+    workflows: [{ id: 'sd15-basic', name: 'SD1.5 文生图', nodeCount: 7 }],
+    activeId: 'sd15-basic',
+  }))
+  assert(true, 'EntryView renders without throwing')
+} catch (error) {
+  assert(false, `EntryView renders without throwing — ${error.message}`)
+}
+assert(entryText.includes('打开工作台'), 'EntryView offers the way into the workbench')
+assert(entryText.includes('拖到主会话区'), 'EntryView explains the float gesture')
+assert(entryText.includes('ComfyUI') && entryText.includes('SD WebUI'), 'EntryView shows both backends')
+assert(entryText.includes('快速运行工作流'), 'EntryView offers a quick workflow run')
+
+// ── the workflow bar ──
+
+let wfText = ''
+try {
+  wfText = renderTree(React.createElement(plugin.WorkflowBar, {
+    workflows: [{ id: 'sd15-basic', name: 'SD1.5 文生图', description: '最快的探索路径', category: 'concept', source: 'template', nodeCount: 7, classes: ['KSampler', 'CLIPTextEncode'] }],
+    activeId: 'sd15-basic', activeGraph: { nodes: [{ id: 1 }] }, busy: false,
+    canvasOnline: true, comfyPort: 8188,
+    onPick() {}, onRun() {}, onReload() {}, onSaveToLibrary() {},
+  }))
+  assert(true, 'WorkflowBar renders without throwing')
+} catch (error) {
+  assert(false, `WorkflowBar renders without throwing — ${error.message}`)
+}
+assert(wfText.includes('ComfyUI 工作流'), 'WorkflowBar renders its title')
+assert(wfText.includes('SD1.5 文生图'), 'WorkflowBar shows the selected workflow')
+assert(wfText.includes('最快的探索路径'), 'WorkflowBar shows the description')
+assert(wfText.includes('7 节点'), 'WorkflowBar shows the node count')
+assert(wfText.includes('运行工作流'), 'WorkflowBar offers running it')
+assert(wfText.includes('把画布存回库'), 'WorkflowBar offers saving canvas edits back')
+assert(wfText.includes('外部打开'), 'WorkflowBar offers opening the real ComfyUI in a browser')
+
+// ── the embedded canvas ──
+
+let canvasText = ''
+let canvasTree = null
+try {
+  canvasTree = resolve(React.createElement(plugin.CanvasPane, { port: 8188, online: false, busy: false, reloadKey: 0, onStart() {}, onReload() {} }))
+  canvasText = renderTree(React.createElement(plugin.CanvasPane, { port: 8188, online: false, busy: false, reloadKey: 0, onStart() {}, onReload() {} }))
+  assert(true, 'CanvasPane renders the offline state without throwing')
+} catch (error) {
+  assert(false, `CanvasPane renders without throwing — ${error.message}`)
+}
+assert(canvasText.includes('ComfyUI 未运行'), 'CanvasPane explains why the canvas is empty when the backend is down')
+assert(canvasText.includes('启动 ComfyUI'), 'CanvasPane offers to start it')
+assert(findByType(canvasTree, 'iframe').length === 0, 'no iframe is rendered while the backend is down')
+
+const onlineCanvas = resolve(React.createElement(plugin.CanvasPane, { port: 8188, online: true, busy: false, reloadKey: 3, onStart() {}, onReload() {} }))
+const frames = findByType(onlineCanvas, 'iframe')
+assert(frames.length === 1, 'CanvasPane renders exactly one iframe when the backend is online')
+assert(frames[0].props.src === 'http://127.0.0.1:8188', `the iframe points at the ComfyUI origin (${frames[0].props.src})`)
+assert(frames[0].props.key === 3 || frames[0].props.src !== undefined, 'the iframe is keyed so a reload remounts it')
+assert(renderTree(onlineCanvas).includes('重新载入画布'), 'the online canvas offers a reload')
+
+// ── the agent hint ──
+
+const hintOn = renderTree(React.createElement(plugin.AgentHint, { lastCommand: '代理填入表单：a blue slime', panelOnline: true }))
+assert(hintOn.includes('代理填入表单'), 'AgentHint reports the last instruction the agent sent')
+const hintOff = renderTree(React.createElement(plugin.AgentHint, { lastCommand: '', panelOnline: false }))
+assert(hintOff.includes('未连接'), 'AgentHint says so when the command channel is not connected')
+
+// ── the conversation bridge ──
+
+let draftValue = ''
+const conversationCtx = () => ({
+  get: (name) => (name === 'conversation'
+    ? { input: { for: () => ({ state: { getSnapshot: () => ({ draft: draftValue }) }, setDraft: (text) => { draftValue = text } }) } }
+    : undefined),
+  sessions: { scope: () => ({ sessionId: 's1' }) },
+})
+assert(plugin.sendToConversation(conversationCtx(), {}, 'first').ok === true, 'sendToConversation succeeds through the public service')
+assert(draftValue === 'first', 'an empty draft receives the text as-is')
+assert(plugin.sendToConversation(conversationCtx(), {}, 'second').ok === true, 'a second send succeeds')
+assert(draftValue === 'first\nsecond', 'subsequent sends append on a new line')
+assert(plugin.sendToConversation(undefined, {}, 'x').ok === false, 'a missing ctx reports a failure instead of throwing')
+assert(/不可用/.test(plugin.sendToConversation(undefined, {}, 'x').reason), 'and gives a reason')
+assert(plugin.sendToConversation({ get: () => undefined }, {}, 'x').ok === false, 'a missing conversation service is reported')
+assert(plugin.sendToConversation({ get: () => ({}) }, {}, 'x').ok === false, 'a malformed conversation service is reported')
+assert(plugin.sendToConversation({ get: () => ({ input: { for: () => undefined } }), sessions: { scope: () => ({}) } }, {}, 'x').ok === false,
+  'a missing input handle is reported')
+
+// ── ArtStudio picks its shape from the placement ──
+
+const mockSidebar = (floats) => ({ getSnapshot: () => ({ state: { floats } }) })
+
+let dockedText = ''
+try {
+  dockedText = renderTree(React.createElement(plugin.ArtStudio, {
+    ctx: { betterSidebar: mockSidebar([]) },
+    store: { reduce() {} },
+    tab: { id: 'godot-imagegen' },
+    scope: { sessionId: 's1' },
+  }))
+  assert(true, 'ArtStudio renders the docked entry view without throwing')
+} catch (error) {
+  assert(false, `ArtStudio (docked) renders without throwing — ${error.message}`)
+}
+assert(dockedText.includes('打开工作台'), 'a docked tab shows the entry view')
+assert(dockedText.includes('拖到主会话区'), 'and explains the float gesture')
+assert(!dockedText.includes('出图（SD WebUI）'), 'a docked tab does NOT push the whole workbench into the narrow sidebar')
+
+let floatingText = ''
+try {
+  floatingText = renderTree(React.createElement(plugin.ArtStudio, {
+    ctx: { betterSidebar: mockSidebar([{ id: 'float:2', tab: { id: 'godot-imagegen' }, x: 0, y: 0, w: 900, h: 700 }]) },
+    store: { reduce() {} },
+    tab: { id: 'godot-imagegen', meta: {} },
+    scope: { sessionId: 's1' },
+  }))
+  assert(true, 'ArtStudio renders the floating workbench without throwing')
+} catch (error) {
+  assert(false, `ArtStudio (floating) renders without throwing — ${error.message}`)
+}
+assert(floatingText.includes('⛶ 全屏'), 'a floating tab offers the fullscreen button')
+assert(floatingText.includes('浮窗'), 'and labels itself as a floating window')
+assert(floatingText.includes('出图（SD WebUI）'), 'and renders the workbench')
+assert(floatingText.includes('ComfyUI 工作流'), 'including the workflow bar')
+assert(floatingText.includes('发送到对话'), 'and the send-to-conversation action')
+assert(!floatingText.includes('如何浮窗？'), 'a floating tab does not keep showing the float hint')
+
+// Unknown placement must never narrow: showing less by accident is worse.
+assert(studioText.includes('出图（SD WebUI）'), 'an unknown placement renders the full workbench')
 
 // Helpers.
 assert(plugin.categoryLabel('character') === '角色', 'categoryLabel maps character to 角色')

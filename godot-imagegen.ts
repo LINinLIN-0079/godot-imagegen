@@ -5443,6 +5443,29 @@ export function apply(ctx: Context, config: unknown): void {
           return
         }
 
+        // Run a library workflow and file its output like any other generated art.
+        if (method === 'POST' && pathname === '/gig/workflow/run') {
+          const body = await readJsonBody(req)
+          const id = requireString(body, 'id', 'id')
+          const category = requireCategory(body)
+          const projectId = optionalString(body, 'projectId', 'projectId') ?? 'default'
+          const { meta, graph } = await library.read(id)
+          const apiGraph = uiToApi(graph, await layouts())
+          if (Object.keys(apiGraph).length === 0) {
+            throw new ClientRouteError(`工作流 ${id} 没有可执行节点（是否所有节点都被静音或绕过了？）`)
+          }
+          const job = jobs.start('generate', `工作流 · ${meta.name}`, (j) => ops.runWorkflow({
+            apiGraph,
+            name: slugify(meta.name),
+            category,
+            projectId,
+            transparent: optionalBoolean(body, 'transparent', 'transparent') === true,
+            seamless: optionalBoolean(body, 'seamless', 'seamless') === true,
+          }, j))
+          sendJson(res, 200, { jobId: job.id, nodeCount: Object.keys(apiGraph).length })
+          return
+        }
+
         if (method === 'GET' && pathname === '/gig/gallery') {
           // NB: searchParams.get() yields null for an absent key — keep it
           // falsy rather than coalescing to undefined, or the filters below
