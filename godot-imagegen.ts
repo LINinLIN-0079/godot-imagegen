@@ -34,9 +34,8 @@
 import { spawn as nodeSpawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, rmdir, stat, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, readFile, readdir, rm, rmdir, stat, writeFile } from 'node:fs/promises'
 import { request as httpRequest } from 'node:http'
-import { tmpdir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -2063,23 +2062,31 @@ interface PostBridge {
 }
 
 /**
- * Create the Python bridge. The script is materialised once into a temp dir and
- * every call goes through the same interpreter, so rembg/cv2/Pillow imports are
- * amortised by the OS file cache rather than re-installed.
+ * Create the Python bridge. The script is materialised once into a stable
+ * directory under the plugin data root and every call goes through the same
+ * interpreter, so rembg/cv2/Pillow imports are amortised by the OS file cache
+ * rather than re-installed.
  */
 function createPostBridge(cfg: ImagegenConfig, subprocess: SubprocessSurface | undefined): PostBridge {
   const spawnProcess = makeSpawner(subprocess)
   let scriptPromise: Promise<string> | undefined
 
+  // The script used to be written into a fresh `mkdtemp` directory, which leaked
+  // one %TEMP%/gig-py-* directory (script + JSON result file) per DSH start and
+  // per test run. A stable path holds at most one copy, disappears together with
+  // the data root, and is never swept by the OS temp cleaner mid-session.
+  function materialise(): Promise<string> {
+    return (async () => {
+      const dir = join(cfg.dataRoot, 'python')
+      await mkdir(dir, { recursive: true })
+      const script = join(dir, 'gig_tools.py')
+      await writeFile(script, PY_TOOL_SOURCE, 'utf8')
+      return script
+    })()
+  }
+
   function ensureScript(): Promise<string> {
-    if (scriptPromise === undefined) {
-      scriptPromise = (async () => {
-        const dir = await mkdtemp(join(tmpdir(), 'gig-py-'))
-        const script = join(dir, 'gig_tools.py')
-        await writeFile(script, PY_TOOL_SOURCE, 'utf8')
-        return script
-      })()
-    }
+    if (scriptPromise === undefined) scriptPromise = materialise()
     return scriptPromise
   }
 
@@ -2098,6 +2105,9 @@ function createPostBridge(cfg: ImagegenConfig, subprocess: SubprocessSurface | u
       throw new Error(`godot-imagegen: 后处理 Python 不存在（${cfg.postPython}），无法执行 ${cmd}`)
     }
     const script = await ensureScript()
+    // Self-heal: if the data root was cleaned while this process stayed alive,
+    // rewrite the script instead of failing every later call with a missing file.
+    if (!fileExists(script)) await materialise()
     const dir = dirname(script)
     // The result travels through a file rather than stdout: rembg / onnxruntime
     // print unbounded warning and model-download output that would otherwise

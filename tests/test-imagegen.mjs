@@ -16,7 +16,7 @@
  */
 import { createServer } from 'node:http'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { deflateSync } from 'node:zlib'
@@ -760,6 +760,10 @@ async function main() {
   // ── T10: cutout via the real Python ──
   if (postAvailable) {
     const cutoutTool = byName(registered, 'image_cutout')
+    // The bridge script must be materialised in a stable place under the plugin
+    // data root. It used to be a fresh mkdtemp() per DSH start, which leaked one
+    // %TEMP%/gig-py-* directory (script + JSON result) on every start.
+    const tempBefore = new Set(readdirSync(tmpdir()).filter((entry) => entry.startsWith('gig-py-')))
     const cut = unwrap(await exec(cutoutTool, {
       image: first.resPath,
       method: 'chroma',
@@ -771,6 +775,21 @@ async function main() {
     const cutBytes = await readFile(cut.image.filePath)
     assert(readPngColorType(cutBytes) === 6, 'cutout wrote an RGBA PNG')
     assert(cut.image.method === 'chroma', 'cutout reports the chroma method')
+    assert(existsSync(join(config.dataRoot, 'python', 'gig_tools.py')), 'the Python bridge script lives under the plugin data root')
+    const leaked = readdirSync(tmpdir()).filter((entry) => entry.startsWith('gig-py-') && !tempBefore.has(entry))
+    assert(leaked.length === 0, `a Python call leaves no %TEMP% directory behind (leaked: ${leaked.join(', ') || 'none'})`)
+
+    // Self-heal: cleaning the data root mid-session must not brick the bridge.
+    await rm(join(config.dataRoot, 'python'), { recursive: true, force: true })
+    const healed = unwrap(await exec(cutoutTool, {
+      image: first.resPath,
+      method: 'chroma',
+      key_color: '#FFFFFF',
+      category: 'item',
+      name: 'potion-heal',
+      project_id: 'testproj',
+    }))
+    assert(readPngColorType(await readFile(healed.image.filePath)) === 6, 'the bridge rewrites its script after the data root is cleaned')
   }
 
   // ── T11: interrogate ──
