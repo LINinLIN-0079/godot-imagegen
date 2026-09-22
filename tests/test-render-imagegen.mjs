@@ -164,13 +164,18 @@ function flattenText(node, out) {
   for (const child of node.children) flattenText(child, out)
 }
 
+/** Text of an ALREADY-resolved tree (renderTree resolves its own). */
+function flatText(node) {
+  const out = []
+  flattenText(node, out)
+  return out.join(' ')
+}
+
 function renderTree(node) {
   // Every top-level renderTree is conceptually a fresh mount, so hook state from
   // an earlier render must not leak into it.
   resetHooks()
-  const out = []
-  flattenText(resolve(node), out)
-  return out.join(' ')
+  return flatText(resolve(node))
 }
 
 /** Every resolved element of the given tag/component name. */
@@ -522,6 +527,40 @@ assert(entryText.includes('右键'), 'and says it is the right-click menu, not o
 assert(entryText.includes('ComfyUI') && entryText.includes('SD WebUI'), 'EntryView shows both backends')
 assert(entryText.includes('快速运行工作流'), 'EntryView offers a quick workflow run')
 
+// ── backend start/stop is REACHABLE ──
+//
+// BackendCard is the only place with a 停止 button, and it used to be defined and
+// exported as a test handle but never mounted — so the render suite exercised it
+// directly and happily passed while the real panel had no stop button at all. It
+// is mounted in the workbench and in the entry rows now, and these assertions are
+// about the MOUNTED panel, not about the component in isolation.
+
+const runningBackends = [
+  { id: 'comfyui', label: 'ComfyUI', port: 8188, running: true, managed: true, models: ['anything-v5.safetensors'], detail: '当前模型 anything-v5' },
+  { id: 'sdwebui', label: 'SD WebUI', port: 7860, running: true, managed: false, models: [], detail: '不是本插件启动的' },
+]
+const buttonsOf = (tree) => findByType(tree, 'button')
+const labelOf = (node) => (Array.isArray(node.children) ? node.children.filter((c) => typeof c === 'string').join('') : '')
+
+const entryBackends = resolve(React.createElement(plugin.EntryView, {
+  backends: runningBackends, busy: false,
+  onStart() {}, onStop() {}, onOpenWorkbench() {}, onRefresh() {},
+  workflows: [], activeId: '', onPick() {}, onRun() {},
+}))
+const entryStops = buttonsOf(entryBackends).filter((b) => labelOf(b) === '停止')
+assert(entryStops.length === 2, `the docked entry view offers 停止 for every running backend (${entryStops.length})`)
+assert(entryStops.some((b) => b.props.disabled === false), 'the one this plugin spawned can be stopped')
+assert(entryStops.some((b) => b.props.disabled === true), 'and one it did not spawn is offered but disabled, with the reason in its tooltip')
+assert(buttonsOf(entryBackends).some((b) => labelOf(b) === '停止' && /绘世|非本插件启动/.test(String(b.props.title))),
+  'the disabled stop explains WHY instead of looking broken')
+
+const cardBackends = resolve(React.createElement(plugin.BackendCard, {
+  backends: runningBackends, postProcessing: { ready: true, detail: '可用' },
+  busy: false, onStart() {}, onStop() {}, onRefresh() {},
+}))
+assert(buttonsOf(cardBackends).some((b) => labelOf(b) === '停止'), 'BackendCard still renders a stop button')
+assert(flatText(cardBackends).includes('插件已启动'), 'and marks which instance belongs to the plugin')
+
 // ── the workflow bar ──
 
 let wfText = ''
@@ -629,6 +668,12 @@ assert(floatingText.includes('⛶ 全屏'), 'a floating tab offers the fullscree
 assert(floatingText.includes('浮窗'), 'and labels itself as a floating window')
 assert(floatingText.includes('出图（SD WebUI）'), 'and renders the workbench')
 assert(floatingText.includes('ComfyUI 工作流'), 'including the workflow bar')
+// The card that holds start/stop must be MOUNTED, not merely implemented: a
+// component that only the tests render is a component the user does not have.
+// Section titles carry the open/closed marker, which is unique to the card — a
+// bare '后端' would also match PromptForm's '— 后端默认 —' option and would pass
+// even with the card unmounted.
+assert(floatingText.includes('▾ 后端'), 'and mounts the backend card, where 启动/停止 live')
 assert(floatingText.includes('发送到对话'), 'and the send-to-conversation action')
 assert(!floatingText.includes('如何浮窗？'), 'a floating tab does not keep showing the float hint')
 
@@ -657,7 +702,10 @@ globalThis.fetch = async (path, options) => {
   relayRequests.push({ path, body })
   if (path === '/gig/state') {
     return jsonOk({
-      backends: [{ id: 'comfyui', port: 8188, running: true, models: [] }, { id: 'sdwebui', port: 7860, running: true, models: ['anything-v5.safetensors'] }],
+      backends: [
+        { id: 'comfyui', port: 8188, running: true, managed: true, models: [], detail: '本插件启动' },
+        { id: 'sdwebui', port: 7860, running: true, managed: false, models: ['anything-v5.safetensors'], detail: '外部实例' },
+      ],
       categories: ['character', 'item'], defaults: {}, controlTypes: [], presets: [],
       settings: {}, output: {}, ui: { online: true, pending: 0 },
     })
@@ -715,7 +763,7 @@ relayPollBodies.length = 0
 windowListeners.length = 0
 const timersBefore = fakeTimers.length
 const effectsBefore = effectQueue.length
-resolve(React.createElement(plugin.ArtStudio, studioProps))
+const workbench = resolve(React.createElement(plugin.ArtStudio, studioProps))
 const relayCleanups = runQueuedEffects(effectsBefore)
 await settle()
 
@@ -745,6 +793,28 @@ assert(Array.isArray(lastPoll.inbound) && lastPoll.inbound.length === 1,
 assert(lastPoll.inbound[0].state.nodeCount === 9 && lastPoll.inbound[0].state.title === 'item-icon',
   'and it is the real canvas state, not the one posted by a foreign window')
 assert(!JSON.stringify(lastPoll.inbound).includes('spoofed'), 'a message from another window is dropped, not relayed')
+
+// ── the stop button in the MOUNTED workbench actually stops ──
+//
+// The user could not find 停止 because the component holding it was never
+// mounted. These assertions are the ones that would have caught that: the button
+// is in the mounted tree, and clicking it really reaches the host. Every running
+// backend gets a button; only the one THIS plugin spawned is enabled, because the
+// plugin never terminates an instance it did not start.
+const mountedStops = findByType(workbench, 'button')
+  .filter((b) => Array.isArray(b.children) && b.children.includes('停止'))
+assert(mountedStops.length === 2, `the mounted workbench offers 停止 for every running backend (got ${mountedStops.length})`)
+const enabledStops = mountedStops.filter((b) => b.props.disabled !== true)
+const disabledStops = mountedStops.filter((b) => b.props.disabled === true)
+assert(enabledStops.length === 1, 'exactly one is enabled — the instance this plugin spawned')
+assert(disabledStops.length === 1 && /绘世|非本插件启动/.test(String(disabledStops[0].props.title)),
+  'the other is disabled and its tooltip explains why, instead of looking broken')
+relayRequests.length = 0
+enabledStops[0].props.onClick()
+await settle()
+const stopCall = relayRequests.find((r) => r.path === '/gig/backend/stop')
+assert(stopCall !== undefined, 'clicking 停止 really POSTs to the host')
+assert(stopCall && stopCall.body && stopCall.body.backend === 'comfyui', 'naming the backend that was clicked')
 
 const bridgeCard = renderTree(React.createElement(plugin.BridgeCard, {
   bridge: {
