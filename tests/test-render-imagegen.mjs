@@ -645,6 +645,21 @@ assert(frames[0].props.src === 'http://127.0.0.1:8188', `the iframe points at th
 assert(frames[0].props.key === 3 || frames[0].props.src !== undefined, 'the iframe is keyed so a reload remounts it')
 assert(renderTree(onlineCanvas).includes('重新载入画布'), 'the online canvas offers a reload')
 
+// Collapsing a Section normally UNMOUNTS its body. For the canvas that means
+// throwing the whole ComfyUI page away, so re-expanding it reloads the frontend —
+// which is exactly what the user saw as "the bridge disconnects when I collapse and
+// reopen the canvas". The canvas section opts into keepMounted.
+{
+  const collapsed = resolve(React.createElement(plugin.Section, { title: 'ComfyUI 画布', defaultOpen: false, keepMounted: true },
+    React.createElement(plugin.CanvasPane, { port: 8188, online: true, busy: false, reloadKey: 0, onStart() {}, onReload() {} })))
+  assert(findByType(collapsed, 'iframe').length === 1, 'a collapsed keepMounted section keeps its iframe MOUNTED (no reload on expand)')
+  const wrapper = findByType(collapsed, 'div').find((d) => d.props && d.props.style && d.props.style.display === 'none')
+  assert(wrapper !== undefined, 'and hides it with display:none instead of removing it')
+  const plainCollapsed = resolve(React.createElement(plugin.Section, { title: '普通', defaultOpen: false },
+    React.createElement(plugin.CanvasPane, { port: 8188, online: true, busy: false, reloadKey: 0, onStart() {}, onReload() {} })))
+  assert(findByType(plainCollapsed, 'iframe').length === 0, 'while an ordinary collapsed section still unmounts its body as before')
+}
+
 // ── the agent hint ──
 
 const hintOn = renderTree(React.createElement(plugin.AgentHint, { lastCommand: '代理填入表单：a blue slime', panelOnline: true }))
