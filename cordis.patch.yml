@@ -22,6 +22,11 @@
 #   comfyRoot / comfyPython / comfyPort         (defaults target the 秋叶 v2 install on :8188)
 #   postPython:     Python used for cutout/upscale (defaults to the ComfyUI one)
 #   defaultBackend: sdwebui | comfyui (default sdwebui)
+#   dataRoot:       plugin-owned data root (default <DSH_HOME>/godot-imagegen):
+#                   workflow library, node-layout cache, pre-write BACKUPS and the
+#                   installed-files manifest of the ComfyUI canvas-bridge extension
+#   extensionSource: where the canvas-bridge extension source lives (default:
+#                   comfyui-extension/ next to this package's module)
 - insert:
     - id: godot-imagegen
       name: godot-imagegen

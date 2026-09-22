@@ -12,18 +12,22 @@
   "files": [
     "godot-imagegen.ts",
     "lib/client.js",
+    "comfyui-extension",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node tests/test-workflow.mjs && node tests/test-workflow-library.mjs && node tests/test-imagegen.mjs && node tests/test-render-imagegen.mjs",
+    "test": "node tests/test-workflow.mjs && node tests/test-workflow-library.mjs && node tests/test-imagegen.mjs && node tests/test-extension.mjs && node tests/test-render-imagegen.mjs",
     "test:workflow": "node tests/test-workflow.mjs",
     "test:library": "node tests/test-workflow-library.mjs",
     "test:offline": "node tests/test-imagegen.mjs",
+    "test:extension": "node tests/test-extension.mjs",
     "test:client": "node tests/test-render-imagegen.mjs",
     "test:live": "node tests/test-imagegen-live.mjs",
-    "test:live:comfy": "node tests/test-imagegen-live-comfy.mjs"
+    "test:live:comfy": "node tests/test-imagegen-live-comfy.mjs",
+    "test:live:extension": "node tests/test-extension-live.mjs",
+    "test:live:extension:serve": "node tests/test-extension-live.mjs --serve"
   },
   "dsh": {
     "bundle": {

@@ -3,6 +3,10 @@ node_modules/
 *.tsbuildinfo
 .tsbuildinfo
 
+# Python byte code — comfyui-extension/__init__.py gets imported by ComfyUI
+__pycache__/
+*.pyc
+
 # local scratch
 .tmp/
 tmp/

@@ -988,7 +988,11 @@ async function main() {
   assert(status2.queued === 0 && status2.delivered === true, 'the queue is empty and the panel is online')
 
   const openedOnline = unwrap(await exec(workflowTool, { action: 'open', id: 'item-icon' }))
-  assert(openedOnline.delivered === true && /已让画布载入/.test(openedOnline.note), 'once a panel polls, action=open delivers immediately')
+  assert(openedOnline.delivered === true && /已让面板载入/.test(openedOnline.note), 'once a panel polls, action=open delivers immediately')
+  // The embedded ComfyUI canvas is a SEPARATE channel: without the bridge
+  // extension the graph must not be queued for it silently, or it would pop up
+  // on the user's canvas minutes later out of context.
+  assert(openedOnline.canvas === false && /桥接扩展未安装/.test(openedOnline.canvasDetail), 'and open says the canvas was not reached, because the bridge is not installed')
   const poll2 = await callRoute(webServer, 'POST', '/gig/ui/poll', {})
   assert(poll2.body.commands.length === 1 && poll2.body.commands[0].kind === 'workflow.load', 'the workflow.load instruction reaches the panel')
   assert(poll2.body.commands[0].payload.graph.nodes.length === 7, 'the instruction carries the whole graph for the canvas')

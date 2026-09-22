@@ -34,10 +34,11 @@
 import { spawn as nodeSpawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, rmdir, stat, writeFile } from 'node:fs/promises'
 import { request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, resolve, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'godot-imagegen'
@@ -134,7 +135,7 @@ export interface GalleryImage {
 /** A long-running backend operation tracked for the UI. */
 interface Job {
   id: string
-  kind: 'generate' | 'edit' | 'upscale' | 'cutout' | 'interrogate' | 'start'
+  kind: 'generate' | 'variants' | 'edit' | 'upscale' | 'cutout' | 'interrogate' | 'start'
   label: string
   status: 'running' | 'done' | 'error' | 'cancelled'
   /** 0..1 when the backend reports it, otherwise undefined. */
@@ -188,6 +189,12 @@ export interface ImagegenConfig {
    * pre-write backups). Lives in DSH home, never inside the ComfyUI install.
    */
   dataRoot: string
+  /**
+   * Directory holding the ComfyUI web-extension source. Defaults to
+   * `comfyui-extension/` next to this module. Only override it for an unusual
+   * layout — the install copies FROM here and never edits it in place.
+   */
+  extensionSource?: string
 }
 
 const DEFAULT_SDWEBUI_ROOT = 'D:/AKI open/sd-webui-aki-v4.10/sd-webui-aki-v4.10'
@@ -240,6 +247,7 @@ function resolveConfig(config: unknown): ImagegenConfig {
     requestTimeoutMs: num('requestTimeoutMs', 30 * 60 * 1000),
     startTimeoutMs: num('startTimeoutMs', 6 * 60 * 1000),
     dataRoot,
+    ...(str('extensionSource', '') === '' ? {} : { extensionSource: str('extensionSource', '') }),
   }
 }
 
@@ -1012,6 +1020,14 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
   ready(): boolean
   reason(): string
   call(cmd: string, args: string[]): Promise<Record<string, unknown>>
+}, hooks?: {
+  /**
+   * Fired after a backend launch attempt resolves. The extension manager uses it
+   * to re-sync an ALREADY installed bridge (it never installs on its own): a
+   * restart of ComfyUI is exactly the moment a new copy takes effect, so the
+   * files on disk must be current by then.
+   */
+  onLaunched?: (id: ResolvedBackend) => void | Promise<void>
 }) {
   const spawnProcess = makeSpawner(subprocess)
   const processes: Partial<Record<ResolvedBackend, RunningProcess>> = {}
@@ -1188,6 +1204,15 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
 
   /** Launch a backend through its bundled Python; resolves once it answers. */
   async function launch(id: ResolvedBackend): Promise<{ ok: boolean; detail: string; pid?: number }> {
+    try {
+      return await launchInner(id)
+    } finally {
+      // A failed sync must never turn a successful launch into a failure.
+      void Promise.resolve(hooks?.onLaunched?.(id)).catch(() => undefined)
+    }
+  }
+
+  async function launchInner(id: ResolvedBackend): Promise<{ ok: boolean; detail: string; pid?: number }> {
     if (await isUp(id)) {
       return { ok: true, detail: `${labelOf(id)} 已在运行（复用现有实例，不重启）` }
     }
@@ -2662,7 +2687,7 @@ function createOps(deps: OpsDeps) {
   ): Promise<GalleryImage> {
     const source = await resolveImagePath(input.imagePath)
     const plan = await outputPlan(input.outDir)
-    const sourceInfo = await post.info(source).catch(() => ({}))
+    const sourceInfo = await post.info(source).catch((): Record<string, unknown> => ({}))
     const width = typeof sourceInfo.width === 'number' ? sourceInfo.width : 0
     const height = typeof sourceInfo.height === 'number' ? sourceInfo.height : 0
     const saved = await saveImage(Buffer.alloc(0), plan, input.category, input.name, `-x${input.scale}`)
@@ -3704,7 +3729,12 @@ export interface WorkflowLibrary {
   list(): Promise<WorkflowSummary[]>
   read(id: string): Promise<{ meta: WorkflowMeta; graph: UiWorkflow }>
   save(id: string, graph: UiWorkflow, patch?: Partial<WorkflowMeta>): Promise<WorkflowMeta>
-  create(input: { name: string; description?: string; category?: string; from?: string; graph?: UiWorkflow }): Promise<{ id: string; meta: WorkflowMeta }>
+  /**
+   * Create a workflow. `graph` is deliberately `unknown`: the caller may hand
+   * over a graph it just parsed out of a tool argument or a file, and it is
+   * normalized (UI format, API format or junk) before it is stored.
+   */
+  create(input: { name: string; description?: string; category?: string; from?: string; graph?: unknown }): Promise<{ id: string; meta: WorkflowMeta }>
   remove(id: string): Promise<boolean>
 }
 
@@ -3747,6 +3777,10 @@ export function createWorkflowLibrary(cfg: ImagegenConfig): WorkflowLibrary {
   }
 
   async function read(id: string): Promise<{ meta: WorkflowMeta; graph: UiWorkflow }> {
+    // Seed before reading: a caller whose first act is `read sd15-basic` (the
+    // documented way to look at a template) must not be told the library is
+    // empty just because nobody has listed it yet.
+    await ensure()
     const path = fileOf(id)
     let raw: string
     try {
@@ -3932,17 +3966,23 @@ export interface PanelState {
   selectedImageId?: string
   /** Workflow the panel currently has loaded. */
   activeWorkflowId?: string
-  /** What the embedded ComfyUI canvas reports (phase 2 fills this from the extension). */
-  canvas?: { workflowId?: string; nodeCount?: number; missingClasses?: string[] }
+  /** What the embedded ComfyUI canvas reports (the bridge extension fills this). */
+  canvas?: { workflowId?: string; nodeCount?: number; classes?: string[]; missingClasses?: string[]; title?: string }
   /** Which section the panel is showing. */
   section?: string
+  /**
+   * The DSH web origin the panel is served from (`window.location.origin`).
+   * The bridge extension has to call back to this exact origin, so the install
+   * bakes it into the generated file rather than guessing a port.
+   */
+  origin?: string
   updatedAt: string
 }
 
 /** One instruction queued for the panel. */
 export interface UiCommand {
   id: string
-  kind: 'form.fill' | 'workshop.focus' | 'gallery.select' | 'workflow.load' | 'toast'
+  kind: 'form.fill' | 'workshop.focus' | 'gallery.select' | 'workflow.load' | 'workflow.patch' | 'toast'
   /** Human-readable summary, so the panel's log reads like a conversation. */
   label: string
   payload: Record<string, unknown>
@@ -4027,6 +4067,450 @@ export function createUiQueue(): UiQueue {
         reportedAt: lastState?.updatedAt ?? null,
       }
     },
+  }
+}
+
+// ──────────────── ComfyUI web-extension bridge (the only thing that writes into ComfyUI) ────────────────
+//
+// Everything else this plugin owns lives under its own data root. The bridge is
+// the single exception: ComfyUI only loads a web extension from INSIDE its own
+// `custom_nodes/<name>/web/` directory, so installing it means writing there.
+//
+// Two rules make that safe:
+//   1. the source of truth stays in this repository (`comfyui-extension/`), and
+//      the install BAKES the DSH origin and a fresh token into a copy;
+//   2. every path the install creates is recorded in a manifest, and the state
+//      that was there before is copied to a timestamped backup FIRST — so the
+//      uninstall is exact and the install is reversible.
+
+/** One file this plugin installed inside the ComfyUI tree. */
+export interface InstalledFile {
+  path: string
+  /** Which extension package created it. */
+  pkg: string
+  installedAt: string
+}
+
+/** The record that makes the install reversible. */
+export interface ExtensionManifest {
+  version: 1
+  /** Secret the installed extension authenticates with. */
+  token: string
+  /** DSH web origin baked into the installed extension. */
+  origin: string
+  /** The ComfyUI install this was written into. */
+  comfyRoot: string
+  installedAt: string
+  /** Directories the install created, shallowest first. */
+  directories: string[]
+  files: InstalledFile[]
+  /** Where the pre-write backup landed (always written, even when empty). */
+  backupDir: string
+}
+
+/** What the extension manager can be asked to do. */
+export interface ExtensionManager {
+  /** Paths involved, for diagnostics and the panel. */
+  readonly sourceDir: string
+  readonly targetDir: string
+  readonly manifestPath: string
+  status(): Promise<{
+    installed: boolean
+    sourcePresent: boolean
+    targetDir: string
+    sourceDir: string
+    installedAt?: string
+    origin?: string
+    files: number
+    /** True when a re-sync would change the installed copy. */
+    stale: boolean
+    detail: string
+  }>
+  install(originHint?: string): Promise<{ ok: boolean; detail: string; backupDir?: string; files: string[]; restartRequired: boolean }>
+  /**
+   * Remove exactly what the manifest records. `reason` distinguishes "there was
+   * nothing installed" from "some files could not be deleted" — a caller that
+   * only looks at `ok` cannot tell those apart, and they need different replies.
+   */
+  uninstall(): Promise<{
+    ok: boolean
+    reason: 'ok' | 'not-installed' | 'partial' | 'leftovers'
+    detail: string
+    removed: string[]
+    /** Derived byte-code cache taken with the sources (see findByteCodeCache). */
+    derived: string[]
+    pruned: string[]
+    leftovers: string[]
+  }>
+  /** Re-install when one is already present and something changed. */
+  syncIfInstalled(originHint?: string): Promise<{ synced: boolean; detail: string }>
+  /** The token the installed extension expects, if any. */
+  currentToken(): Promise<string | undefined>
+}
+
+/** The package name inside `custom_nodes/` — a directory of our own, easy to spot. */
+const EXTENSION_PACKAGE = 'godot-imagegen-bridge'
+const EXTENSION_FILES: Array<{ source: string; target: string }> = [
+  { source: '__init__.py', target: '__init__.py' },
+  { source: 'godot-imagegen-bridge.js', target: 'web/godot-imagegen-bridge.js' },
+]
+
+/**
+ * Where the extension source lives, resolved relative to THIS module.
+ *
+ * Resolving from `import.meta.url` rather than a configured absolute path means
+ * the plugin keeps working when the repository moves (it did once already) and
+ * when the deployment loads it through a profile junction. A config override
+ * exists for unusual layouts.
+ */
+function defaultExtensionSource(): string {
+  try {
+    return fileURLToPath(new URL('./comfyui-extension/', import.meta.url))
+  } catch {
+    return join(process.env.DSH_HOME ?? '.dsh', 'godot-imagegen', 'comfyui-extension')
+  }
+}
+
+/** Create the bridge manager. It performs no I/O until it is asked to. */
+export function createExtensionManager(cfg: ImagegenConfig, sourceOverride?: string): ExtensionManager {
+  const sourceDir = sourceOverride === undefined || sourceOverride === ''
+    ? defaultExtensionSource()
+    : sourceOverride.replace(/\\/g, '/')
+  // The ComfyUI APPLICATION directory is <root>/ComfyUI (that is the launch cwd
+  // too), so custom_nodes lives one level in. Paths are normalized to forward
+  // slashes so every path this manager records is comparable with the config it
+  // was built from — a mixed-separator path looks equal but is not `===`.
+  const appDir = `${cfg.comfyRoot}/ComfyUI`.replace(/\\/g, '/')
+  const targetDir = `${appDir}/custom_nodes/${EXTENSION_PACKAGE}`
+  const manifestPath = `${cfg.dataRoot}/installed-files.json`.replace(/\\/g, '/')
+  const backupsRoot = `${cfg.dataRoot}/backups`.replace(/\\/g, '/')
+
+  async function readManifest(): Promise<ExtensionManifest | undefined> {
+    try {
+      const parsed = JSON.parse(await readFile(manifestPath, 'utf8')) as ExtensionManifest
+      if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.files)) return undefined
+      return parsed
+    } catch {
+      return undefined
+    }
+  }
+
+  async function loadSource(): Promise<Map<string, string>> {
+    const out = new Map<string, string>()
+    for (const entry of EXTENSION_FILES) {
+      const path = join(sourceDir, entry.source)
+      out.set(entry.target, await readFile(path, 'utf8'))
+    }
+    return out
+  }
+
+  /** Which files, if any, already sit under the target directory. */
+  async function listExisting(): Promise<string[]> {
+    const found: string[] = []
+    async function walk(dir: string, prefix: string): Promise<void> {
+      let entries
+      try {
+        entries = await readdir(dir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const entry of entries) {
+        const rel = prefix === '' ? entry.name : `${prefix}/${entry.name}`
+        if (entry.isDirectory()) await walk(join(dir, entry.name), rel)
+        else found.push(rel)
+      }
+    }
+    await walk(targetDir, '')
+    return found.sort()
+  }
+
+  /**
+   * Copy whatever is already under the target directory into a timestamped
+   * backup, and always write a BEFORE.json describing the prior state — so there
+   * is an audit trail even when the install only ever creates new files.
+   */
+  async function backupTarget(): Promise<string> {
+    const stamp = timestampLabel()
+    const dir = `${backupsRoot}/${stamp}/comfyui`
+    await mkdir(dir, { recursive: true })
+    const before = await listExisting()
+    for (const rel of before) {
+      const destination = join(dir, rel)
+      await mkdir(dirname(destination), { recursive: true })
+      await copyFile(join(targetDir, rel), destination)
+    }
+    await writeFile(
+      join(dir, 'BEFORE.json'),
+      `${JSON.stringify({
+        at: new Date().toISOString(),
+        targetDir,
+        existed: before.length > 0,
+        files: before,
+        // Stated plainly so a future reader can tell "nothing to lose" from
+        // "someone forgot to back up".
+        note: before.length === 0
+          ? '目标目录在本次写入前不存在或为空：本次只创建新文件，未覆盖任何既有内容。'
+          : `本次写入前已备份 ${before.length} 个既有文件。`,
+      }, null, 2)}\n`,
+      'utf8',
+    )
+    return dir
+  }
+
+  /** Substitute the two placeholders the extension authenticates with. */
+  function fillTemplate(text: string, origin: string, token: string): string {
+    return text.replace(/__DSH_ORIGIN__/g, origin).replace(/__TOKEN__/g, token)
+  }
+
+  async function compose(origin: string, token: string): Promise<Map<string, string>> {
+    const source = await loadSource()
+    const out = new Map<string, string>()
+    for (const [target, text] of source) {
+      out.set(target, target.endsWith('.js') ? fillTemplate(text, origin, token) : text)
+    }
+    return out
+  }
+
+  async function currentContent(target: string): Promise<string | undefined> {
+    try {
+      return await readFile(join(targetDir, target), 'utf8')
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Python's byte-code cache, as it shows up under the target directory.
+   *
+   * ComfyUI IMPORTS the package at boot, so Python writes
+   * `__pycache__/<stem>.cpython-3xx.pyc` next to the .py files this plugin
+   * installed. That cache is derived from our own source and is regenerated on
+   * the next import, so an uninstall may take it along — but only when the stem
+   * matches a file this plugin actually installed, so a .pyc for anything else
+   * in there is left alone (and reported) rather than swept up.
+   *
+   * Without this, "卸载不留残留" would be false the moment ComfyUI had ever
+   * booted with the extension installed — which is exactly the normal case.
+   */
+  async function findByteCodeCache(installedStems: Set<string>): Promise<{ files: string[]; dirs: string[] }> {
+    const files: string[] = []
+    const dirs: string[] = []
+    async function walk(dir: string, insideCache: boolean): Promise<void> {
+      let entries
+      try {
+        entries = await readdir(dir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const entry of entries) {
+        const full = join(dir, entry.name)
+        if (entry.isDirectory()) {
+          const isCache = entry.name === '__pycache__'
+          if (isCache) dirs.push(full)
+          await walk(full, insideCache || isCache)
+          continue
+        }
+        if (!insideCache) continue
+        // `__init__.cpython-312.pyc` → stem `__init__`, which is what we compare.
+        const match = /^(.+?)\.[^.]*\.pyc$/i.exec(entry.name)
+        if (match !== null && installedStems.has(match[1])) files.push(full)
+      }
+    }
+    await walk(targetDir, false)
+    return { files, dirs }
+  }
+
+  return {
+    sourceDir,
+    targetDir,
+    manifestPath,
+
+    async status() {
+      const manifest = await readManifest()
+      const sourcePresent = fileExists(join(sourceDir, EXTENSION_FILES[0].source))
+      const targetPresent = fileExists(join(targetDir, EXTENSION_FILES[0].target))
+      const installed = manifest !== undefined && targetPresent
+      let stale = false
+      if (installed && manifest !== undefined) {
+        try {
+          const wanted = await compose(manifest.origin, manifest.token)
+          for (const [target, text] of wanted) {
+            if ((await currentContent(target)) !== text) { stale = true; break }
+          }
+        } catch {
+          stale = true
+        }
+      }
+      return {
+        installed,
+        sourcePresent,
+        targetDir,
+        sourceDir,
+        ...(manifest === undefined ? {} : { installedAt: manifest.installedAt, origin: manifest.origin }),
+        files: manifest === undefined ? 0 : manifest.files.length,
+        stale,
+        detail: !sourcePresent
+          ? `扩展源码不在 ${sourceDir}（可用 config.extensionSource 指定）`
+          : installed
+            ? `已安装到 ${targetDir}${stale ? '（内容已变化，需要重新同步）' : ''}`
+            : `未安装（将写入 ${targetDir}）`,
+      }
+    },
+
+    async install(originHint) {
+      if (!fileExists(join(sourceDir, EXTENSION_FILES[0].source))) {
+        return { ok: false, detail: `扩展源码不存在：${join(sourceDir, EXTENSION_FILES[0].source)}`, files: [], restartRequired: false }
+      }
+      if (!fileExists(appDir)) {
+        return { ok: false, detail: `ComfyUI 安装目录不存在：${appDir}`, files: [], restartRequired: false }
+      }
+      const previous = await readManifest()
+      const origin = (originHint !== undefined && originHint !== '' ? originHint : previous?.origin) ?? 'http://127.0.0.1:43120'
+      // Reuse the token so an already-loaded canvas keeps working across a sync.
+      const token = previous?.token ?? randomUUID().replace(/-/g, '')
+      const wantedDirs = [targetDir, join(targetDir, 'web')]
+      // Which of them are already on disk BEFORE we touch anything — those are
+      // never ours to prune later, even if a later run re-writes files into them.
+      const existedBefore = new Set(wantedDirs.filter((dir) => fileExists(dir)))
+
+      const backupDir = await backupTarget()
+      const wanted = await compose(origin, token)
+
+      await mkdir(join(targetDir, 'web'), { recursive: true })
+      const files: InstalledFile[] = []
+      const now = new Date().toISOString()
+      for (const [target, text] of wanted) {
+        await writeFile(join(targetDir, target), text, 'utf8')
+        files.push({ path: join(targetDir, target), pkg: EXTENSION_PACKAGE, installedAt: now })
+      }
+      // Only count directories this plugin actually brought into existence.
+      const directories = wantedDirs.filter((dir) => !existedBefore.has(dir) || previous?.directories.includes(dir) === true)
+      const manifest: ExtensionManifest = {
+        version: 1,
+        token,
+        origin,
+        comfyRoot: cfg.comfyRoot,
+        installedAt: now,
+        directories,
+        files,
+        backupDir,
+      }
+      await mkdir(cfg.dataRoot, { recursive: true })
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
+      return {
+        ok: true,
+        detail: `已安装到 ${targetDir}（宿主 ${origin}）。ComfyUI 需要重启才会加载这个扩展。`,
+        backupDir,
+        files: files.map((f) => f.path),
+        restartRequired: true,
+      }
+    },
+
+    async uninstall() {
+      const manifest = await readManifest()
+      if (manifest === undefined) {
+        return {
+          ok: false,
+          reason: 'not-installed' as const,
+          detail: '没有安装记录（installed-files.json 不存在）——本来就没有装过，无需卸载。',
+          removed: [],
+          derived: [],
+          pruned: [],
+          leftovers: [],
+        }
+      }
+      const removed: string[] = []
+      const failed: string[] = []
+      // Delete exactly what we recorded. Anything else under the target dir was
+      // not put there by this plugin and is left alone.
+      for (const file of manifest.files) {
+        const inside = isInside(targetDir, file.path)
+        if (!inside) {
+          failed.push(`${file.path}（在目标目录之外，拒绝删除）`)
+          continue
+        }
+        try {
+          await rm(file.path, { force: true })
+          removed.push(file.path)
+        } catch (error) {
+          failed.push(`${file.path}（${(error as Error).message}）`)
+        }
+      }
+      const pruned: string[] = []
+      // Byte-code cache that COMIFYUI's own import created from our sources.
+      const stems = new Set(manifest.files.map((f) => basename(f.path).replace(/\.[^.]+$/, '')))
+      const cache = await findByteCodeCache(stems)
+      const derived: string[] = []
+      for (const file of cache.files) {
+        if (!isInside(targetDir, file)) continue
+        try {
+          await rm(file, { force: true })
+          derived.push(file)
+        } catch (error) {
+          failed.push(`${file}（${(error as Error).message}）`)
+        }
+      }
+      // Deepest first, so a directory is only removed once it is empty.
+      // NB: this must be rmdir, not rm — `rm` refuses a directory path outright
+      // (ERR_FS_EISDIR), and `rm -r` would take any unexpected content with it.
+      // rmdir fails on a non-empty directory, which is exactly the guard we want.
+      for (const dir of [...manifest.directories, ...cache.dirs].sort((a, b) => b.length - a.length)) {
+        const leftovers = await listDirSafe(dir)
+        if (leftovers !== undefined && leftovers.length === 0) {
+          try {
+            await rmdir(dir)
+            pruned.push(dir)
+          } catch { /* another process may hold it, or it was restored meanwhile */ }
+        }
+      }
+      await rm(manifestPath, { force: true })
+      // The manifest is the contract; anything still sitting under our package
+      // directory was NOT installed by this plugin, so it is reported, never
+      // deleted. Silence here would look like a clean uninstall when it is not.
+      const leftovers = await listExisting()
+      const counts = [
+        `${removed.length} 个文件`,
+        derived.length === 0 ? '' : `${derived.length} 个 Python 字节码缓存`,
+        pruned.length === 0 ? '' : `${pruned.length} 个目录`,
+      ].filter((s) => s !== '')
+      const notes = [
+        failed.length === 0 ? '' : `部分删除失败：${failed.join('；')}`,
+        leftovers.length === 0 ? '' : `另有 ${leftovers.length} 个非本插件文件保留在目标目录：${leftovers.slice(0, 5).join('、')}${leftovers.length > 5 ? '…' : ''}`,
+      ].filter((s) => s !== '')
+      const reason = failed.length > 0 ? 'partial' : leftovers.length > 0 ? 'leftovers' : 'ok'
+      return {
+        ok: reason === 'ok',
+        reason,
+        detail: notes.length === 0
+          ? `已卸载：删除 ${counts.join('、')}，目标目录无残留。重启 ComfyUI 后扩展消失。`
+          : notes.join('；'),
+        removed,
+        derived,
+        pruned,
+        leftovers,
+      }
+    },
+
+    async syncIfInstalled(originHint) {
+      const manifest = await readManifest()
+      if (manifest === undefined) return { synced: false, detail: '未安装，跳过同步（安装是显式操作）' }
+      const result = await this.install(originHint)
+      return { synced: result.ok, detail: result.detail }
+    },
+
+    async currentToken() {
+      const manifest = await readManifest()
+      return manifest?.token
+    },
+  }
+}
+
+/** `readdir` that returns undefined instead of throwing. */
+async function listDirSafe(dir: string): Promise<string[] | undefined> {
+  try {
+    return await readdir(dir)
+  } catch {
+    return undefined
   }
 }
 
@@ -4115,12 +4599,16 @@ function registerImageTools(
     library: WorkflowLibrary
     /** Host → panel instruction queue. */
     queue: UiQueue
+    /** Host → embedded-ComfyUI canvas instruction queue (via the bridge extension). */
+    canvas: UiQueue
+    /** The ComfyUI web-extension bridge: install/uninstall/status. */
+    extension: ExtensionManager
     /** Cached node layouts, refreshed from ComfyUI on demand. */
     layouts: (force?: boolean) => Promise<Record<string, WidgetSpec[]> | undefined>
   },
 ): void {
   const { cfg, jobs, gallery, backends, post, runWorkflow } = ops
-  const { library, queue, layouts } = deps
+  const { library, queue, canvas, extension, layouts } = deps
   const projectIdParam = { type: 'string', description: '图库归属的项目 id（可选，默认 default；与 Godot 资产管理器的项目对应）。' }
 
   /** Watch a tool's abort flag and cancel the matching job. */
@@ -4771,6 +5259,7 @@ function registerImageTools(
         transparent: { type: 'boolean', description: 'action=run: cut the result out to a transparent PNG.' },
         seamless: { type: 'boolean', description: 'action=run: make the result a seamless tile.' },
         force_layout_refresh: { type: 'boolean', description: 'Re-read node definitions from ComfyUI before editing (needed after installing a custom node).' },
+        to_canvas: { type: 'boolean', description: 'action=open/patch: also push the graph straight to the embedded ComfyUI canvas through the bridge extension (needs the bridge installed and ComfyUI restarted). Default true for "open".' },
       },
       required: ['action'],
     },
@@ -4818,6 +5307,9 @@ function registerImageTools(
           /** Whether a connected panel took the instruction (action=open/patch). */
           delivered: { type: 'boolean' },
           queued: { type: 'number' },
+          /** Whether the embedded ComfyUI canvas took the graph directly. */
+          canvas: { type: 'boolean' },
+          canvasDetail: { type: 'string' },
           note: { type: 'string' },
         },
         required: ['action'],
@@ -4831,12 +5323,17 @@ function registerImageTools(
           images?: GalleryImage[]
           delivered?: boolean
           queued?: number
+          canvas?: boolean
+          canvasDetail?: string
           note?: string
         }
         const tail = v.note === undefined ? '' : `\n${v.note}`
         const panel = v.delivered === undefined
           ? ''
           : v.delivered ? `\n✓ 已送达美术工坊面板（队列剩余 ${v.queued ?? 0}）` : `\n⚠ 面板未连接，指令已排队（${v.queued ?? 0} 条）`
+        const canvasLine = v.canvasDetail === undefined
+          ? ''
+          : `\n${v.canvas === true ? '✓' : 'ℹ'} ${v.canvasDetail}`
         if (v.action === 'list' && v.workflows !== undefined) {
           if (v.workflows.length === 0) return [{ type: 'text', text: `工作流库为空。${tail}` }]
           const lines = v.workflows.map((w) =>
@@ -4859,8 +5356,8 @@ function registerImageTools(
           const lines = v.images.map((i) => `• ${describeImage(i)}`)
           return [{ type: 'text', text: `工作流执行完成，产出 ${v.images.length} 张：\n${lines.join('\n')}${tail}` }]
         }
-        if (v.applied !== undefined) return [{ type: 'text', text: `已改：${v.applied.join('、')}${panel}${tail}` }]
-        return [{ type: 'text', text: `${v.action} 完成${panel}${tail}` }]
+        if (v.applied !== undefined) return [{ type: 'text', text: `已改：${v.applied.join('、')}${panel}${canvasLine}${tail}` }]
+        return [{ type: 'text', text: `${v.action} 完成${panel}${canvasLine}${tail}` }]
       },
     },
     async execute(args, exec) {
@@ -4868,6 +5365,30 @@ function registerImageTools(
       const category = requireCategory(args)
       const projectId = optionalString(args, 'project_id', 'project_id') ?? 'default'
       const force = optionalBoolean(args, 'force_layout_refresh', 'force_layout_refresh') === true
+
+      /**
+       * Hand a graph to the embedded ComfyUI canvas.
+       *
+       * The panel queue and the canvas queue are separate on purpose — this is
+       * the path that reaches ComfyUI itself, and it only exists once the bridge
+       * extension is installed AND ComfyUI has been restarted to load it. When
+       * the bridge is missing we must NOT queue silently: the graph would sit in
+       * the queue and appear on the user's canvas minutes later, out of context.
+       */
+      const pushCanvas = async (id: string, name: string, graph: UiWorkflow): Promise<{ canvas: boolean; canvasDetail: string }> => {
+        const bridge = await extension.status()
+        if (!bridge.installed) {
+          return { canvas: false, canvasDetail: '内嵌画布未接管：桥接扩展未安装（用 image_workshop action="install-bridge" 安装，然后重启 ComfyUI）' }
+        }
+        const online = canvas.status().online
+        canvas.push('workflow.load', `代理载入工作流 ${name}`, { id, name, graph })
+        return {
+          canvas: online,
+          canvasDetail: online
+            ? `已直接推送到内嵌 ComfyUI 画布（${name}）`
+            : `内嵌画布未连接，已排队（${name}）—— 用户打开美术工坊的「画布」后会自动载入`,
+        }
+      }
 
       const summaryOf = (w: WorkflowSummary): Record<string, unknown> => ({
         id: w.id,
@@ -4913,7 +5434,7 @@ function registerImageTools(
           ...(optionalString(args, 'description', 'description') === undefined ? {} : { description: optionalString(args, 'description', 'description') as string }),
           category,
           ...(optionalString(args, 'from', 'from') === undefined ? {} : { from: optionalString(args, 'from', 'from') as string }),
-          ...(graphArg === undefined ? {} : { graph: graphArg }),
+          ...(graphArg === undefined || graphArg === null ? {} : { graph: graphArg }),
         })
         const createdGraph = (await library.read(created.id)).graph
         return {
@@ -4971,11 +5492,13 @@ function registerImageTools(
         // Keep an open canvas in sync so the user SEES the edit.
         const status = queue.status()
         if (status.online) queue.push('workflow.patch', `代理改写了工作流 ${meta.name}`, { id, graph: patched.graph })
+        const reached = optionalBoolean(args, 'to_canvas', 'to_canvas') === true ? await pushCanvas(id, meta.name, patched.graph) : undefined
         return {
           action,
           delivered: status.online,
           queued: queue.status().pending,
           applied: patched.applied,
+          ...(reached === undefined ? {} : { canvas: reached.canvas, canvasDetail: reached.canvasDetail }),
           ...(status.online ? {} : { note: '改动已存到工作流库，但当前没有打开的美术工坊面板，画布上看不到；打开面板后用 action="open" 载入。' }),
         }
       }
@@ -4991,13 +5514,17 @@ function registerImageTools(
         const { meta, graph } = await library.read(id)
         queue.push('workflow.load', `代理载入工作流 ${meta.name}`, { id, name: meta.name, graph })
         const status = queue.status()
+        // `open` means "put it on the canvas", so the embedded canvas is the
+        // primary target; an explicit to_canvas=false opts out.
+        const reached = optionalBoolean(args, 'to_canvas', 'to_canvas') === false ? undefined : await pushCanvas(id, meta.name, graph)
         return {
           action,
           delivered: status.online,
           queued: status.pending,
+          ...(reached === undefined ? {} : { canvas: reached.canvas, canvasDetail: reached.canvasDetail }),
           note: status.online
-            ? `已让画布载入 ${meta.name}`
-            : `指令已排队（${meta.name}）。当前没有打开的美术工坊面板，用户打开后会自动载入。`,
+            ? `已让面板载入 ${meta.name}`
+            : `面板未连接，指令已排队（${meta.name}）。用户打开美术工坊后会自动载入。`,
         }
       }
 
@@ -5041,12 +5568,12 @@ function registerImageTools(
 
   tools.register({
     name: 'image_workshop',
-    description: 'Drive the 美术工坊 (Art Studio) panel from the conversation, so the user does not have to retype what you already decided. action="fill-form" puts a prompt and parameters into the panel\'s form; "focus" brings a section forward; "select-image" highlights a produced image; "toast" shows a note in the panel; "read-state" returns what the user is currently looking at (their unsaved form, selected image, loaded workflow); "status" reports whether a panel is connected and how deep the queue is. Instructions are delivered on the panel\'s next poll (about 1.5s) and only while the panel is open — "status"/"read-state" tell you whether it is.',
+    description: 'Drive the 美术工坊 (Art Studio) panel and its embedded ComfyUI canvas from the conversation, so the user does not have to retype what you already decided. action="fill-form" puts a prompt and parameters into the panel\'s form; "focus" brings a section forward; "select-image" highlights a produced image; "toast" shows a note in the panel; "read-state" returns what the user is currently looking at (their unsaved form, selected image, loaded workflow, canvas); "status" reports whether a panel is connected and how deep the queue is. For the embedded canvas: "bridge-status" reports whether the ComfyUI web-extension bridge is installed and whether a canvas is answering; "install-bridge" installs it (this writes into the ComfyUI install — back up first, and ComfyUI must be restarted for it to load); "uninstall-bridge" removes exactly the files it installed; "read-canvas" reports the node classes the canvas is actually showing. Instructions are delivered on the next poll (about 1.5s) and only while the panel is open — "status"/"read-state" tell you whether it is.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        action: { type: 'string', enum: ['fill-form', 'focus', 'select-image', 'toast', 'read-state', 'status'], description: 'What to do.' },
+        action: { type: 'string', enum: ['fill-form', 'focus', 'select-image', 'toast', 'read-state', 'status', 'bridge-status', 'install-bridge', 'uninstall-bridge', 'read-canvas'], description: 'What to do.' },
         prompt: { type: 'string', description: 'action=fill-form: the positive prompt to place in the form.' },
         negative_prompt: { type: 'string', description: 'action=fill-form: the negative prompt.' },
         category: { type: 'string', enum: ART_CATEGORIES, description: 'action=fill-form: art category (also switches the form\'s defaults).' },
@@ -5064,6 +5591,7 @@ function registerImageTools(
         text: { type: 'string', description: 'action=toast: the message to show.' },
         level: { type: 'string', enum: ['info', 'ok', 'error'], description: 'action=toast: severity (default info).' },
         autostart: { type: 'boolean', description: 'action=fill-form: also press generate once the form is filled.' },
+        origin: { type: 'string', description: 'action=install-bridge: the DSH web origin the canvas should call back to (e.g. http://127.0.0.1:43120). Defaults to the origin the open panel reported, then to the conventional local address.' },
       },
       required: ['action'],
     },
@@ -5076,6 +5604,32 @@ function registerImageTools(
           delivered: { type: 'boolean' },
           queued: { type: 'number' },
           note: { type: 'string' },
+          bridge: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              installed: { type: 'boolean' },
+              sourcePresent: { type: 'boolean' },
+              stale: { type: 'boolean' },
+              targetDir: { type: 'string' },
+              installedAt: { type: 'string' },
+              origin: { type: 'string' },
+              files: { type: 'number' },
+              detail: { type: 'string' },
+              backupDir: { type: 'string' },
+              removed: { type: 'number' },
+              derived: { type: 'number' },
+              pruned: { type: 'number' },
+              restartRequired: { type: 'boolean' },
+              canvasOnline: { type: 'boolean' },
+              canvasLastPollSecondsAgo: { type: 'number' },
+              canvasNodeCount: { type: 'number' },
+              canvasClasses: { type: 'array', items: { type: 'string' } },
+              canvasMissingClasses: { type: 'array', items: { type: 'string' } },
+              canvasTitle: { type: 'string' },
+            },
+            required: ['installed'],
+          },
           state: {
             type: 'object',
             additionalProperties: false,
@@ -5099,12 +5653,56 @@ function registerImageTools(
           delivered: boolean
           queued: number
           note?: string
+          bridge?: {
+            installed: boolean
+            sourcePresent: boolean
+            stale: boolean
+            targetDir: string
+            installedAt?: string
+            origin?: string
+            files: number
+            detail: string
+            backupDir?: string
+            removed?: number
+            derived?: number
+            pruned?: number
+            restartRequired?: boolean
+            canvasOnline: boolean
+            canvasLastPollSecondsAgo?: number
+            canvasNodeCount?: number
+            canvasClasses?: string[]
+            canvasMissingClasses?: string[]
+            canvasTitle?: string
+          }
           state?: { updatedAt: string; lastPollSecondsAgo?: number; section?: string; activeWorkflowId?: string; selectedImageId?: string; formDescription?: string; canvasNodes?: number }
         }
         const lines: string[] = []
-        lines.push(v.delivered
-          ? `✓ 已送达美术工坊面板（队列剩余 ${v.queued}）`
-          : `⚠ 面板当前未连接，指令已排队（${v.queued} 条）。用户打开美术工坊后会自动执行。`)
+        if (v.bridge !== undefined) {
+          const b = v.bridge
+          lines.push(b.installed
+            ? `画布桥接：已安装（${b.files} 个文件${b.installedAt === undefined ? '' : `，${b.installedAt}`}）`
+            : '画布桥接：未安装')
+          lines.push(`  ${b.detail}`)
+          if (b.origin !== undefined) lines.push(`  宿主 origin：${b.origin}`)
+          if (b.backupDir !== undefined) lines.push(`  写入前备份：${b.backupDir}`)
+          if (b.removed !== undefined) lines.push(`  已删除文件 ${b.removed} 个${b.derived === undefined ? '' : `、Python 字节码缓存 ${b.derived} 个`}${b.pruned === undefined ? '' : `、目录 ${b.pruned} 个`}`)
+          if (b.stale) lines.push('  ⚠ 磁盘上的副本与当前源码不一致：重新安装（install-bridge）即可同步。')
+          if (b.restartRequired) lines.push('  ⚠ ComfyUI 需要重启才会加载这个扩展。')
+          lines.push(b.canvasOnline
+            ? `内嵌画布：在线${b.canvasLastPollSecondsAgo === undefined ? '' : `（${b.canvasLastPollSecondsAgo} 秒前上报）`}${b.canvasNodeCount === undefined ? '' : `，${b.canvasNodeCount} 个节点`}`
+            : '内嵌画布：未连接（用户还没打开美术工坊的「画布」，或桥接扩展尚未生效）')
+          if (b.canvasTitle !== undefined && b.canvasTitle !== '') lines.push(`  当前工作流：${b.canvasTitle}`)
+          if (b.canvasClasses !== undefined && b.canvasClasses.length > 0) {
+            lines.push(`  节点类型：${b.canvasClasses.slice(0, 8).join(', ')}${b.canvasClasses.length > 8 ? '…' : ''}`)
+          }
+          if (b.canvasMissingClasses !== undefined && b.canvasMissingClasses.length > 0) {
+            lines.push(`  ⚠ 画布缺少这些节点类型（需要装对应自定义节点）：${b.canvasMissingClasses.join(', ')}`)
+          }
+        } else {
+          lines.push(v.delivered
+            ? `✓ 已送达美术工坊面板（队列剩余 ${v.queued}）`
+            : `⚠ 面板当前未连接，指令已排队（${v.queued} 条）。用户打开美术工坊后会自动执行。`)
+        }
         if (v.state !== undefined) {
           lines.push(`面板状态（${v.state.lastPollSecondsAgo ?? '?'} 秒前上报）：`)
           if (v.state.section !== undefined) lines.push(`  正在看：${v.state.section}`)
@@ -5120,6 +5718,76 @@ function registerImageTools(
     async execute(args) {
       const action = requireString(args, 'action', 'action')
       const status = queue.status()
+
+      // ---- the embedded-ComfyUI bridge ----
+      if (action === 'bridge-status' || action === 'install-bridge' || action === 'uninstall-bridge' || action === 'read-canvas') {
+        /** Assemble the wire view: on-disk facts + whatever the canvas last reported. */
+        const bridgeView = async (extra: Record<string, unknown> = {}): Promise<Record<string, unknown>> => {
+          const info = await extension.status()
+          const reported = canvas.state()?.canvas
+          const canvasStatus = canvas.status()
+          return {
+            installed: info.installed,
+            sourcePresent: info.sourcePresent,
+            stale: info.stale,
+            targetDir: info.targetDir,
+            files: info.files,
+            detail: info.detail,
+            ...(info.installedAt === undefined ? {} : { installedAt: info.installedAt }),
+            ...(info.origin === undefined ? {} : { origin: info.origin }),
+            canvasOnline: canvasStatus.online,
+            ...(canvasStatus.lastPollSecondsAgo === null ? {} : { canvasLastPollSecondsAgo: canvasStatus.lastPollSecondsAgo }),
+            ...(reported?.nodeCount === undefined ? {} : { canvasNodeCount: reported.nodeCount }),
+            ...(reported?.classes === undefined ? {} : { canvasClasses: reported.classes }),
+            ...(reported?.missingClasses === undefined || reported.missingClasses.length === 0 ? {} : { canvasMissingClasses: reported.missingClasses }),
+            ...(reported?.title === undefined || reported.title === '' ? {} : { canvasTitle: reported.title }),
+            ...extra,
+          }
+        }
+
+        if (action === 'bridge-status' || action === 'read-canvas') {
+          return { action, delivered: canvas.status().online, queued: canvas.status().pending, bridge: await bridgeView() }
+        }
+
+        if (action === 'install-bridge') {
+          const hint = optionalString(args, 'origin', 'origin') ?? queue.state()?.origin
+          const result = await extension.install(hint)
+          if (!result.ok) throw new Error(`安装画布桥接失败：${result.detail}`)
+          return {
+            action,
+            delivered: canvas.status().online,
+            queued: canvas.status().pending,
+            bridge: await bridgeView({
+              ...(result.backupDir === undefined ? {} : { backupDir: result.backupDir }),
+              restartRequired: result.restartRequired,
+            }),
+            note: '这一版扩展已写入 ComfyUI 的 custom_nodes。重启 ComfyUI 后，美术工坊的「画布」就能与对话互通。',
+          }
+        }
+
+        const result = await extension.uninstall()
+        if (result.reason === 'not-installed') {
+          // Not an error: the user asked for a state, and that state already holds.
+          return {
+            action,
+            delivered: false,
+            queued: 0,
+            bridge: await bridgeView({ removed: 0, derived: 0, pruned: 0 }),
+            note: result.detail,
+          }
+        }
+        if (result.reason === 'partial') throw new Error(`卸载画布桥接失败：${result.detail}`)
+        const detail = result.reason === 'leftovers'
+          ? `${result.detail}（这些文件不是本插件写入的，已保留）`
+          : `${result.detail}${result.derived.length === 0 ? '' : `（其中 ${result.derived.length} 个是 ComfyUI 导入时生成的 __pycache__ 缓存）`}`
+        return {
+          action,
+          delivered: false,
+          queued: 0,
+          bridge: await bridgeView({ removed: result.removed.length, derived: result.derived.length, pruned: result.pruned.length }),
+          note: detail,
+        }
+      }
 
       if (action === 'status') {
         return {
@@ -5245,7 +5913,17 @@ export function apply(ctx: Context, config: unknown): void {
 
   const cfg = resolveConfig(config)
   const post = createPostBridge(cfg, subprocess)
-  const backends = createBackends(cfg, subprocess, post)
+  const extension = createExtensionManager(cfg, cfg.extensionSource)
+  const backends = createBackends(cfg, subprocess, post, {
+    // ComfyUI reads WEB_DIRECTORY at boot, so a restart is the moment an updated
+    // bridge takes effect; refresh an ALREADY installed copy right before it.
+    onLaunched: async (id) => {
+      // Best effort: the result is observable through GET /gig/extension, which
+      // is where the panel and the agent read the bridge state from.
+      if (id !== 'comfyui') return
+      await extension.syncIfInstalled()
+    },
+  })
   const jobs = createJobRegistry()
 
   // One live handle per KV unit for the whole plugin lifetime; closed with the fiber.
@@ -5282,6 +5960,10 @@ export function apply(ctx: Context, config: unknown): void {
   const library = createWorkflowLibrary(cfg)
   const layoutCache = createLayoutCache(cfg)
   const uiQueue = createUiQueue()
+  // A second, independent queue for the embedded ComfyUI canvas. Separate on
+  // purpose: the panel and the canvas come and go on their own schedules, and
+  // one being offline must never mark the other unreachable.
+  const canvasQueue = createUiQueue()
 
   /**
    * The node layouts that let a workflow's widgets be addressed by name.
@@ -5303,7 +5985,7 @@ export function apply(ctx: Context, config: unknown): void {
     return compact
   }
 
-  registerImageTools(tools, ops, { library, queue: uiQueue, layouts })
+  registerImageTools(tools, ops, { library, queue: uiQueue, canvas: canvasQueue, extension, layouts })
 
   // Disposal must cancel in-flight work AND release the gallery unit: a KV unit
   // allows exactly one live handle per backend, so leaking it would make a later
@@ -5396,6 +6078,116 @@ export function apply(ctx: Context, config: unknown): void {
 
         if (method === 'GET' && pathname === '/gig/ui/queue') {
           sendJson(res, 200, { commands: uiQueue.pending(), status: uiQueue.status(), state: uiQueue.state() ?? null })
+          return
+        }
+
+        // ── ComfyUI canvas bridge ─────────────────────────────────────────
+        //
+        // The bridge extension runs on ComfyUI's OWN origin (127.0.0.1:8188)
+        // and calls back here cross-origin, so this is the one route whose
+        // responses carry CORS headers. It is gated by a per-install token that
+        // is baked into the installed file, so a stray local page cannot drive
+        // the canvas even though the origin is wildcarded.
+        if (pathname === '/gig/bridge/poll') {
+          const cors: Record<string, string> = {
+            'access-control-allow-origin': '*',
+            'access-control-allow-headers': 'content-type',
+            'access-control-allow-methods': 'POST, OPTIONS',
+            'access-control-max-age': '600',
+          }
+          const corsJson = (status: number, value: unknown): void => {
+            res.writeHead(status, { ...cors, 'content-type': 'application/json; charset=utf-8' })
+            res.end(JSON.stringify(value))
+          }
+          if (method === 'OPTIONS') {
+            res.writeHead(204, cors)
+            res.end()
+            return
+          }
+          if (method !== 'POST') {
+            corsJson(405, { error: 'method not allowed' })
+            return
+          }
+          const body = await readJsonBody(req).catch(() => ({} as Record<string, unknown>))
+          const expected = await extension.currentToken()
+          const token = typeof body.token === 'string' ? body.token : ''
+          if (expected === undefined || token === '' || token !== expected) {
+            corsJson(403, {
+              error: expected === undefined
+                ? '画布桥接未安装（没有已安装记录），扩展不应在轮询'
+                : 'bridge token 无效：宿主已重新生成令牌，请在美术工坊重新安装桥接扩展',
+            })
+            return
+          }
+          if (Array.isArray(body.ack)) {
+            canvasQueue.ack(body.ack.filter((id): id is string => typeof id === 'string'))
+          }
+          if (body.state !== null && typeof body.state === 'object' && !Array.isArray(body.state)) {
+            canvasQueue.report({ canvas: body.state as PanelState['canvas'] })
+          } else {
+            canvasQueue.report(canvasQueue.state() ?? {})
+          }
+          corsJson(200, { commands: canvasQueue.pending(), status: canvasQueue.status() })
+          return
+        }
+
+        if (method === 'GET' && pathname === '/gig/extension') {
+          const status = await extension.status()
+          const reported = canvasQueue.state()?.canvas
+          sendJson(res, 200, {
+            ...status,
+            canvas: {
+              online: canvasQueue.online(),
+              lastPollSecondsAgo: canvasQueue.status().lastPollSecondsAgo,
+              ...(reported ?? {}),
+            },
+          })
+          return
+        }
+
+        if (method === 'POST' && pathname === '/gig/extension/install') {
+          const body = await readJsonBody(req)
+          // The panel knows the exact origin it is served from; fall back to the
+          // conventional local address when the request carries none.
+          const hint = typeof body.origin === 'string' && body.origin !== ''
+            ? body.origin
+            : uiQueue.state()?.origin
+          const result = await extension.install(hint)
+          sendJson(res, result.ok ? 200 : 500, result)
+          return
+        }
+
+        if (method === 'POST' && pathname === '/gig/extension/uninstall') {
+          const result = await extension.uninstall()
+          sendJson(res, result.ok || result.reason === 'leftovers' ? 200 : 500, result)
+          return
+        }
+
+        // The panel asking for a workflow to land on the canvas. Only meaningful
+        // with the bridge installed; the reply says which of the two facts is
+        // missing instead of pretending the click worked.
+        if (method === 'POST' && pathname === '/gig/canvas/load') {
+          const body = await readJsonBody(req)
+          const id = typeof body.id === 'string' ? body.id : ''
+          if (id === '') throw new ClientRouteError('id is required')
+          const { meta, graph } = await library.read(id)
+          const bridge = await extension.status()
+          if (!bridge.installed) {
+            sendJson(res, 409, {
+              delivered: false,
+              note: '画布桥接扩展还没安装：先在「画布桥接」里点「安装到 ComfyUI」，然后重启 ComfyUI。',
+            })
+            return
+          }
+          const online = canvasQueue.online()
+          canvasQueue.push('workflow.load', `面板载入工作流 ${meta.name}`, { id, name: meta.name, graph })
+          sendJson(res, 200, {
+            delivered: online,
+            queued: canvasQueue.status().pending,
+            note: online
+              ? `已把「${meta.name}」推到画布。`
+              : `画布还没连上：指令已排队，打开本页的「画布」后会自动载入。`,
+          })
           return
         }
 
