@@ -35,16 +35,50 @@ function assert(cond, label) {
 
 const ELEMENT = Symbol('element')
 let hookCalls = 0
+/**
+ * Effects queued by the render in progress.
+ *
+ * The relay between this panel and the ComfyUI canvas lives ENTIRELY inside
+ * effects (the poll tick and the window message listener), so a no-op useEffect
+ * would leave the most intricate client code in this plugin completely
+ * unexecuted. Collecting them lets a test run them for real.
+ */
+const effectQueue = []
+/** Every postMessage that reached a faked host node's contentWindow. */
+const canvasPosts = []
+/**
+ * Hook state, keyed by "Component@path".
+ *
+ * React re-renders a component when a setter runs; this stand-in cannot, so state
+ * is stored per instance path and a test may render TWICE to observe the effect of
+ * a setter — that is how the wide layout is reached, and the wide layout is the
+ * only one that mounts the ComfyUI iframe outside a collapsed Section. Keying by
+ * path matters: without it every `Section` in a tree would share one state cell.
+ */
+const hookState = new Map()
+const refState = new Map()
+let hookOwner = ''
+let hookIndex = 0
+function resetHooks() {
+  hookState.clear()
+  refState.clear()
+}
 const React = {
   createElement(type, props, ...children) {
     return { [ELEMENT]: true, type, props: props || {}, children }
   },
   useState(initial) {
     hookCalls++
-    return [typeof initial === 'function' ? initial() : initial, () => {}]
+    const key = `${hookOwner}#${hookIndex++}`
+    if (!hookState.has(key)) hookState.set(key, typeof initial === 'function' ? initial() : initial)
+    const set = (next) => {
+      hookState.set(key, typeof next === 'function' ? next(hookState.get(key)) : next)
+    }
+    return [hookState.get(key), set]
   },
-  useEffect() {
+  useEffect(fn, deps) {
     hookCalls++
+    effectQueue.push({ fn, deps })
   },
   useCallback(fn) {
     hookCalls++
@@ -56,8 +90,20 @@ const React = {
   },
   useRef(value) {
     hookCalls++
-    return { current: value }
+    const key = `${hookOwner}#${hookIndex++}`
+    if (!refState.has(key)) refState.set(key, { current: value })
+    return refState.get(key)
   },
+}
+
+/** Run the effects one render queued; returns whatever cleanups they returned. */
+function runQueuedEffects(from) {
+  const cleanups = []
+  for (const entry of effectQueue.slice(from)) {
+    const cleanup = entry.fn()
+    if (typeof cleanup === 'function') cleanups.push(cleanup)
+  }
+  return cleanups
 }
 
 /**
@@ -67,14 +113,41 @@ const React = {
  * (e.g. that an <iframe> really points at the ComfyUI origin) and not just on the
  * text a component happens to emit.
  */
-function resolve(node) {
+function resolve(node, path = '0') {
   if (node === null || node === undefined || typeof node === 'boolean') return null
-  if (Array.isArray(node)) return node.map(resolve)
+  if (Array.isArray(node)) return node.map((child, index) => resolve(child, `${path}.${index}`))
   if (typeof node === 'string' || typeof node === 'number') return node
   if (typeof node !== 'object' || node[ELEMENT] !== true) return null
   const { type, props, children } = node
-  if (typeof type === 'function') return resolve(type(Object.assign({}, props, { children })))
-  return { [ELEMENT]: true, type, props, children: children.map(resolve) }
+  if (typeof type === 'function') {
+    // Give every element INSTANCE its own hook namespace, the way React keys state
+    // by position in the tree rather than by component name.
+    const outerOwner = hookOwner
+    const outerIndex = hookIndex
+    hookOwner = `${type.name || 'anonymous'}@${path}`
+    hookIndex = 0
+    let rendered
+    try {
+      rendered = type(Object.assign({}, props, { children }))
+    } finally {
+      hookOwner = outerOwner
+      hookIndex = outerIndex
+    }
+    return resolve(rendered, path)
+  }
+  // React attaches a host node to its ref after commit; without that the
+  // component would see ref.current === null forever and any code hanging off the
+  // DOM (the canvas iframe handle) could never run here. Each faked node exposes a
+  // contentWindow that records what was posted into it, and a clientWidth so the
+  // width-reading hook has something to measure.
+  const ref = props ? props.ref : undefined
+  if (ref !== null && typeof ref === 'object' && 'current' in ref) {
+    const contentWindow = {
+      postMessage(message, origin) { canvasPosts.push({ message, origin, window: contentWindow }) },
+    }
+    ref.current = { contentWindow, clientWidth: 1000 }
+  }
+  return { [ELEMENT]: true, type, props, children: children.map((child, index) => resolve(child, `${path}.${index}`)) }
 }
 
 function flattenText(node, out) {
@@ -92,6 +165,9 @@ function flattenText(node, out) {
 }
 
 function renderTree(node) {
+  // Every top-level renderTree is conceptually a fresh mount, so hook state from
+  // an earlier render must not leak into it.
+  resetHooks()
   const out = []
   flattenText(resolve(node), out)
   return out.join(' ')
@@ -557,6 +633,151 @@ assert(!floatingText.includes('如何浮窗？'), 'a floating tab does not keep 
 
 // Unknown placement must never narrow: showing less by accident is worse.
 assert(studioText.includes('出图（SD WebUI）'), 'an unknown placement renders the full workbench')
+
+// ── the canvas relay loop, actually executed ──
+//
+// The panel is the only route into the ComfyUI iframe, and both halves of that
+// relay are effects. Everything above only proves the components RENDER; this
+// step runs the effects against a fake fetch and fake timers and checks the
+// channel in both directions, which is the part no other suite can reach.
+
+const relayRequests = []
+const relayPollBodies = []
+const windowListeners = []
+const fakeTimers = []
+const realFetch = globalThis.fetch
+const realSetInterval = globalThis.setInterval
+const realClearInterval = globalThis.clearInterval
+const settle = () => new Promise((resolve) => setTimeout(resolve, 5))
+const jsonOk = (payload) => ({ ok: true, status: 200, json: async () => payload })
+
+globalThis.fetch = async (path, options) => {
+  const body = options && typeof options.body === 'string' ? JSON.parse(options.body) : null
+  relayRequests.push({ path, body })
+  if (path === '/gig/state') {
+    return jsonOk({
+      backends: [{ id: 'comfyui', port: 8188, running: true, models: [] }, { id: 'sdwebui', port: 7860, running: true, models: ['anything-v5.safetensors'] }],
+      categories: ['character', 'item'], defaults: {}, controlTypes: [], presets: [],
+      settings: {}, output: {}, ui: { online: true, pending: 0 },
+    })
+  }
+  if (path === '/gig/workflows') return jsonOk({ workflows: [{ id: 'item-icon', name: '道具图标', nodeCount: 7, classes: ['KSampler'] }] })
+  if (path === '/gig/gallery') return jsonOk({ images: [] })
+  if (path === '/gig/jobs') return jsonOk({ jobs: [] })
+  if (path === '/gig/extension') return jsonOk({ installed: true, files: 2, detail: '已安装', canvas: { online: true, nodeCount: 7 } })
+  if (path === '/gig/ui/poll') {
+    relayPollBodies.push(body)
+    return jsonOk({
+      commands: [],
+      status: { online: true, pending: 0, lastPollSecondsAgo: 0, reportedAt: null },
+      canvasMessages: [{
+        __gig: 'tok', type: 'canvas.load', seq: 'ui_1', label: '代理载入工作流 道具图标',
+        graph: { nodes: [{ id: 1, type: 'KSampler' }], links: [] },
+      }],
+      canvasStatus: { online: true },
+      canvasErrors: [],
+    })
+  }
+  return jsonOk({})
+}
+globalThis.setInterval = (fn) => { fakeTimers.push(fn); return fakeTimers.length }
+globalThis.clearInterval = () => {}
+globalThis.window.location = { origin: 'http://127.0.0.1:43120' }
+globalThis.window.addEventListener = (type, fn) => { if (type === 'message') windowListeners.push(fn) }
+globalThis.window.removeEventListener = () => {}
+// The panel only mounts the canvas iframe in its WIDE layout, and the width comes
+// from a ResizeObserver measurement — so the observer has to exist for the width
+// to be read at all.
+const realResizeObserver = globalThis.ResizeObserver
+globalThis.ResizeObserver = class { observe() {} disconnect() {} }
+
+const studioProps = {
+  ctx: { betterSidebar: mockSidebar([{ id: 'float:2', tab: { id: 'godot-imagegen' }, x: 0, y: 0, w: 900, h: 700 }]) },
+  store: { reduce() {} },
+  tab: { id: 'godot-imagegen', meta: {} },
+  scope: { sessionId: 's1' },
+}
+
+// Pass 1 measures the root element and records the width; pass 2 then takes the
+// wide branch and actually mounts the iframe. Pass 1 also starts a poll tick of
+// its own (with no iframe to relay into), so everything it recorded is discarded
+// before pass 2 — the assertions below describe the mounted workbench only.
+resetHooks()
+canvasPosts.length = 0
+const measureAt = effectQueue.length
+resolve(React.createElement(plugin.ArtStudio, studioProps))
+const measureCleanups = runQueuedEffects(measureAt)
+await settle()
+
+relayRequests.length = 0
+relayPollBodies.length = 0
+windowListeners.length = 0
+const timersBefore = fakeTimers.length
+const effectsBefore = effectQueue.length
+resolve(React.createElement(plugin.ArtStudio, studioProps))
+const relayCleanups = runQueuedEffects(effectsBefore)
+await settle()
+
+assert(relayRequests.some((r) => r.path === '/gig/ui/poll'), 'running the effects really makes the panel poll the host')
+assert(relayPollBodies.length === 1, 'exactly one poll per tick')
+assert(relayPollBodies[0].state.origin === 'http://127.0.0.1:43120',
+  'the poll reports the origin the bridge install must bake in (taken from window.location)')
+assert(canvasPosts.length === 1, 'the queued canvas instruction was posted INTO the iframe')
+assert(canvasPosts[0].origin === 'http://127.0.0.1:8188', 'pinned to the ComfyUI origin — never posted to "*"')
+assert(canvasPosts[0].message.seq === 'ui_1' && canvasPosts[0].message.graph.nodes.length === 1,
+  'and it is the envelope the host stamped, delivered verbatim')
+assert(canvasPosts[0].message.__gig === 'tok', 'with the install token intact — the panel relays it without interpreting it')
+
+// The other direction: what the canvas says is buffered and carried up in the
+// NEXT poll, and only when it came from our own iframe.
+assert(windowListeners.length === 1, 'the panel registered exactly one window message listener')
+windowListeners[0]({ source: { postMessage() {} }, data: { __gig: 'tok', type: 'canvas.state', state: { nodeCount: 1, title: 'spoofed' } } })
+windowListeners[0]({ source: canvasPosts[0].window, data: { __gig: 'tok', type: 'canvas.state', state: { nodeCount: 9, title: 'item-icon' } } })
+windowListeners[0]({ source: canvasPosts[0].window, data: 'not-an-envelope' })
+for (const timer of fakeTimers.slice(timersBefore)) timer()
+await settle()
+
+const lastPoll = relayPollBodies[relayPollBodies.length - 1]
+assert(relayPollBodies.length === 2, 'the interval callbacks tick the poll again')
+assert(Array.isArray(lastPoll.inbound) && lastPoll.inbound.length === 1,
+  'the next poll carries the canvas reply up — one message, from our own iframe')
+assert(lastPoll.inbound[0].state.nodeCount === 9 && lastPoll.inbound[0].state.title === 'item-icon',
+  'and it is the real canvas state, not the one posted by a foreign window')
+assert(!JSON.stringify(lastPoll.inbound).includes('spoofed'), 'a message from another window is dropped, not relayed')
+
+const bridgeCard = renderTree(React.createElement(plugin.BridgeCard, {
+  bridge: { installed: true, files: 2, detail: '已安装到 …', canvas: { online: true, nodeCount: 9, title: 'item-icon', missingClasses: ['SomeCustomNode'] } },
+  busy: false, canPush: true, onInstall() {}, onUninstall() {}, onPush() {}, onRefresh() {},
+}))
+assert(bridgeCard.includes('扩展已安装'), 'BridgeCard reports an installed extension')
+assert(bridgeCard.includes('画布已连接'), 'and a canvas that is answering')
+assert(bridgeCard.includes('9 个节点'), 'with what the canvas reports')
+assert(bridgeCard.includes('item-icon'), 'including the workflow it is editing')
+assert(bridgeCard.includes('SomeCustomNode'), 'and warns about node classes this ComfyUI does not have')
+const bridgeOffline = renderTree(React.createElement(plugin.BridgeCard, {
+  bridge: { installed: true, files: 2, detail: '已安装', stale: true, canvas: { online: false } },
+  busy: false, canPush: false, onInstall() {}, onUninstall() {}, onPush() {}, onRefresh() {},
+}))
+assert(bridgeOffline.includes('重启 ComfyUI'), 'BridgeCard explains the usual reason nothing happens yet')
+assert(bridgeOffline.includes('不一致'), 'and reports a copy on disk that drifted from the source')
+assert(!bridgeOffline.includes('推到画布'), 'while offering no push button with no canvas to push to')
+const bridgeAbsent = renderTree(React.createElement(plugin.BridgeCard, {
+  bridge: { installed: false, files: 0, detail: '未安装（将写入 …）', canvas: { online: false } },
+  busy: false, canPush: false, onInstall() {}, onUninstall() {}, onPush() {}, onRefresh() {},
+}))
+assert(bridgeAbsent.includes('安装到 ComfyUI'), 'BridgeCard offers the install when the bridge is absent')
+assert(bridgeAbsent.includes('对话改不动它'), 'and says plainly what is missing without it')
+
+for (const cleanup of relayCleanups) cleanup()
+for (const cleanup of measureCleanups) cleanup()
+globalThis.fetch = realFetch
+globalThis.setInterval = realSetInterval
+globalThis.clearInterval = realClearInterval
+globalThis.ResizeObserver = realResizeObserver
+delete globalThis.window.location
+delete globalThis.window.addEventListener
+delete globalThis.window.removeEventListener
+resetHooks()
 
 // Helpers.
 assert(plugin.categoryLabel('character') === '角色', 'categoryLabel maps character to 角色')

@@ -21,6 +21,7 @@
  *
  * Run with:  node tests/test-extension.mjs   (from the repo root)
  */
+import { createServer } from 'node:http'
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -252,6 +253,11 @@ async function main() {
   // ── E: re-sync reuses the token and can detect drift ──────────────────────
   const second = await manager.install('http://127.0.0.1:9999')
   assert(second.ok === true, 'a second install (re-sync) succeeds')
+  // Two writes inside the same second must still get their own backup directory —
+  // otherwise the second would overwrite the first one's BEFORE.json.
+  assert(second.backupDir !== install.backupDir, 'each write gets its own backup directory, even in the same second')
+  assert(await exists(join(install.backupDir, 'BEFORE.json')) && await exists(join(second.backupDir, 'BEFORE.json')),
+    'and both audit records survive')
   const manifest2 = await readJson(join(dataRoot, 'installed-files.json'))
   assert(manifest2.token === manifest.token, 'the token is REUSED, so an already-loaded canvas keeps talking to the host')
   assert(manifest2.origin === 'http://127.0.0.1:9999', 'but an explicitly supplied origin replaces the baked one')
@@ -607,6 +613,82 @@ async function main() {
   // The mock tools are reached through the registry only; this asserts the
   // plugin did not register anything under a name that shadows the real surface.
   assert(registered.filter((t) => t.name === 'image_workshop').length === 1, 'exactly one image_workshop tool is registered')
+
+  // ── L: starting ComfyUI re-syncs an installed bridge, and never installs one ──
+  //
+  // The extension is read by ComfyUI at BOOT, so a restart is precisely the moment
+  // an updated copy takes effect — the plugin therefore refreshes an already
+  // installed bridge when a backend is launched. That wiring lives in a hook on
+  // the launcher, which nothing else exercises, so it is driven here through the
+  // real REST route against a stub ComfyUI that answers /system_stats.
+  const syncRoot = join(workRoot, 'ComfyUI-sync')
+  const syncData = join(workRoot, 'data-sync')
+  const SYNC_PORT = 18191
+  let syncStats = 0
+  const stubComfy = createServer((req, res) => {
+    if (req.url === '/system_stats') {
+      syncStats += 1
+      res.writeHead(200, { 'content-type': 'application/json' }).end('{}')
+      return
+    }
+    res.writeHead(404).end()
+  })
+  await new Promise((resolve) => stubComfy.listen(SYNC_PORT, '127.0.0.1', resolve))
+  await mkdir(join(syncRoot, 'ComfyUI', 'custom_nodes'), { recursive: true })
+  const syncWebServer = makeWebServer()
+  const syncCtx = makeCtx({ webServer: syncWebServer })
+  plugin.apply(syncCtx.ctx, {
+    unitName: 'godot_imagegen_sync_test',
+    comfyRoot: syncRoot,
+    dataRoot: syncData,
+    requestTimeoutMs: 3000,
+    startTimeoutMs: 3000,
+    sdwebuiPort: 17863,
+    comfyPort: SYNC_PORT,
+  })
+
+  const startRoute = await callRoute(syncWebServer, 'POST', '/gig/backend/start', { backend: 'comfyui' })
+  assert(startRoute.status === 200 && syncStats > 0, 'starting a backend probes it and reuses the running instance')
+  const syncStatus1 = await callRoute(syncWebServer, 'GET', '/gig/extension')
+  assert(syncStatus1.body.installed === false, 'a launch does NOT install the bridge — the first install stays an explicit action')
+  assert(!(await exists(join(syncRoot, 'ComfyUI', 'custom_nodes', 'godot-imagegen-bridge'))), 'and nothing was written into custom_nodes by it')
+
+  const syncInstall = await callRoute(syncWebServer, 'POST', '/gig/extension/install', { origin: 'http://127.0.0.1:43120' })
+  assert(syncInstall.body.ok === true, 'the bridge is then installed explicitly')
+  const syncManifest = await readJson(join(syncData, 'installed-files.json'))
+  const installedFile = join(syncRoot, 'ComfyUI', 'custom_nodes', 'godot-imagegen-bridge', 'web', 'godot-imagegen-bridge.js')
+  // Simulate the drift every source edit creates: the copy on disk no longer
+  // matches the plugin's source.
+  await writeFile(installedFile, '// drifted\n', 'utf8')
+  const drifted = await callRoute(syncWebServer, 'GET', '/gig/extension')
+  assert(drifted.body.stale === true, 'an out-of-date copy on disk is reported as stale')
+
+  const startAgain = await callRoute(syncWebServer, 'POST', '/gig/backend/start', { backend: 'comfyui' })
+  assert(startAgain.status === 200, 'starting the backend again succeeds')
+  const resynced = await callRoute(syncWebServer, 'GET', '/gig/extension')
+  assert(resynced.body.stale === false, 'and the launch re-synced the installed copy BEFORE the process started, because ComfyUI reads it once at boot')
+  const resyncedJs = await readFile(installedFile, 'utf8')
+  assert(resyncedJs.includes('postMessage') && !resyncedJs.includes('__TOKEN__'), 'the re-synced copy is the real extension with its token substituted')
+  const syncManifest2 = await readJson(join(syncData, 'installed-files.json'))
+  assert(syncManifest2.token === syncManifest.token, 'and the token survived the re-sync, so an open canvas keeps working')
+  assert(syncManifest2.origin === syncManifest.origin, 'as did the origin it calls back to')
+  assert(syncManifest2.backupDir !== syncManifest.backupDir, 'the re-sync made its own timestamped backup')
+
+  // A second start with nothing changed must not touch the ComfyUI install at all:
+  // no write, and no backup directory piling up.
+  const startClean = await callRoute(syncWebServer, 'POST', '/gig/backend/start', { backend: 'comfyui' })
+  assert(startClean.status === 200, 'starting again with a current copy still succeeds')
+  const syncManifest3 = await readJson(join(syncData, 'installed-files.json'))
+  assert(syncManifest3.backupDir === syncManifest2.backupDir, 'and writes nothing — no new backup, no touched files')
+  assert(syncManifest3.installedAt === syncManifest2.installedAt, 'the install record is untouched')
+
+  // A launch must also survive a bridge that is NOT installed while the target is
+  // missing entirely — the hook is best effort and must never fail the launch.
+  await rm(syncData, { recursive: true, force: true })
+  await rm(join(syncRoot, 'ComfyUI', 'custom_nodes', 'godot-imagegen-bridge'), { recursive: true, force: true })
+  const startAfterRemoval = await callRoute(syncWebServer, 'POST', '/gig/backend/start', { backend: 'comfyui' })
+  assert(startAfterRemoval.status === 200, 'a launch with no install record still succeeds')
+  await new Promise((resolve) => stubComfy.close(resolve))
 
   await rm(workRoot, { recursive: true, force: true })
 

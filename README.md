@@ -110,6 +110,11 @@
 
 清单在 `<dataRoot>/installed-files.json`：令牌、origin、目标目录、每一个文件、每一个"我创建的目录"。
 
+**同步时机是有讲究的**：ComfyUI 只在**启动时**读一次 `WEB_DIRECTORY`，所以
+「启动后端」会**先**把已安装的桥接刷新到当前源码，**再**拉起进程——反过来做，这次启动加载的
+仍然是旧副本，只能等下一次重启。而且**只有内容真的不一致时才写**：否则每次启动都会去动你的
+ComfyUI 安装目录、还多留一份备份，毫无意义。
+
 还有一个实测发现的坑：ComfyUI 启动时 `import` 这个包，Python 会在包里写下
 `__pycache__/__init__.cpython-3xx.pyc`。**它也算残留**，所以卸载会一并删掉——但只删文件名词干
 与"本次安装过的文件"对得上的 `.pyc`，别人放进去的 `.pyc` 会保留并如实报告。
@@ -323,18 +328,18 @@ image_workflow  action="patch" id="item-icon" edits=[…] to_canvas=true   # 改
   并且双向都要过 origin + 每次安装的令牌。宿主这一侧没有任何跨域路由可以被打（`/gig` 全部同源）。
 - 工作流库、节点布局缓存、备份目录都在 `$DSH_HOME/godot-imagegen/` 下，不在你的 ComfyUI 安装里。
 - **不自动安装**：桥接扩展的首次安装必须是显式动作（面板按钮或 `install-bridge`）；
-  只有"已经装过"时，后端启动才会顺手重新同步一次（因为重启正是新副本生效的时刻）。
+  只有"已经装过"时，「启动后端」才会在拉起进程**之前**重新同步一次，且**只在内容不一致时**才写。
 
 ## 10. 验证
 
 ```powershell
 cd D:\deepseek\my-imagegen            # 本仓库根目录
-npm test                              # = 下面五条离线套件（803 条断言）
+npm test                              # = 下面五条离线套件（842 条断言）
 node tests/test-workflow.mjs          # 62 条断言（工作流层，含真实 ComfyUI 导出文件）
 node tests/test-workflow-library.mjs  # 252 条断言（工作流库、6 套模板、布局缓存）
 node tests/test-imagegen.mjs          # 187 条断言（10 个工具 + REST + 真实 Python 后处理）
-node tests/test-extension.mjs         # 144 条断言（桥接：备份/清单/卸载/令牌/中继/零残留/真跑扩展）
-node tests/test-render-imagegen.mjs   # 158 条断言（客户端面板渲染，含三态窗口判定、浮窗几何补丁与画布中继）
+node tests/test-extension.mjs         # 161 条断言（桥接：备份/清单/卸载/令牌/中继/零残留/真跑扩展/启动同步）
+node tests/test-render-imagegen.mjs   # 180 条断言（客户端面板渲染，含三态窗口、浮窗几何补丁，并真的跑一遍画布中继）
 node tests/test-imagegen-live.mjs          # 29 条断言：真实 SD WebUI 端到端（后端没起时自动跳过）
 node tests/test-imagegen-live-comfy.mjs    # 23 条断言：真实 ComfyUI 端到端，含真跑内置模板（没起时跳过）
 node tests/test-extension-live.mjs         # 17 条断言：真实 ComfyUI 安装→卸载→零残留
@@ -344,7 +349,7 @@ node --check lib/client.js
 node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"   # 技能 frontmatter / 行尾校验
 ```
 
-后端都起着时总计 **880 条断言**（803 离线 + 29 SD WebUI + 23 ComfyUI + 25 桥接实时）。
+后端都起着时总计 **919 条断言**（842 离线 + 29 SD WebUI + 23 ComfyUI + 25 桥接实时）。
 
 - **离线套件**用两个真实 HTTP 服务冒充 A1111 与 ComfyUI（覆盖 `/sdapi/v1/*`、`/controlnet/model_list`、
   `/tagger/v1/*`、`/prompt`、`/history`、`/view`），并用**真实的秋叶 Python** 跑抠图与放大，
@@ -358,6 +363,9 @@ node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"  
   并回一个带 seq 的结果，画布拒绝载入时必须回 `ok:false` 与原因。
 - **客户端套件**用最小 React 替身递归执行每个组件函数（本机磁盘上没有 react/react-dom，
   DSH 的客户端运行时在 app.asar 内），因此未定义标识符、错误的解构、坏的 createElement 调用都会暴露。
+  它还会**真的跑一遍 effect**：装一个假 `fetch` 与假定时器，让面板的空转轮询与窗口消息监听真正执行，
+  于是中继的两个方向都被验证——宿主排队的信封确实以 `postMessage` 投进 iframe（且 targetOrigin
+  是 ComfyUI 的源、绝不是 `*`），而画布的回包会搭下一次轮询送回宿主，冒充窗口发来的消息被丢弃。
 - **实时套件**驱动真正安装的 SD WebUI / ComfyUI：真实出图、真实 rembg 抠图、真实 R-ESRGAN 放大、
   真实 ControlNet 引导，并断言产物真的落在 Godot 项目的 `assets/generated/<品类>/` 且带 `res://` 路径；
   桥接的实时套件则真的写进 `D:\AKI open\ComfyUI-aki-v2`，再真的卸干净并全树扫描确认无残片。

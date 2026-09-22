@@ -1022,12 +1022,14 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
   call(cmd: string, args: string[]): Promise<Record<string, unknown>>
 }, hooks?: {
   /**
-   * Fired after a backend launch attempt resolves. The extension manager uses it
-   * to re-sync an ALREADY installed bridge (it never installs on its own): a
-   * restart of ComfyUI is exactly the moment a new copy takes effect, so the
-   * files on disk must be current by then.
+   * Fired BEFORE a backend launch attempt, and awaited.
+   *
+   * The extension manager uses it to re-sync an ALREADY installed bridge (it
+   * never installs on its own). Order matters: ComfyUI reads `WEB_DIRECTORY` once,
+   * at startup, so a sync that ran after the launch would only take effect on the
+   * NEXT restart — the copy has to be current before the process starts.
    */
-  onLaunched?: (id: ResolvedBackend) => void | Promise<void>
+  onBeforeLaunch?: (id: ResolvedBackend) => void | Promise<void>
 }) {
   const spawnProcess = makeSpawner(subprocess)
   const processes: Partial<Record<ResolvedBackend, RunningProcess>> = {}
@@ -1204,12 +1206,14 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
 
   /** Launch a backend through its bundled Python; resolves once it answers. */
   async function launch(id: ResolvedBackend): Promise<{ ok: boolean; detail: string; pid?: number }> {
+    // Sync first, spawn second: ComfyUI reads its web-extension directory once, at
+    // startup, so refreshing the copy afterwards would only help the NEXT restart.
     try {
-      return await launchInner(id)
-    } finally {
-      // A failed sync must never turn a successful launch into a failure.
-      void Promise.resolve(hooks?.onLaunched?.(id)).catch(() => undefined)
+      await hooks?.onBeforeLaunch?.(id)
+    } catch {
+      // A failed sync must never turn a launch into a failure.
     }
+    return launchInner(id)
   }
 
   async function launchInner(id: ResolvedBackend): Promise<{ ok: boolean; detail: string; pid?: number }> {
@@ -4231,7 +4235,13 @@ export function createExtensionManager(cfg: ImagegenConfig, sourceOverride?: str
    */
   async function backupTarget(): Promise<string> {
     const stamp = timestampLabel()
-    const dir = `${backupsRoot}/${stamp}/comfyui`
+    let dir = `${backupsRoot}/${stamp}/comfyui`
+    // Two writes can land inside the same second. They must NOT share a directory:
+    // the second would overwrite the first one's BEFORE.json and lose that record
+    // of what was there before it.
+    for (let attempt = 2; attempt < 1000 && fileExists(dir); attempt += 1) {
+      dir = `${backupsRoot}/${stamp}-${attempt}/comfyui`
+    }
     await mkdir(dir, { recursive: true })
     const before = await listExisting()
     for (const rel of before) {
@@ -4494,6 +4504,14 @@ export function createExtensionManager(cfg: ImagegenConfig, sourceOverride?: str
     async syncIfInstalled(originHint) {
       const manifest = await readManifest()
       if (manifest === undefined) return { synced: false, detail: '未安装，跳过同步（安装是显式操作）' }
+      // Only write when something ACTUALLY changed. A blind re-install here would
+      // touch the user's ComfyUI install — and take a backup — on every single
+      // backend start, for no reason at all.
+      const current = await this.status()
+      const originChanged = originHint !== undefined && originHint !== '' && originHint !== manifest.origin
+      if (!current.stale && !originChanged) {
+        return { synced: false, detail: `已安装且与当前源码一致（${current.files} 个文件），无需同步` }
+      }
       const result = await this.install(originHint)
       return { synced: result.ok, detail: result.detail }
     },
@@ -5915,9 +5933,7 @@ export function apply(ctx: Context, config: unknown): void {
   const post = createPostBridge(cfg, subprocess)
   const extension = createExtensionManager(cfg, cfg.extensionSource)
   const backends = createBackends(cfg, subprocess, post, {
-    // ComfyUI reads WEB_DIRECTORY at boot, so a restart is the moment an updated
-    // bridge takes effect; refresh an ALREADY installed copy right before it.
-    onLaunched: async (id) => {
+    onBeforeLaunch: async (id) => {
       // Best effort: the result is observable through GET /gig/extension, which
       // is where the panel and the agent read the bridge state from.
       if (id !== 'comfyui') return
