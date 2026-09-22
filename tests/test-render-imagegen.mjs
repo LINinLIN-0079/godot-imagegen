@@ -517,7 +517,8 @@ try {
   assert(false, `EntryView renders without throwing — ${error.message}`)
 }
 assert(entryText.includes('打开工作台'), 'EntryView offers the way into the workbench')
-assert(entryText.includes('拖到主会话区'), 'EntryView explains the float gesture')
+assert(entryText.includes('移动到自由窗口'), 'EntryView names the float path that works on this DSH build (the tab context menu)')
+assert(entryText.includes('右键'), 'and says it is the right-click menu, not only a gesture')
 assert(entryText.includes('ComfyUI') && entryText.includes('SD WebUI'), 'EntryView shows both backends')
 assert(entryText.includes('快速运行工作流'), 'EntryView offers a quick workflow run')
 
@@ -609,7 +610,7 @@ try {
   assert(false, `ArtStudio (docked) renders without throwing — ${error.message}`)
 }
 assert(dockedText.includes('打开工作台'), 'a docked tab shows the entry view')
-assert(dockedText.includes('拖到主会话区'), 'and explains the float gesture')
+assert(dockedText.includes('移动到自由窗口'), 'and explains how to float it, using the path that works on this DSH build')
 assert(!dockedText.includes('出图（SD WebUI）'), 'a docked tab does NOT push the whole workbench into the narrow sidebar')
 
 let floatingText = ''

@@ -20,7 +20,7 @@
 | 工作流库 | 插件本地（`$DSH_HOME/godot-imagegen/workflows/`，**从不写入你的 ComfyUI**）：6 套游戏美术模板 + 任意新建/改写；元数据写在文档自身的 `extra` 里 |
 | 画布桥接 | 随插件分发的 ComfyUI web 扩展（源码在仓库 `comfyui-extension/`），安装时把 **DSH origin + 一次性令牌** 烤进副本；装/卸都是一键，写入前必先备份 |
 | 对话驱动 | 代理可通过 `image_workflow` / `image_workshop` 改写工作流、把工作流直接推到 ComfyUI 画布、把提示词与参数填进面板、在面板里定位图片——你只需在对话里说 |
-| 浏览器面板 | better-sidebar tab「美术工坊」（order 63）。**三态**：侧边栏**入口态**（状态 + 启动后端 + 工作流速跑）、**浮窗态**（拖 tab 到主会话区，宽 ≥700px 时三分栏：图库 / ComfyUI 画布 / 参数）、**全屏态**（面板自绘「⛶ 全屏」/「⤡ 回浮窗」，只改浮窗几何）。含提示词预设、任务进度（含后端实时预览图）、图库灯箱（放大/抠图/反推/发送到对话/注册资产/删除） |
+| 浏览器面板 | better-sidebar tab「美术工坊」（order 63）。**三态**：侧边栏**入口态**（状态 + 启动后端 + 工作流速跑）、**浮窗态**（右键 tab →「移动到自由窗口」，宽 ≥700px 时三分栏：图库 / ComfyUI 画布 / 参数）、**全屏态**（面板自绘「⛶ 全屏」/「⤡ 回浮窗」，只改浮窗几何）。含提示词预设、任务进度（含后端实时预览图）、图库灯箱（放大/抠图/反推/发送到对话/注册资产/删除） |
 | DSH 技能 | `D:\游戏开发skill\game-art` —— 游戏美术提示词手册、分品类尺寸与透明规范、端到端工作流、21 条样例提示词、色键抠图脚本 |
 | 持久化 | 独立 KV 单元 `godot_imagegen`（图库记录 + 用户预设 + 设置） |
 
@@ -33,12 +33,18 @@
 | 形态 | 什么时候 | 里面有什么 |
 | --- | --- | --- |
 | **入口态** | tab 停在侧边栏（默认） | 两个后端的状态与启动、工作流速跑、一个「在此展开完整工作台」 |
-| **浮窗态** | **你把 tab 拖到主会话区**（拖一次，按会话记住） | 宽 ≥700px 时三分栏：图库 / ComfyUI 画布 / 参数；窄时上下堆叠 |
+| **浮窗态** | **右键点 tab →「移动到自由窗口」**（英文界面 Move to Free Window） | 宽 ≥700px 时三分栏：图库 / ComfyUI 画布 / 参数；窄时上下堆叠 |
 | **全屏态** | 浮窗态下点「⛶ 全屏」 | 同一套工作台，浮窗几何铺满视口；点「⤡ 回浮窗」还原 |
 
-浮窗**必须由你拖一次**：自动浮窗要把 tab 从面板树里摘出来，那会与 `dsh-better-sidebar` 的内部状态结构
-耦合，它一升级就可能坏掉。一旦浮起来，几何就是安全的（`store.reduce` 只改那一条 float 的 x/y/w/h，
-不动任何面板结构），所以全屏/还原完全可靠。
+浮窗**必须由你手动触发一次**（右键菜单）。**不要依赖「把 tab 拖到主会话区」那个手势**：
+`dsh-better-sidebar` 0.18.0 去找的锚点是旧版槽位名（`#root [data-slot="conversation"]`），
+而当前 DSH 渲染的是新版的 `main.conversation`，所以它算不出落点、整个手势不触发——
+这与本插件无关，也不是拖拽动作本身坏了。上游 0.19.1 把选择器改成两者都认，但 0.19 **同时删掉了浮窗功能**
+（右列改由 DSH 原生侧边栏接管），所以"升级"并不能拿回这个手势。
+
+右键菜单那条路径不经过锚点（中心列找不到时回落到窗口中心），因此在 0.18.0 上照常可用。
+一旦浮起来，几何就是安全的（`store.reduce` 只改那一条 float 的 x/y/w/h，不动任何面板结构），
+所以全屏/还原完全可靠。
 
 面板里还能：选工作流 → 在画布上编辑或直接「运行工作流」→ 产物照常落进 Godot 项目并进图库。
 「发送到对话」把当前提示词与参数（或选中的图）送回输入框。
@@ -334,12 +340,12 @@ image_workflow  action="patch" id="item-icon" edits=[…] to_canvas=true   # 改
 
 ```powershell
 cd D:\deepseek\my-imagegen            # 本仓库根目录
-npm test                              # = 下面五条离线套件（844 条断言）
-node tests/test-workflow.mjs          # 62 条断言（工作流层，含真实 ComfyUI 导出文件）
-node tests/test-workflow-library.mjs  # 252 条断言（工作流库、6 套模板、布局缓存）
-node tests/test-imagegen.mjs          # 187 条断言（10 个工具 + REST + 真实 Python 后处理）
-node tests/test-extension.mjs         # 161 条断言（桥接：备份/清单/卸载/令牌/中继/零残留/真跑扩展/启动同步）
-node tests/test-render-imagegen.mjs   # 182 条断言（客户端面板渲染，含三态窗口、浮窗几何补丁，并真的跑一遍画布中继）
+npm test                              # = 下面五条"离线"套件（845 条；ComfyUI 开着则 867 条，见下）
+node tests/test-workflow.mjs          # 62 条（ComfyUI 开着 65 条）：工作流层，含 10 个真实 ComfyUI 导出文件
+node tests/test-workflow-library.mjs  # 252 条（ComfyUI 开着 271 条）：工作流库、6 套模板、布局缓存
+node tests/test-imagegen.mjs          # 187 条（10 个工具 + REST + 真实 Python 后处理）
+node tests/test-extension.mjs         # 161 条（桥接：备份/清单/卸载/令牌/中继/零残留/真跑扩展/启动同步）
+node tests/test-render-imagegen.mjs   # 183 条（客户端面板渲染，含三态窗口、浮窗几何补丁，并真的跑一遍画布中继）
 node tests/test-imagegen-live.mjs          # 29 条断言：真实 SD WebUI 端到端（后端没起时自动跳过）
 node tests/test-imagegen-live-comfy.mjs    # 23 条断言：真实 ComfyUI 端到端，含真跑内置模板（没起时跳过）
 node tests/test-extension-live.mjs         # 17 条断言：真实 ComfyUI 安装→卸载→零残留
@@ -349,7 +355,12 @@ node --check lib/client.js
 node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"   # 技能 frontmatter / 行尾校验
 ```
 
-后端都起着时总计 **921 条断言**（844 离线 + 29 SD WebUI + 23 ComfyUI + 25 桥接实时）。
+**断言条数会随 ComfyUI 是否在跑而变化**（这是设计，不是漏测）：`test-workflow.mjs` 与
+`test-workflow-library.mjs` 在后端应答时会**顺手拿真实的 1212 类 `/object_info`** 再验一遍
+「真实工作流的 UI→API 转换」和「模板能否在本机跑」，各多出 3 条与 19 条；后端没起时它会打印
+一行 `NOTE ... skipped`，而不是假装通过。所以离线总数是 **845（后端关）→ 867（ComfyUI 开）**。
+
+后端都起着时总计 **944 条断言**（867 离线 + 29 SD WebUI + 23 ComfyUI + 25 桥接实时）。
 
 - **离线套件**用两个真实 HTTP 服务冒充 A1111 与 ComfyUI（覆盖 `/sdapi/v1/*`、`/controlnet/model_list`、
   `/tagger/v1/*`、`/prompt`、`/history`、`/view`），并用**真实的秋叶 Python** 跑抠图与放大，
@@ -381,8 +392,38 @@ node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"  
 | 从 DSH 页 `fetch(':8188/...')`（带 `Origin: DSH`） | **403**（`origin_only_middleware`） | 面板**不能**直接跟 ComfyUI 说话——所以工作流层必须走宿主 |
 | 画布内部同源 API 调用 | 200 | 画布自身功能正常 |
 
+### 想把「拖到主会话区」也修回来的话（可选，当前**未**应用）
+
+按你的选择，这个补丁**没有**打进已安装的第三方包。如果以后想要回那个手势，改动就是一处字符串，
+与上游 0.19.1 的修法完全一致 —— 把查找中心列的 JS 字符串从「只认旧槽位名」改成「两个都认」：
+
+```
+"#root [data-slot=\"conversation\"]"
+  →
+"#root [data-slot=\"main.conversation\"], #root [data-slot=\"conversation\"]"
+```
+
+只改 **JS 里的 `querySelector(...)` 调用点与 `CENTER_COLUMN_SELECTOR` 常量**，不要动 CSS 字符串里的
+`[data-slot="conversation"]`（那处在 `:has(...)` / 复合选择器里，加逗号会改变整条选择器的含义）。
+涉及的文件（desktop 各 2 处 JS，web 各 1 处 JS）：
+
+```
+~/.dsh/profiles/desktop/node_modules/dsh-better-sidebar/lib/client.js
+~/.dsh/profiles/desktop/node_modules/dsh-better-sidebar/lib/client-registry.js
+~/.dsh/profiles/web/node_modules/dsh-better-sidebar/lib/client.js          # 0.16.1，同一缺陷
+~/.dsh/profiles/web/node_modules/dsh-better-sidebar/lib/client-registry.js
+```
+
+改前先备份该文件；**重装或升级 `dsh-better-sidebar` 会把它还原**（`profiles/*/package.json` 里
+desktop 钉的是 `0.18.0`、web 钉的是 `0.16.1`）。注意升级到 0.19.x 不是替代方案：那版把浮窗功能整个删掉了。
+
 ## 11. 已知限制
 
+- **浮窗要用右键菜单，不能用「拖到主会话区」**：`dsh-better-sidebar` 0.18.0 的中心列锚点是旧版槽位名
+  （`#root [data-slot="conversation"]`），当前 DSH 渲染的是 `main.conversation`，所以它算不出落点、
+  拖拽手势不触发。上游 0.19.1 修了选择器，但同版本**删掉了浮窗功能**（右列交给 DSH 原生侧边栏），
+  因此升级换不回这个手势。右键 tab →「移动到自由窗口」不受影响，这是推荐路径。
+  详见第 2 节。
 - **后端调用不使用全局 `fetch`**：undici 有 300s 的 `headersTimeout`/`bodyTimeout` 且无法在无 undici 包时调高，
   真实 SDXL 出图（7GB 换模型 + 采样）会超过它并抛 `UND_ERR_HEADERS_TIMEOUT`。插件改用 `node:http`，
   超时只受自身的 `requestTimeoutMs` 控制。
