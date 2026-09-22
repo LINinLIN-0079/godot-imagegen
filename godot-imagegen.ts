@@ -2769,6 +2769,488 @@ function createOps(deps: OpsDeps) {
   }
 }
 
+// ─────────────────────────── ComfyUI workflow layer ───────────────────────────
+//
+// Everything needed to treat a user's ComfyUI workflow as a first-class,
+// agent-editable object. The hard part is NOT parsing JSON — it is addressing a
+// widget BY NAME. A UI-format node serialises its widgets into a positional
+// `widgets_values` array, so writing "the positive prompt" means knowing that
+// CLIPTextEncode's `text` happens to sit at index 0 — a fact that changes with
+// every node class and with ComfyUI's own `control_after_generate` extra slot.
+// We therefore derive the layout from the live `/object_info` schema instead of
+// guessing, and fail with an actionable message when a name does not exist.
+
+/** One node of a ComfyUI *UI-format* workflow (the JSON the frontend saves). */
+export interface UiWorkflowNode {
+  id: number
+  type: string
+  pos?: unknown
+  size?: unknown
+  flags?: Record<string, unknown>
+  order?: number
+  /** 0 = active, 2 = muted, 4 = bypassed. */
+  mode?: number
+  inputs?: Array<{ name: string; type?: string; link?: number | null; widget?: { name?: string } }>
+  outputs?: Array<{ name: string; type?: string; links?: Array<number | null> | null; slot_index?: number }>
+  /** Positional in array form, name-keyed in newer frontends. */
+  widgets_values?: unknown[] | Record<string, unknown>
+  title?: string
+  properties?: Record<string, unknown>
+}
+
+/** A ComfyUI *UI-format* workflow document. */
+export interface UiWorkflow {
+  last_node_id?: number
+  last_link_id?: number
+  nodes: UiWorkflowNode[]
+  /** Array of `[id, originId, originSlot, targetId, targetSlot, type]`, or an object map. */
+  links?: unknown[] | Record<string, unknown>
+  groups?: unknown[]
+  config?: Record<string, unknown>
+  extra?: Record<string, unknown>
+  version?: number
+}
+
+/** One editable widget of a node class, in serialisation order. */
+export interface WidgetSpec {
+  name: string
+  /** How many `widgets_values` slots this widget consumes (2 for seed-like controls). */
+  slots: number
+  /** Allowed values for a COMBO widget. */
+  options?: string[]
+  default?: unknown
+}
+
+/** A patch addressed at nodes by class + optional title/index, not by node id. */
+export interface WorkflowEdit {
+  /** Node class to match (`CLIPTextEncode`, `KSampler`, …). */
+  classType: string
+  /** Optional case-insensitive substring of the node's title. */
+  title?: string
+  /** Optional 0-based pick when several nodes match. */
+  index?: number
+  /** Widget values to set, keyed by widget name. */
+  set?: Record<string, unknown>
+  /** Also set the node's display title. */
+  setTitle?: string
+  /** Also set the node's mode (0 active / 2 muted / 4 bypassed). */
+  setMode?: number
+}
+
+/** ComfyUI's primitive widget types; every other type string is a link input. */
+const WIDGET_TYPES = new Set(['INT', 'FLOAT', 'STRING', 'BOOLEAN', 'COMBO'])
+
+/** Whether one `/object_info` input declaration renders as an editable widget. */
+function isWidgetInput(def: unknown): boolean {
+  const type = Array.isArray(def) ? def[0] : def
+  if (Array.isArray(type)) return true
+  if (typeof type === 'string') return WIDGET_TYPES.has(type)
+  if (type !== null && typeof type === 'object') return (type as Record<string, unknown>).forceInput !== true
+  return false
+}
+
+/**
+ * The ordered widget layout of a node class, derived from `/object_info`.
+ *
+ * ComfyUI serialises widgets in `required` then `optional` declaration order,
+ * and a widget flagged `control_after_generate` (every `seed`) consumes a SECOND
+ * slot holding its post-generation mode — the classic off-by-one that silently
+ * corrupts naive writers.
+ */
+export function widgetLayout(objectInfo: Record<string, unknown> | undefined, classType: string): WidgetSpec[] {
+  const info = objectInfo?.[classType] as
+    | { input?: { required?: Record<string, unknown>; optional?: Record<string, unknown> } }
+    | undefined
+  const out: WidgetSpec[] = []
+  for (const group of ['required', 'optional'] as const) {
+    const spec = info?.input?.[group]
+    if (spec === undefined || spec === null || typeof spec !== 'object') continue
+    for (const [name, def] of Object.entries(spec)) {
+      if (!isWidgetInput(def)) continue
+      const type = Array.isArray(def) ? def[0] : def
+      const optsRaw = Array.isArray(def) && def.length > 1 ? def[1] : type
+      const opts = optsRaw !== null && typeof optsRaw === 'object' ? (optsRaw as Record<string, unknown>) : undefined
+      const spec2: WidgetSpec = { name, slots: opts?.control_after_generate === true ? 2 : 1 }
+      if (Array.isArray(type)) spec2.options = type.map((v) => String(v))
+      if (opts !== undefined && opts.default !== undefined) spec2.default = opts.default
+      out.push(spec2)
+    }
+  }
+  return out
+}
+
+/** Read a node's widgets as a name→value map, honouring both serialisation forms. */
+export function readWidgets(node: UiWorkflowNode, layout: WidgetSpec[]): Record<string, unknown> {
+  const raw = node.widgets_values
+  if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+    return { ...(raw as Record<string, unknown>) }
+  }
+  if (!Array.isArray(raw)) return {}
+  if (layout.length === 0) {
+    // Without a schema, the frontend's per-input `widget.name` is the only hint.
+    const named = (node.inputs ?? []).filter((i) => typeof i.widget?.name === 'string')
+    if (named.length > 0) {
+      const out: Record<string, unknown> = {}
+      named.forEach((input, i) => { out[String(input.widget?.name)] = raw[i] })
+      return out
+    }
+    return {}
+  }
+  const out: Record<string, unknown> = {}
+  let index = 0
+  for (const spec of layout) {
+    if (index >= raw.length) break
+    out[spec.name] = raw[index]
+    index += spec.slots
+  }
+  return out
+}
+
+/**
+ * Write widget values by name, growing the array when a widget was never
+ * serialised.
+ *
+ * `hasSchema` distinguishes "this node class genuinely has no editable widgets"
+ * from "we never read /object_info, so we cannot know its widgets" — the two
+ * need very different fixes, and conflating them sends the caller hunting for a
+ * bug in their node when they only needed to start the backend.
+ */
+function writeWidgets(
+  node: UiWorkflowNode,
+  layout: WidgetSpec[],
+  patch: Record<string, unknown>,
+  label: string,
+  hasSchema: boolean,
+): string[] {
+  const known = new Set(layout.map((s) => s.name))
+  const unknown = Object.keys(patch).filter((key) => !known.has(key))
+  if (unknown.length > 0) {
+    if (!hasSchema) {
+      throw new Error(
+        `无法按名字修改 ${label}（${node.type}）：还没有读取过节点定义（/object_info），不知道它有哪些参数。`
+        + '请先启动 ComfyUI（image_backend_status action="start"）或让插件成功探测到后端一次。',
+      )
+    }
+    const available = layout.map((s) => s.name).join(', ')
+    throw new Error(
+      `节点 ${label}（${node.type}）没有这些参数：${unknown.join(', ')}。`
+      + `可用参数：${available === '' ? '（该节点没有可编辑参数）' : available}`,
+    )
+  }
+  const raw = node.widgets_values
+  if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+    const target = raw as Record<string, unknown>
+    for (const [key, value] of Object.entries(patch)) target[key] = value
+    return Object.keys(patch)
+  }
+  const arr = Array.isArray(raw) ? raw.slice() : []
+  let index = 0
+  for (const spec of layout) {
+    if (Object.prototype.hasOwnProperty.call(patch, spec.name)) {
+      while (arr.length < index + 1) arr.push(null)
+      arr[index] = patch[spec.name]
+    }
+    index += spec.slots
+  }
+  node.widgets_values = arr
+  return Object.keys(patch)
+}
+
+/** Validate an untrusted document as a UI-format workflow, with actionable errors. */
+export function normalizeUiWorkflow(raw: unknown): UiWorkflow {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('工作流必须是一个 JSON 对象（ComfyUI UI 格式：{ nodes: [...], links: [...] }）')
+  }
+  const graph = raw as Record<string, unknown>
+  if (!Array.isArray(graph.nodes)) {
+    const looksApi = Object.values(graph).every(
+      (v) => v !== null && typeof v === 'object' && typeof (v as Record<string, unknown>).class_type === 'string',
+    ) && Object.keys(graph).length > 0
+    throw new Error(
+      looksApi
+        ? '这是一份 ComfyUI **API 格式**工作流（{ "1": { class_type, inputs } }），画布用的是 UI 格式。请先用 image_workflow 的 action="to-ui" 转换。'
+        : '工作流缺少 nodes 数组 —— 这不是 ComfyUI 的 UI 格式工作流。',
+    )
+  }
+  const nodes = (graph.nodes as unknown[]).map((entry, i) => {
+    if (entry === null || typeof entry !== 'object') throw new Error(`nodes[${i}] 不是对象`)
+    const node = entry as Record<string, unknown>
+    if (typeof node.type !== 'string' || node.type === '') throw new Error(`nodes[${i}] 缺少 type（节点类名）`)
+    const id = Number(node.id)
+    if (!Number.isFinite(id)) throw new Error(`nodes[${i}] 缺少可解析为数字的 id`)
+    return entry as UiWorkflowNode
+  })
+  return { ...(graph as unknown as UiWorkflow), nodes }
+}
+
+/** A resolved link between two nodes. */
+export interface LinkRef {
+  id: number
+  originId: number
+  originSlot: number
+  targetId: number
+  targetSlot: number
+  type?: string
+}
+
+/** Index a workflow's links, accepting both the array and object serialisations. */
+export function linkTable(graph: UiWorkflow): Map<number, LinkRef> {
+  const table = new Map<number, LinkRef>()
+  const add = (value: unknown): void => {
+    if (Array.isArray(value) && value.length >= 5) {
+      const id = Number(value[0])
+      if (!Number.isFinite(id)) return
+      table.set(id, {
+        id,
+        originId: Number(value[1]),
+        originSlot: Number(value[2]),
+        targetId: Number(value[3]),
+        targetSlot: Number(value[4]),
+        ...(value[5] === undefined ? {} : { type: String(value[5]) }),
+      })
+      return
+    }
+    if (value !== null && typeof value === 'object') {
+      const o = value as Record<string, unknown>
+      const id = Number(o.id)
+      if (!Number.isFinite(id)) return
+      table.set(id, {
+        id,
+        originId: Number(o.origin_id),
+        originSlot: Number(o.origin_slot),
+        targetId: Number(o.target_id),
+        targetSlot: Number(o.target_slot),
+        ...(o.type === undefined ? {} : { type: String(o.type) }),
+      })
+    }
+  }
+  const links = graph.links
+  if (Array.isArray(links)) for (const link of links) add(link)
+  else if (links !== null && typeof links === 'object') for (const link of Object.values(links)) add(link)
+  return table
+}
+
+/** Find nodes by class, optional title substring and optional ordinal. */
+export function findNodes(graph: UiWorkflow, match: { classType: string; title?: string; index?: number }): UiWorkflowNode[] {
+  const byClass = graph.nodes.filter((node) => node.type === match.classType)
+  const byTitle = match.title === undefined
+    ? byClass
+    : byClass.filter((node) => String(node.title ?? '').toLowerCase().includes(String(match.title).toLowerCase()))
+  if (match.index !== undefined) {
+    const picked = byTitle[match.index]
+    return picked === undefined ? [] : [picked]
+  }
+  return byTitle
+}
+
+/** Describe one node for a human/agent reading the canvas. */
+function describeNode(node: UiWorkflowNode, layout: WidgetSpec[], textLimit: number): Record<string, unknown> {
+  const widgets = readWidgets(node, layout)
+  const trimmed: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(widgets)) {
+    trimmed[key] = typeof value === 'string' && value.length > textLimit
+      ? `${value.slice(0, textLimit)}…(${value.length} 字符)`
+      : value
+  }
+  return {
+    id: node.id,
+    type: node.type,
+    ...(node.title === undefined ? {} : { title: node.title }),
+    mode: node.mode ?? 0,
+    widgets: trimmed,
+  }
+}
+
+/**
+ * Read a workflow as something an agent can reason about: the class histogram
+ * plus every node's editable widgets (long strings elided).
+ */
+export function summarizeWorkflow(
+  graph: UiWorkflow,
+  objectInfo?: Record<string, unknown>,
+  textLimit = 160,
+): Record<string, unknown> {
+  const classCounts: Record<string, number> = {}
+  for (const node of graph.nodes) classCounts[node.type] = (classCounts[node.type] ?? 0) + 1
+  return {
+    nodeCount: graph.nodes.length,
+    linkCount: linkTable(graph).size,
+    classCounts,
+    nodes: graph.nodes.map((node) => describeNode(node, widgetLayout(objectInfo, node.type), textLimit)),
+  }
+}
+
+/**
+ * Convert a UI-format workflow into the API graph ComfyUI's `/prompt` accepts.
+ * Muted (2) and bypassed (4) nodes are dropped so a headless run behaves the
+ * way the canvas looks.
+ */
+export function uiToApi(graph: UiWorkflow, objectInfo?: Record<string, unknown>): Record<string, unknown> {
+  const links = linkTable(graph)
+  const consumed = new Set<number>()
+  const api: Record<string, unknown> = {}
+  for (const node of graph.nodes) {
+    if (node.mode === 2 || node.mode === 4) continue
+    const inputs: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(readWidgets(node, widgetLayout(objectInfo, node.type)))) {
+      inputs[key] = value
+    }
+    for (const input of node.inputs ?? []) {
+      if (input.link === null || input.link === undefined) continue
+      const link = links.get(Number(input.link))
+      if (link === undefined) continue
+      inputs[input.name] = [String(link.originId), link.originSlot]
+      consumed.add(link.id)
+    }
+    api[String(node.id)] = {
+      class_type: node.type,
+      inputs,
+      ...(node.title === undefined ? {} : { _meta: { title: node.title } }),
+    }
+  }
+  // A link pointing at a node whose `inputs` array does not declare it would be
+  // dropped silently, producing a graph that runs "successfully" with missing
+  // wiring. Real ComfyUI exports always declare these; a hand-authored graph may
+  // not, so say so instead of guessing.
+  for (const link of links.values()) {
+    if (consumed.has(link.id)) continue
+    const target = graph.nodes.find((n) => n.id === link.targetId)
+    if (target === undefined || target.mode === 2 || target.mode === 4) continue
+    throw new Error(
+      `工作流的 links 与 nodes 不一致：link ${link.id} 指向节点 #${link.targetId}（${target.type}）的 slot ${link.targetSlot}，`
+      + `但该节点的 inputs 数组里没有声明这条连线。这会静默丢掉接线，请检查工作流文件（或先用 ComfyUI 打开并重新保存一次）。`,
+    )
+  }
+  return api
+}
+
+/**
+ * Convert an API graph into a UI-format workflow, so an agent-authored graph can
+ * be opened and edited on the canvas. Nodes are laid out on a simple grid and
+ * links are materialised with fresh ids.
+ */
+export function apiToUi(api: Record<string, unknown>): UiWorkflow {
+  const entries = Object.entries(api).filter(
+    ([, value]) => value !== null && typeof value === 'object' && typeof (value as Record<string, unknown>).class_type === 'string',
+  )
+  if (entries.length === 0) throw new Error('API 工作流为空：需要 { "1": { class_type, inputs } } 形状')
+  const nodes: UiWorkflowNode[] = []
+  const links: unknown[] = []
+  const slots = new Map<string, string[]>()
+  let linkId = 0
+  // Pass 1: mint nodes.
+  entries.forEach(([key, value], order) => {
+    const node = value as { class_type: string; inputs?: Record<string, unknown>; _meta?: { title?: string } }
+    const id = Number(key)
+    const column = order % 4
+    const row = Math.floor(order / 4)
+    nodes.push({
+      id: Number.isFinite(id) ? id : order + 1,
+      type: node.class_type,
+      pos: [column * 320, row * 220],
+      size: [280, 180],
+      flags: {},
+      order,
+      mode: 0,
+      inputs: [],
+      outputs: [],
+      widgets_values: [],
+      ...(node._meta?.title === undefined ? {} : { title: node._meta.title }),
+      properties: { 'Node name for S&R': node.class_type },
+    })
+  })
+  const byId = new Map(nodes.map((node) => [String(node.id), node]))
+  // Pass 2: split widget values from links, then wire.
+  for (const [key, value] of entries) {
+    const node = byId.get(Number.isFinite(Number(key)) ? String(Number(key)) : key)
+    if (node === undefined) continue
+    const inputs = (value as { inputs?: Record<string, unknown> }).inputs ?? {}
+    const widgets: unknown[] = []
+    for (const [name, entry] of Object.entries(inputs)) {
+      const isLink = Array.isArray(entry) && entry.length === 2 && typeof entry[0] === 'string'
+      if (!isLink) {
+        widgets.push(entry)
+        continue
+      }
+      const [originKey, originSlot] = entry as [string, number]
+      const origin = byId.get(String(Number(originKey)))
+      if (origin === undefined) continue
+      linkId += 1
+      const targetSlot = (node.inputs ?? []).length
+      node.inputs?.push({ name, type: '*', link: linkId })
+      const outputs = origin.outputs ?? (origin.outputs = [])
+      while (outputs.length <= originSlot) outputs.push({ name: `out${outputs.length}`, type: '*', links: [] })
+      outputs[originSlot].links = [...(outputs[originSlot].links ?? []), linkId]
+      links.push([linkId, origin.id, originSlot, node.id, targetSlot, '*'])
+      const key2 = `${origin.id}:${originSlot}`
+      slots.set(key2, [...(slots.get(key2) ?? []), String(linkId)])
+    }
+    node.widgets_values = widgets
+  }
+  return {
+    last_node_id: nodes.reduce((max, node) => Math.max(max, node.id), 0),
+    last_link_id: linkId,
+    nodes,
+    links,
+    groups: [],
+    config: {},
+    extra: { dsl: { linkExtensions: [], reroutes: [] } },
+    version: 0.4,
+  }
+}
+
+/**
+ * Apply name-addressed edits to a UI workflow and return a NEW graph (the input
+ * is never mutated, so a caller can keep the original for diffing or rollback).
+ */
+export function patchWorkflow(
+  graph: UiWorkflow,
+  edits: WorkflowEdit[],
+  objectInfo?: Record<string, unknown>,
+): { graph: UiWorkflow; applied: string[] } {
+  const next = JSON.parse(JSON.stringify(graph)) as UiWorkflow
+  const applied: string[] = []
+  for (const edit of edits) {
+    const matches = findNodes(next, edit)
+    if (matches.length === 0) {
+      const classes = [...new Set(next.nodes.map((n) => n.type))].sort().join(', ')
+      const titleHint = edit.title === undefined ? '' : `、标题含 "${edit.title}"`
+      throw new Error(
+        `找不到节点：classType="${edit.classType}"${titleHint}`
+        + (edit.index === undefined ? '' : `、第 ${edit.index} 个`)
+        + `。当前画布上的节点类：${classes}`,
+      )
+    }
+    for (const node of matches) {
+      const label = node.title === undefined ? `#${node.id}` : `#${node.id} "${node.title}"`
+      if (edit.set !== undefined && Object.keys(edit.set).length > 0) {
+        const hasSchema = objectInfo !== undefined && objectInfo[node.type] !== undefined
+        writeWidgets(node, widgetLayout(objectInfo, node.type), edit.set, label, hasSchema)
+        applied.push(`${label}.${Object.keys(edit.set).join('/')}`)
+      }
+      if (edit.setTitle !== undefined) {
+        node.title = edit.setTitle
+        applied.push(`${label}.title`)
+      }
+      if (edit.setMode !== undefined) {
+        node.mode = edit.setMode
+        applied.push(`${label}.mode`)
+      }
+    }
+  }
+  return { graph: next, applied }
+}
+
+/** Whether a document looks like an API-format graph rather than a UI workflow. */
+export function isApiWorkflow(raw: unknown): boolean {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return false
+  const values = Object.values(raw as Record<string, unknown>)
+  if (values.length === 0) return false
+  return values.every(
+    (v) => v !== null && typeof v === 'object' && typeof (v as Record<string, unknown>).class_type === 'string',
+  )
+}
+
 // ─────────────────────────── model tools ───────────────────────────
 
 /** Wire shape of a gallery image returned by the tools. */
