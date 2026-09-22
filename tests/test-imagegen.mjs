@@ -1,0 +1,926 @@
+/**
+ * Functional test for ../godot-imagegen.ts (this repo's plugin root).
+ *
+ * Loads the plugin exactly the way the dsh loader does (a file:// import of the
+ * .ts — Node's type stripping), applies it against a mocked Cordis context, and
+ * exercises every tool plus the /gig REST surface end to end.
+ *
+ * Three real dependencies are deliberately used instead of mocks:
+ *   1. a REAL node:http server impersonating the A1111 /sdapi/v1 API,
+ *   2. a REAL node:http server impersonating the ComfyUI graph API,
+ *   3. the REAL 秋叶 bundled Python for the cutout / upscale post-processing.
+ * Storage and the webServer are mocked because the harness' own host plugins
+ * live inside app.asar and are not resolvable from a standalone script.
+ *
+ * Run with:  node tests/test-imagegen.mjs   (from the repo root)
+ */
+import { createServer } from 'node:http'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { existsSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { deflateSync } from 'node:zlib'
+import * as plugin from '../godot-imagegen.ts'
+
+let failures = 0
+let passes = 0
+function assert(cond, label) {
+  if (cond) {
+    passes++
+    console.log(`PASS  ${label}`)
+  } else {
+    failures++
+    console.error(`FAIL  ${label}`)
+  }
+}
+async function rejects(fn, pattern, label) {
+  try {
+    await fn()
+    failures++
+    console.error(`FAIL  ${label} (expected rejection)`)
+  } catch (error) {
+    if (pattern.test(error.message)) {
+      passes++
+      console.log(`PASS  ${label}`)
+    } else {
+      failures++
+      console.error(`FAIL  ${label} — unexpected error: ${error.message}`)
+    }
+  }
+}
+
+// ─────────────────────────── PNG encoder (no dependencies) ───────────────────────────
+
+const CRC_TABLE = (() => {
+  const table = new Int32Array(256)
+  for (let n = 0; n < 256; n++) {
+    let c = n
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
+    table[n] = c
+  }
+  return table
+})()
+function crc32(buf) {
+  let c = 0xffffffff
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8)
+  return (c ^ 0xffffffff) >>> 0
+}
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4)
+  len.writeUInt32BE(data.length, 0)
+  const body = Buffer.concat([Buffer.from(type, 'ascii'), data])
+  const crc = Buffer.alloc(4)
+  crc.writeUInt32BE(crc32(body), 0)
+  return Buffer.concat([len, body, crc])
+}
+/** Encode an RGBA image; `pixel(x, y)` returns [r, g, b, a]. */
+function encodePng(width, height, pixel) {
+  const stride = width * 4 + 1
+  const raw = Buffer.alloc(stride * height)
+  for (let y = 0; y < height; y++) {
+    raw[y * stride] = 0
+    for (let x = 0; x < width; x++) {
+      const [r, g, b, a] = pixel(x, y)
+      const o = y * stride + 1 + x * 4
+      raw[o] = r
+      raw[o + 1] = g
+      raw[o + 2] = b
+      raw[o + 3] = a
+    }
+  }
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(width, 0)
+  ihdr.writeUInt32BE(height, 4)
+  ihdr[8] = 8
+  ihdr[9] = 6
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(raw)),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ])
+}
+/** A white sheet with a red square — chroma-keyable against #FFFFFF. */
+const SAMPLE_PNG = encodePng(64, 64, (x, y) =>
+  x >= 16 && x < 48 && y >= 16 && y < 48 ? [220, 40, 40, 255] : [255, 255, 255, 255])
+const SAMPLE_PNG_B64 = SAMPLE_PNG.toString('base64')
+
+function readPngSize(bytes) {
+  return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) }
+}
+function readPngColorType(bytes) {
+  return bytes[25]
+}
+
+// ─────────────────────────── fake A1111 backend ───────────────────────────
+
+function startFakeA1111(port, requests) {
+  const server = createServer(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const body = chunks.length === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    requests.push({ method: req.method, url: req.url, body })
+    const json = (value) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(value))
+    }
+    const url = req.url.split('?')[0]
+    if (req.method === 'GET' && url === '/sdapi/v1/options') {
+      return json({ sd_model_checkpoint: 'waiIllustriousSDXL_v150.safetensors' })
+    }
+    if (req.method === 'GET' && url === '/sdapi/v1/sd-models') {
+      return json([
+        { title: 'waiIllustriousSDXL_v150.safetensors', model_name: 'wai' },
+        { title: 'anything-v5.safetensors', model_name: 'anything' },
+      ])
+    }
+    if (req.method === 'GET' && url === '/sdapi/v1/samplers') {
+      return json([{ name: 'DPM++ 2M SDE' }, { name: 'Euler a' }])
+    }
+    if (req.method === 'GET' && url === '/sdapi/v1/upscalers') {
+      return json([
+        { name: 'None' },
+        { name: 'RealESRGAN_x4plus_anime_6B' },
+        { name: '4x-AnimeSharp' },
+      ])
+    }
+    if (req.method === 'GET' && url === '/sdapi/v1/interrogators') {
+      return json([{ name: 'deepdanbooru' }, { name: 'wd14' }])
+    }
+    if (req.method === 'GET' && url === '/controlnet/model_list') {
+      return json({
+        model_list: [
+          'control_v11p_sd15_openpose_fp16 [b18e0966]',
+          'control_v11p_sd15_lineart_anime_fp16 [x]',
+          'control_v11p_sd15_canny_fp16 [y]',
+        ],
+      })
+    }
+    if (req.method === 'GET' && url === '/sdapi/v1/progress') {
+      return json({ progress: 0.5, eta_relative: 1.5, current_image: null, state: { sampling_step: 14, sampling_steps: 28 } })
+    }
+    if (req.method === 'POST' && url === '/sdapi/v1/txt2img') {
+      const n = body.batch_size || 1
+      return json({
+        images: Array.from({ length: n }, () => SAMPLE_PNG_B64),
+        info: JSON.stringify({ seed: 12345, width: body.width, height: body.height }),
+      })
+    }
+    if (req.method === 'POST' && url === '/sdapi/v1/img2img') {
+      return json({ images: [SAMPLE_PNG_B64], info: JSON.stringify({ seed: 999 }) })
+    }
+    if (req.method === 'POST' && url === '/sdapi/v1/extra-single-image') {
+      const scale = body.upscaling_resize || 2
+      const enlarged = encodePng(64 * scale, 64 * scale, (x, y) =>
+        x >= 16 * scale && x < 48 * scale && y >= 16 * scale && y < 48 * scale ? [220, 40, 40, 255] : [255, 255, 255, 255])
+      return json({ image: enlarged.toString('base64' ) })
+    }
+    if (req.method === 'POST' && url === '/sdapi/v1/interrogate') {
+      return json({ caption: '1girl, solo, red dress, white background, masterpiece' })
+    }
+    if (req.method === 'POST' && url === '/sdapi/v1/interrupt') return json({})
+    res.writeHead(404, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: 'unknown ' + req.method + ' ' + req.url }))
+  })
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)))
+}
+
+// ─────────────────────────── fake ComfyUI backend ───────────────────────────
+
+function startFakeComfy(port, requests) {
+  const history = new Map()
+  const server = createServer(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const raw = Buffer.concat(chunks).toString('utf8')
+    requests.push({ method: req.method, url: req.url, raw })
+    const json = (value) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(value))
+    }
+    const url = req.url.split('?')[0]
+    if (req.method === 'GET' && url === '/system_stats') return json({ system: { comfyui_version: 'test' } })
+    if (req.method === 'GET' && url === '/object_info/CheckpointLoaderSimple') {
+      return json({ CheckpointLoaderSimple: { input: { required: { ckpt_name: [['anything-v5.safetensors']] } } } })
+    }
+    if (req.method === 'GET' && url === '/object_info') {
+      return json({ KSampler: {}, CheckpointLoaderSimple: {}, LayeredDiffusionApply: {}, LayeredDiffusionDecodeRGBA: {} })
+    }
+    // Mirrors the real install, where extra_model_paths.yaml points ComfyUI at
+    // the SD WebUI model directories.
+    if (req.method === 'GET' && url === '/object_info/ControlNetLoader') {
+      return json({ ControlNetLoader: { input: { required: { control_net_name: [['control_v11p_sd15_openpose_fp16.safetensors', 'control_v11p_sd15_lineart_anime_fp16.safetensors']] } } } })
+    }
+    if (req.method === 'GET' && url === '/object_info/UpscaleModelLoader') {
+      return json({ UpscaleModelLoader: { input: { required: { model_name: [['RealESRGAN_x4plus_anime_6B.pth', '4x-AnimeSharp.pth']] } } } })
+    }
+    if (req.method === 'POST' && url === '/prompt') {
+      const id = 'prompt-' + (history.size + 1)
+      history.set(id, {
+        outputs: { '9': { images: [{ filename: 'ComfyUI_test.png', subfolder: '', type: 'output' }] } },
+        status: { status_str: 'success', completed: true },
+      })
+      return json({ prompt_id: id })
+    }
+    if (req.method === 'GET' && url.startsWith('/history/')) {
+      const id = url.slice('/history/'.length)
+      return json(history.has(id) ? { [id]: history.get(id) } : {})
+    }
+    if (req.method === 'GET' && url === '/view') {
+      res.writeHead(200, { 'content-type': 'image/png' })
+      res.end(SAMPLE_PNG)
+      return
+    }
+    res.writeHead(404, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: 'unknown ' + req.method + ' ' + req.url }))
+  })
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)))
+}
+
+/**
+ * An SD WebUI that accepts /sdapi/v1/txt2img and then NEVER answers — the
+ * signature of a backend stuck mid-sampling (and of a real SDXL run that
+ * outlives the client's patience).
+ */
+function startFakeA1111Hanging(port, requests) {
+  const server = createServer(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    requests.push({ method: req.method, url: req.url })
+    const url = req.url.split('?')[0]
+    const json = (value) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(value))
+    }
+    if (req.method === 'GET' && url === '/sdapi/v1/options') return json({ sd_model_checkpoint: 'hang.safetensors' })
+    if (req.method === 'POST' && url === '/sdapi/v1/interrupt') return json({})
+    // Deliberately never responds.
+    if (req.method === 'POST' && url === '/sdapi/v1/txt2img') return undefined
+    res.writeHead(404, { 'content-type': 'application/json' })
+    res.end('{}')
+    return undefined
+  })
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)))
+}
+
+// ─────────────────────────── fake WD14-tagger-only SD WebUI ───────────────────────────
+/**
+ * Mirrors the real 秋叶 install: `/sdapi/v1/interrogators` is 404, but the
+ * wd14 tagger extension serves `/tagger/v1/*`.
+ */
+function startFakeTaggerOnly(port, requests) {
+  const server = createServer(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const raw = Buffer.concat(chunks).toString('utf8')
+    requests.push({ method: req.method, url: req.url, body: raw === '' ? {} : JSON.parse(raw) })
+    const json = (value) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(value))
+    }
+    const url = req.url.split('?')[0]
+    if (req.method === 'GET' && url === '/sdapi/v1/options') return json({ sd_model_checkpoint: 'wai.sel' })
+    if (req.method === 'GET' && url === '/tagger/v1/interrogators') {
+      return json({ models: ['wd-eva02-large-tagger-v3', 'wd14-convnextv2-v2', 'wd14-vit'] })
+    }
+    if (req.method === 'POST' && url === '/tagger/v1/interrogate') {
+      return json({ caption: { rating: 'general', general: '1girl, solo, red dress, masterpiece' } })
+    }
+    res.writeHead(404, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: 'unknown ' + req.method + ' ' + req.url }))
+  })
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)))
+}
+
+// ─────────────────────────── mocked DSH services ───────────────────────────
+
+/** In-memory stand-in for the harness json storage backend (one live unit per name). */
+function makeStorageBackend() {
+  const units = new Map()
+  return {
+    get(name) {
+      if (name !== 'json') throw new Error(`backend "${name}" not found`)
+      return {
+        kv: {
+          async open(descriptor) {
+            if (process.env.GIG_DEBUG) {
+              console.log(`DEBUG  kv.open(${descriptor.name}) live=${units.has(descriptor.name) ? units.get(descriptor.name).live : 'new'}`)
+              console.log(new Error('open-trace').stack.split('\n').slice(2, 7).join('\n'))
+            }
+            if (units.has(descriptor.name) && units.get(descriptor.name).live) {
+              throw new Error('unit is already open: ' + descriptor.name)
+            }
+            const state = units.get(descriptor.name) || { tables: {}, global: null }
+            state.live = true
+            units.set(descriptor.name, state)
+            const clone = (v) => JSON.parse(JSON.stringify(v))
+            return {
+              async loadAll() {
+                return { tables: clone(state.tables), global: clone(state.global) }
+              },
+              async putRecord(table, key, value) {
+                if (!state.tables[table]) state.tables[table] = {}
+                state.tables[table][key] = clone(value)
+              },
+              async deleteRecord(table, key) {
+                if (state.tables[table]) delete state.tables[table][key]
+              },
+              async setGlobal(value) {
+                state.global = clone(value)
+              },
+              async close() {
+                state.live = false
+                if (process.env.GIG_DEBUG) console.log(`DEBUG  kv.close(${descriptor.name})`)
+              },
+            }
+          },
+        },
+      }
+    },
+  }
+}
+
+function makeCtx(backend, extra = {}) {
+  const registered = []
+  const disposers = []
+  const ctx = {
+    tools: {
+      register(definition) {
+        registered.push(definition)
+        return () => {}
+      },
+    },
+    storage: { backend },
+    get(name) {
+      if (name === 'subprocess') return undefined
+      if (name === 'webServer') return extra.webServer
+      return undefined
+    },
+    inject(deps, callback) {
+      if (deps.includes('webServer') && extra.webServer !== undefined) {
+        callback(Object.assign(Object.create(ctx), { webServer: extra.webServer }))
+      }
+      return () => {}
+    },
+    effect(callback) {
+      const cleanup = callback()
+      if (typeof cleanup === 'function') disposers.push(cleanup)
+      return cleanup
+    },
+  }
+  return { ctx, registered, disposers }
+}
+
+function makeWebServer() {
+  const routes = []
+  return {
+    routes,
+    register(opts) {
+      routes.push(opts)
+      return () => {}
+    },
+  }
+}
+
+function jsonRequest(method, pathname, body) {
+  return {
+    method,
+    url: pathname,
+    async *[Symbol.asyncIterator]() {
+      yield Buffer.from(JSON.stringify(body ?? {}), 'utf8')
+    },
+  }
+}
+function jsonResponse() {
+  const captured = {}
+  return {
+    captured,
+    writeHead(status, headers) { captured.status = status; captured.headers = headers },
+    end(body) { captured.body = body },
+  }
+}
+async function callRoute(webServer, method, pathname, body) {
+  const route = webServer.routes.find((r) => r.path === '/gig')
+  const res = jsonResponse()
+  await route.handler(jsonRequest(method, pathname, body), res)
+  let parsed = null
+  if (typeof res.captured.body === 'string') {
+    try { parsed = JSON.parse(res.captured.body) } catch { parsed = res.captured.body }
+  }
+  return { status: res.captured.status, body: parsed, raw: res.captured.body }
+}
+
+const byName = (list, name) => list.find((tool) => tool.name === name)
+const exec = (tool, args) => tool.execute(args, { signal: { aborted: false } })
+const unwrap = (result) => result
+
+// ─────────────────────────── the run ───────────────────────────
+
+const SD_PORT = 17860
+const COMFY_PORT = 18188
+const AKI_PYTHON = 'D:/AKI open/ComfyUI-aki-v2/python/python.exe'
+
+async function main() {
+  const workRoot = await mkdtemp(join(tmpdir(), 'gig-test-'))
+  const godotProject = join(workRoot, 'godot-project')
+  await mkdir(join(godotProject, 'assets'), { recursive: true })
+  await writeFile(join(godotProject, 'project.godot'), 'config_version=5\n', 'utf8')
+
+  const sdRequests = []
+  const comfyRequests = []
+  const sdServer = await startFakeA1111(SD_PORT, sdRequests)
+  const comfyServer = await startFakeComfy(COMFY_PORT, comfyRequests)
+
+  const postAvailable = existsSync(AKI_PYTHON)
+  if (!postAvailable) console.log(`NOTE  秋叶 Python not found at ${AKI_PYTHON} — post-processing assertions will be skipped`)
+
+  const config = {
+    unitName: 'godot_imagegen_test',
+    sdwebuiPort: SD_PORT,
+    comfyPort: COMFY_PORT,
+    sdwebuiRoot: 'D:/AKI open/sd-webui-aki-v4.10/sd-webui-aki-v4.10',
+    sdwebuiPython: 'D:/AKI open/sd-webui-aki-v4.10/sd-webui-aki-v4.10/python/python.exe',
+    comfyRoot: 'D:/AKI open/ComfyUI-aki-v2',
+    comfyPython: AKI_PYTHON,
+    postPython: AKI_PYTHON,
+    godotProject,
+    defaultBackend: 'sdwebui',
+    requestTimeoutMs: 60000,
+    startTimeoutMs: 5000,
+  }
+
+  const storage = makeStorageBackend()
+  const webServer = makeWebServer()
+  const { ctx, registered, disposers } = makeCtx(storage, { webServer })
+  plugin.apply(ctx, config)
+
+  // ── module + registration shape ──
+  assert(plugin.name === 'godot-imagegen', 'plugin exports the expected name')
+  assert(Array.isArray(plugin.inject) && plugin.inject.includes('tools') && plugin.inject.includes('storage'), 'plugin injects tools + storage')
+  const expectedTools = [
+    'image_backend_status', 'image_generate', 'image_edit', 'image_variants',
+    'image_upscale', 'image_cutout', 'image_interrogate', 'image_gallery',
+  ]
+  assert(registered.length === 8, `registers exactly 8 tools (got ${registered.length})`)
+  for (const toolName of expectedTools) {
+    assert(byName(registered, toolName) !== undefined, `registers ${toolName}`)
+  }
+  assert(webServer.routes.length === 1 && webServer.routes[0].path === '/gig', 'registers the /gig REST prefix')
+
+  // ── ARG-000: no unit name collision with godot-asset-planner ──
+  assert(config.unitName !== 'godot_asset_planner' && config.unitName !== 'godot_asset_planner_ui',
+    'uses its own KV unit (never the asset planner unit)')
+
+  // ── T1: backend status ──
+  const statusTool = byName(registered, 'image_backend_status')
+  const status = unwrap(await exec(statusTool, {}))
+  assert(status.backends.length === 2, 'status reports both backends')
+  const sd = status.backends.find((b) => b.id === 'sdwebui')
+  const comfy = status.backends.find((b) => b.id === 'comfyui')
+  assert(sd.running === true, 'detects the running SD WebUI')
+  assert(sd.models.length === 2 && sd.models[0].includes('waiIllustriousSDXL'), 'lists SD WebUI checkpoints')
+  assert(sd.detail.includes('ControlNet 3'), 'reports the ControlNet model count')
+  assert(Array.isArray(sd.strengths) && sd.strengths.some((s) => s.includes('ControlNet 3')),
+    'exposes human-readable capability strengths to the model')
+  assert(sd.strengths.some((s) => s.startsWith('反推提示词')), 'reports which prompt-interrogation route is available')
+  assert(comfy.running === true, 'detects the running ComfyUI')
+  assert(comfy.strengths.some((s) => s.includes('ControlNet 权重 2 个')),
+    'ComfyUI reports the ControlNet weights it shares from the SD WebUI install (extra_model_paths)')
+  assert(comfy.strengths.some((s) => s.includes('放大权重 2 个')), 'ComfyUI reports the shared upscale weights')
+  assert(comfy.strengths.some((s) => s.includes('只实现文生图')),
+    'ComfyUI discloses the adapter limitation so the model routes ControlNet/upscale to SD WebUI')
+  assert(status.outputRoot === join(godotProject, 'assets', 'generated'), 'output root defaults to <project>/assets/generated')
+  assert(status.godotProject.replace(/\\/g, '/') === godotProject.replace(/\\/g, '/'), 'reports the configured Godot project')
+
+  // ── T2: start adopts an already-running instance, never spawns a duplicate ──
+  const started = unwrap(await exec(statusTool, { action: 'start', backend: 'sdwebui' }))
+  assert(started.note.includes('已在运行') && started.note.includes('不重启'), 'start adopts a live backend instead of duplicating it')
+  const stopRefused = unwrap(await exec(statusTool, { action: 'stop', backend: 'sdwebui' }))
+  assert(stopRefused.note.includes('拒绝终止'), 'stop refuses to kill an instance the plugin did not start')
+
+  // ── T3: generate (SD WebUI) ──
+  const generateTool = byName(registered, 'image_generate')
+  const gen = unwrap(await exec(generateTool, {
+    prompt: 'game item icon, potion bottle, single object',
+    negative_prompt: 'blurry',
+    category: 'item',
+    name: 'potion',
+    width: 512,
+    height: 512,
+    steps: 20,
+    cfg_scale: 7,
+    seed: 42,
+    transparent_method: 'chroma',
+    project_id: 'testproj',
+  }))
+  assert(gen.count === 1, 'generate produces one image')
+  const first = gen.images[0]
+  assert(first.backend === 'sdwebui', 'generate ran on SD WebUI')
+  assert(first.filePath.includes(join('assets', 'generated', 'item')), 'generated file lands in assets/generated/item')
+  assert(typeof first.resPath === 'string' && first.resPath.startsWith('res://assets/generated/item/'), 'returns a res:// path inside the Godot project')
+  assert(first.category === 'item' && first.seed === 12345, 'records category and seed')
+  assert(existsSync(first.filePath), 'generated PNG exists on disk')
+  const txt2imgCall = sdRequests.find((r) => r.url === '/sdapi/v1/txt2img')
+  assert(txt2imgCall !== undefined && txt2imgCall.body.prompt.includes('potion'), 'forwards the prompt to /sdapi/v1/txt2img')
+  assert(txt2imgCall.body.override_settings.sd_model_checkpoint === 'waiIllustriousSDXL_v150.safetensors', 'selects the first available checkpoint by default')
+
+  // ── T3b: blank optional text means "not provided", never an error ──
+  // REGRESSION: the 美术工坊 panel posts `negativePrompt: ""` whenever the
+  // negative-prompt box is left empty (its initial state), and an agent may pass
+  // `negative_prompt: ""` / `sampler: ""` / `out_dir: ""` for the same reason.
+  // Treating those as validation failures made every panel generation fail with
+  // "negativePrompt, when provided, must be a non-empty string".
+  const blankGen = unwrap(await exec(generateTool, {
+    prompt: 'blank optional text',
+    negative_prompt: '',
+    sampler: '',
+    model: '',
+    name: '',
+    out_dir: '',
+    category: 'item',
+    width: 256,
+    height: 256,
+    steps: 6,
+    seed: 1,
+    transparent: false,
+    project_id: 'testproj',
+  }))
+  assert(blankGen.count === 1, 'blank optional text (negative_prompt/sampler/model/name/out_dir) is accepted')
+  assert(!blankGen.images[0].filePath.includes('-0x0'), 'an empty name still produces a sane auto-generated filename')
+  assert(/[\\/]item-\d{8}-\d{6}-/.test(blankGen.images[0].filePath), 'a blank name falls back to the <category>-<timestamp> pattern')
+  const blankCall = sdRequests.filter((r) => r.url === '/sdapi/v1/txt2img').pop()
+  assert(blankCall.body.negative_prompt === '', 'an absent negative prompt reaches the backend as an empty string, not an error')
+  assert(blankCall.body.sampler_name === 'DPM++ 2M SDE', 'a blank sampler falls back to the default instead of overriding it')
+  await rejects(
+    () => exec(generateTool, { prompt: 'x', negative_prompt: 42 }),
+    /negative_prompt, when provided, must be a string/,
+    'a non-string optional value is still rejected',
+  )
+
+  // ── T4: transparent (chroma) actually produced an alpha channel ──
+  if (postAvailable) {
+    const generatedBytes = await readFile(first.filePath)
+    assert(readPngSize(generatedBytes).width === 64, 'post-processed PNG keeps its pixel size')
+    assert(first.method === 'chroma', 'records the cutout method used')
+    assert(readPngColorType(generatedBytes) === 6, 'cutout rewrote the PNG as RGBA (colour type 6)')
+  }
+
+  // ── T5: variants ──
+  const variantsTool = byName(registered, 'image_variants')
+  const variants = unwrap(await exec(variantsTool, {
+    prompt: 'seamless tileable grass texture, top down',
+    category: 'tile',
+    count: 3,
+    name: 'grass',
+    seed: -1,
+    project_id: 'testproj',
+  }))
+  assert(variants.count === 3, 'variants honours count=3')
+  assert(variants.images.every((i) => i.category === 'tile'), 'variants keep the requested category')
+  const batchCall = sdRequests.filter((r) => r.url === '/sdapi/v1/txt2img').pop()
+  assert(batchCall.body.batch_size === 3, 'variants uses one batched request on SD WebUI')
+  assert(batchCall.body.tiling === true, 'tile category enables seamless tiling on the backend')
+
+  // ── T6: generate on ComfyUI ──
+  const comfyGen = unwrap(await exec(generateTool, {
+    prompt: 'chibi slime monster, game sprite',
+    category: 'character',
+    name: 'slime',
+    width: 512,
+    height: 512,
+    steps: 18,
+    backend: 'comfyui',
+    transparent: false,
+    project_id: 'testproj',
+  }))
+  assert(comfyGen.images[0].backend === 'comfyui', 'generate can target ComfyUI explicitly')
+  assert(comfyGen.images[0].model === 'anything-v5.safetensors', 'picks the ComfyUI checkpoint')
+  const promptCall = comfyRequests.find((r) => r.url === '/prompt')
+  assert(promptCall !== undefined, 'ComfyUI received a /prompt graph')
+  const graph = JSON.parse(promptCall.raw).prompt
+  assert(graph['4'].class_type === 'CheckpointLoaderSimple', 'graph has a CheckpointLoaderSimple node')
+  assert(graph['3'].class_type === 'KSampler' && graph['3'].inputs.positive[0] === '6', 'graph wires KSampler to the positive conditioning')
+  assert(graph['9'].class_type === 'SaveImage', 'graph ends in SaveImage')
+  assert(comfyGen.images[0].filePath.includes(join('assets', 'generated', 'character')), 'ComfyUI output lands in the character category folder')
+
+  // ── T7: edit (img2img) ──
+  const editTool = byName(registered, 'image_edit')
+  const edited = unwrap(await exec(editTool, {
+    image: first.resPath,
+    prompt: 'same potion, glowing blue liquid',
+    category: 'item',
+    name: 'potion-blue',
+    denoise: 0.5,
+    project_id: 'testproj',
+  }))
+  assert(edited.count === 1 && edited.images[0].op === 'edit', 'edit records op=edit')
+  const img2imgCall = sdRequests.find((r) => r.url === '/sdapi/v1/img2img')
+  assert(img2imgCall !== undefined && img2imgCall.body.init_images.length === 1, 'edit sends the source image as init_images')
+  assert(Math.abs(img2imgCall.body.denoising_strength - 0.5) < 1e-9, 'edit forwards denoise as denoising_strength')
+  assert(edited.images[0].filePath.includes('assets'), 'edited file is written under the project')
+
+  // ── T8: upscale via the real 秋叶 Python (lanczos path) ──
+  const upscaleTool = byName(registered, 'image_upscale')
+  if (postAvailable) {
+    const up = unwrap(await exec(upscaleTool, {
+      image: first.resPath,
+      scale: 2,
+      method: 'lanczos',
+      category: 'item',
+      name: 'potion-x2',
+      project_id: 'testproj',
+    }))
+    const upBytes = await readFile(up.image.filePath)
+    assert(readPngSize(upBytes).width === 128 && readPngSize(upBytes).height === 128, 'lanczos upscale produced a 128x128 PNG')
+    assert(up.image.method === 'lanczos', 'records the lanczos method')
+  }
+
+  // ── T9: upscale via SD WebUI ──
+  const upEsrgan = unwrap(await exec(upscaleTool, {
+    image: first.resPath,
+    scale: 2,
+    method: 'esrgan',
+    category: 'item',
+    name: 'potion-esrgan',
+    project_id: 'testproj',
+  }))
+  const extraCall = sdRequests.find((r) => r.url === '/sdapi/v1/extra-single-image')
+  assert(extraCall !== undefined, 'upscale called /sdapi/v1/extra-single-image')
+  assert(extraCall.body.upscaler_1 === 'RealESRGAN_x4plus_anime_6B', 'prefers the anime-tuned RealESRGAN model')
+  assert(upEsrgan.image.method === 'RealESRGAN_x4plus_anime_6B', 'records the upscaler that actually ran')
+
+  // ── T10: cutout via the real Python ──
+  if (postAvailable) {
+    const cutoutTool = byName(registered, 'image_cutout')
+    const cut = unwrap(await exec(cutoutTool, {
+      image: first.resPath,
+      method: 'chroma',
+      key_color: '#FFFFFF',
+      category: 'item',
+      name: 'potion-cut',
+      project_id: 'testproj',
+    }))
+    const cutBytes = await readFile(cut.image.filePath)
+    assert(readPngColorType(cutBytes) === 6, 'cutout wrote an RGBA PNG')
+    assert(cut.image.method === 'chroma', 'cutout reports the chroma method')
+  }
+
+  // ── T11: interrogate ──
+  const interrogateTool = byName(registered, 'image_interrogate')
+  const caption = unwrap(await exec(interrogateTool, { image: first.resPath }))
+  assert(caption.caption.includes('1girl'), 'interrogate returns the tag caption')
+  assert(caption.model === 'deepdanbooru', 'interrogate picks deepdanbooru by default')
+
+  // ── T11b: interrogate falls back to the WD14 tagger extension ──
+  // The real 秋叶 install has NO /sdapi/v1/interrogators (404) but DOES ship the
+  // wd14 tagger extension, so the second route is the one that actually runs
+  // there. A dedicated server with only /tagger/v1/* exercises it.
+  const TAGGER_PORT = 17861
+  const taggerRequests = []
+  const taggerServer = await startFakeTaggerOnly(TAGGER_PORT, taggerRequests)
+  try {
+    const taggerCtx = makeCtx(storage, { webServer: makeWebServer() })
+    plugin.apply(taggerCtx.ctx, Object.assign({}, config, { sdwebuiPort: TAGGER_PORT }))
+    const taggerTool = byName(taggerCtx.registered, 'image_interrogate')
+    const taggerCaption = unwrap(await exec(taggerTool, { image: first.filePath }))
+    assert(taggerCaption.caption.includes('1girl'), 'interrogate reads the WD14 tagger caption')
+    assert(taggerCaption.model.includes('wd14') && taggerCaption.model.includes('tagger'),
+      'interrogate reports which WD14 model answered')
+    const taggerCall = taggerRequests.find((r) => r.url === '/tagger/v1/interrogate')
+    assert(taggerCall !== undefined && taggerCall.body.model === 'wd14-convnextv2-v2',
+      'WD14 fallback posts to /tagger/v1/interrogate with the preferred model')
+    for (const dispose of taggerCtx.disposers) dispose()
+  } finally {
+    await new Promise((resolve) => taggerServer.close(resolve))
+  }
+
+  // ── T12: gallery ──
+  const galleryTool = byName(registered, 'image_gallery')
+  const listed = unwrap(await exec(galleryTool, { action: 'list', project_id: 'testproj' }))
+  assert(listed.images.length >= 6, `gallery lists every produced image (got ${listed.images.length})`)
+  const itemOnly = unwrap(await exec(galleryTool, { action: 'list', category: 'item', project_id: 'testproj' }))
+  assert(itemOnly.images.every((i) => i.category === 'item'), 'gallery filters by category')
+  const otherProject = unwrap(await exec(galleryTool, { action: 'list', project_id: 'other' }))
+  assert(otherProject.images.length === 0, 'gallery isolates projects')
+  const victim = listed.images[0]
+  const deleted = unwrap(await exec(galleryTool, { action: 'delete', id: victim.id }))
+  assert(deleted.removed === 1, 'gallery deletes one record')
+  assert(!existsSync(victim.filePath), 'gallery delete also removes the PNG unless keep_file is set')
+  const afterDelete = unwrap(await exec(galleryTool, { action: 'list', project_id: 'testproj' }))
+  assert(afterDelete.images.length === listed.images.length - 1, 'deleted record is gone from the list')
+
+  // ── T13: ControlNet wiring ──
+  const cnGen = unwrap(await exec(generateTool, {
+    prompt: 'character standing pose',
+    category: 'character',
+    name: 'pose-test',
+    control_image: first.filePath,
+    control_type: 'openpose',
+    project_id: 'testproj',
+  }))
+  assert(cnGen.count === 1, 'generation with a ControlNet reference succeeds')
+  const cnCall = sdRequests.filter((r) => r.url === '/sdapi/v1/txt2img').pop()
+  const args = cnCall.body.alwayson_scripts.controlnet.args[0]
+  assert(args.module === 'openpose' && args.model.includes('openpose'), 'ControlNet sends the openpose module and model')
+  assert(args.save_detected_map === false, 'ControlNet suppresses its detected-map preview so it is not saved as a fake asset')
+
+  // ── T14: error paths ──
+  await rejects(() => exec(generateTool, { prompt: 'x', backend: 'comfyui', model: 'nope.safetensors' }),
+    /was not found/, 'unknown checkpoint produces a clear error')
+  await rejects(() => exec(generateTool, { prompt: '' }), /prompt must be a non-empty string/, 'empty prompt is rejected')
+  await rejects(() => exec(editTool, { image: first.resPath, prompt: 'x', denoise: 5 }), /denoise must be between/, 'out-of-range denoise is rejected')
+  await rejects(() => exec(galleryTool, { action: 'delete', id: 'img_missing' }), /找不到记录/, 'deleting an unknown image id fails clearly')
+  await rejects(() => exec(upscaleTool, { image: 'relative/path.png' }), /绝对路径/, 'a relative image path is rejected')
+  await rejects(() => exec(statusTool, { action: 'status', backend: 'nope' }), /must be one of/, 'an unknown backend id is rejected')
+
+  // ── R1..: REST surface ──
+  const restState = await callRoute(webServer, 'GET', '/gig/state')
+  assert(restState.status === 200 && restState.body.backends.length === 2, 'GET /gig/state returns backends')
+  assert(Array.isArray(restState.body.presets) && restState.body.presets.length >= 11, 'GET /gig/state ships the built-in prompt presets')
+  assert(restState.body.categories.length === 7, 'GET /gig/state lists all 7 art categories')
+  assert(restState.body.controlTypes.includes('openpose'), 'GET /gig/state lists the ControlNet types')
+
+  const restGallery = await callRoute(webServer, 'GET', '/gig/gallery?project=testproj')
+  assert(restGallery.status === 200 && restGallery.body.images.length >= 5, 'GET /gig/gallery returns the project gallery')
+
+  const fileRoute = webServer.routes[0].handler
+  const fileRes = jsonResponse()
+  await fileRoute(jsonRequest('GET', '/gig/file?id=' + encodeURIComponent(restGallery.body.images[0].id)), fileRes)
+  assert(fileRes.captured.status === 200 && fileRes.captured.headers['content-type'] === 'image/png', 'GET /gig/file serves PNG bytes')
+  assert(Buffer.isBuffer(fileRes.captured.body), 'GET /gig/file returns a buffer body')
+
+  const missingFile = await callRoute(webServer, 'GET', '/gig/file?id=img_nope')
+  assert(missingFile.status === 404, 'GET /gig/file 404s for an unknown id')
+
+  const genRoute = await callRoute(webServer, 'POST', '/gig/generate', {
+    prompt: 'ui button, empty center',
+    category: 'ui',
+    name: 'btn',
+    transparent: false,
+    projectId: 'testproj',
+  })
+  assert(genRoute.status === 200 && typeof genRoute.body.jobId === 'string', 'POST /gig/generate returns a jobId immediately')
+  await new Promise((r) => setTimeout(r, 700))
+  const jobsRoute = await callRoute(webServer, 'GET', '/gig/jobs')
+  const restJob = jobsRoute.body.jobs.find((j) => j.id === genRoute.body.jobId)
+  assert(restJob !== undefined && restJob.status === 'done', `the REST generate job reaches status done (job=${JSON.stringify(restJob && { status: restJob.status, message: restJob.message, error: restJob.error })})`)
+  assert(restJob.images.length === 1, 'the REST generate job carries its produced image')
+
+  const settingsRoute = await callRoute(webServer, 'POST', '/gig/settings', { lastCategory: 'tile' })
+  assert(settingsRoute.status === 200 && settingsRoute.body.settings.lastCategory === 'tile', 'POST /gig/settings persists a setting')
+  const stateAfterSettings = await callRoute(webServer, 'GET', '/gig/state')
+  assert(stateAfterSettings.body.settings.lastCategory === 'tile', 'the setting survives a re-read')
+
+  const presetRoute = await callRoute(webServer, 'POST', '/gig/presets', {
+    name: '测试预设', category: 'tile', prompt: 'seamless stone floor', width: 768, height: 768, steps: 30, cfgScale: 7,
+  })
+  assert(presetRoute.status === 200 && presetRoute.body.presets.some((p) => p.name === '测试预设'), 'POST /gig/presets adds a user preset')
+  assert(presetRoute.body.presets.some((p) => p.builtin === true), 'user presets do not displace built-ins')
+
+  const badRoute = await callRoute(webServer, 'GET', '/gig/nope')
+  assert(badRoute.status === 404, 'unknown /gig route 404s')
+
+  const badBody = await callRoute(webServer, 'POST', '/gig/generate', { category: 'item' })
+  assert(badBody.status === 400, 'a missing prompt in a REST body is a 400')
+
+  // ── R-blank: the exact payload the 美术工坊 panel sends on a fresh form ──
+  // REGRESSION: this is the bug the user hit — an untouched negative-prompt box
+  // posts "" and the whole generation was rejected.
+  const panelShaped = await callRoute(webServer, 'POST', '/gig/generate', {
+    prompt: 'ui button, empty center',
+    negativePrompt: '',
+    category: 'ui',
+    width: 1024,
+    height: 1024,
+    steps: 26,
+    cfgScale: 6,
+    seed: -1,
+    count: 1,
+    backend: 'auto',
+    model: undefined,
+    transparent: true,
+    transparentMethod: 'auto',
+    seamless: false,
+    projectId: 'testproj',
+    controlType: undefined,
+    controlImage: undefined,
+  })
+  assert(panelShaped.status === 200 && typeof panelShaped.body.jobId === 'string',
+    'POST /gig/generate accepts the panel-shaped body with an empty negativePrompt')
+  // The panel's default is transparent + auto, so this job also runs rembg
+  // against the real 秋叶 Python — allow a few seconds for that.
+  await new Promise((r) => setTimeout(r, 6000))
+  const panelJob = (await callRoute(webServer, 'GET', '/gig/jobs')).body.jobs.find((j) => j.id === panelShaped.body.jobId)
+  assert(panelJob !== undefined && panelJob.status === 'done',
+    `the panel-shaped generation completes (status=${panelJob && panelJob.status} msg=${panelJob && panelJob.message})`)
+
+  const blankEdit = await callRoute(webServer, 'POST', '/gig/edit', {
+    image: first.filePath,
+    prompt: 'recolour it',
+    negativePrompt: '',
+    mask: '',
+    sampler: '',
+    category: 'item',
+    projectId: 'testproj',
+  })
+  assert(blankEdit.status === 200 && typeof blankEdit.body.jobId === 'string',
+    'POST /gig/edit accepts blank negativePrompt and mask')
+
+  const badRest = await callRoute(webServer, 'POST', '/gig/generate', { prompt: 'x', negativePrompt: 42 })
+  assert(badRest.status === 400, 'a non-string negativePrompt in a REST body is still a 400')
+
+  // ── R-contract: the panel's routes and payloads must match the host ──
+  // The blank-negativePrompt bug slipped through because the REST routes were
+  // tested, but never with the exact body the panel builds. These static
+  // cross-checks catch route typos and renames cheaply; the "panel-shaped body"
+  // test above covers the payload contract behaviourally.
+  const clientSource = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  const hostSource = readFileSync(new URL('../godot-imagegen.ts', import.meta.url), 'utf8')
+
+  const gigRoutes = [...new Set([...clientSource.matchAll(/['"](\/gig\/[a-z/]+)['"]/g)].map((m) => m[1]))].sort()
+  assert(gigRoutes.length >= 12, `the panel calls ${gigRoutes.length} distinct /gig routes`)
+  const unhandled = gigRoutes.filter((route) => !hostSource.includes(`'${route}'`))
+  assert(unhandled.length === 0, `every /gig route the panel calls is handled by the host (unhandled: ${unhandled.join(', ') || 'none'})`)
+  assert(hostSource.includes("path: '/gig'"), 'the host registers the /gig prefix the panel targets')
+
+  // The panel talks to exactly two routes of the NEIGHBOURING plugin; both were
+  // verified against godot-asset-planner's own route table.
+  const gapRoutes = [...new Set([...clientSource.matchAll(/['"](\/gap\/[a-z/]+)['"]/g)].map((m) => m[1]))].sort()
+  const knownGapRoutes = ['/gap/assets', '/gap/state']
+  assert(gapRoutes.length > 0 && gapRoutes.every((route) => knownGapRoutes.includes(route)),
+    `the panel only calls verified godot-asset-planner routes (${gapRoutes.join(', ')})`)
+
+  // ── P1: persistence across a plugin restart ──
+  assert(disposers.length >= 2, 'the plugin registers disposers for its jobs and storage unit')
+  for (const dispose of disposers) dispose()
+  await rejects(
+    () => exec(byName(registered, 'image_gallery'), { action: 'list' }),
+    /was disposed/,
+    'a stale operation after dispose cannot re-open the storage unit',
+  )
+  // The KV unit closes asynchronously; give the fiber cleanup a tick before
+  // re-applying, exactly like a hot patch reload would.
+  await new Promise((r) => setTimeout(r, 100))
+  const second = makeCtx(storage, { webServer: makeWebServer() })
+  plugin.apply(second.ctx, config)
+  const reloadedGallery = unwrap(await exec(byName(second.registered, 'image_gallery'), { action: 'list', project_id: 'testproj' }))
+  assert(reloadedGallery.images.length >= 5, 'gallery survives a plugin restart (storage persisted)')
+  const reloadedStatus = unwrap(await exec(byName(second.registered, 'image_backend_status'), {}))
+  assert(reloadedStatus.backends.find((b) => b.id === 'sdwebui').running === true, 're-applied plugin re-detects the backend')
+
+  // ── T15: a timed-out request interrupts the backend ──
+  // Diffusion servers keep sampling after the client disconnects, so a timeout
+  // MUST proactively stop the job: otherwise it holds the GPU for its full run
+  // and every later request queues behind it (observed in the live SDXL run,
+  // where an abandoned job blocked the queue for ~25 minutes).
+  for (const dispose of second.disposers) dispose()
+  await new Promise((r) => setTimeout(r, 100))
+  const HANG_PORT = 17862
+  const hangRequests = []
+  const hangServer = await startFakeA1111Hanging(HANG_PORT, hangRequests)
+  try {
+    const hangCtx = makeCtx(storage, { webServer: makeWebServer() })
+    plugin.apply(hangCtx.ctx, Object.assign({}, config, { sdwebuiPort: HANG_PORT, requestTimeoutMs: 1500 }))
+    const hangGenerate = byName(hangCtx.registered, 'image_generate')
+    let failed = false
+    try {
+      await exec(hangGenerate, { prompt: 'hang test', category: 'item', name: 'hang', transparent: false })
+    } catch {
+      failed = true
+    }
+    assert(failed, 'a backend that never answers fails the call instead of hanging forever')
+    assert(hangRequests.some((r) => r.url === '/sdapi/v1/interrupt'),
+      'a timed-out request tells the backend to interrupt (no orphaned GPU job)')
+
+    // ── T16: explicit vs auto upscale semantics ──
+    // This backend answers but reports no upscalers, so the SD WebUI path fails.
+    const upscaleTool = byName(hangCtx.registered, 'image_upscale')
+    await rejects(
+      () => exec(upscaleTool, { image: first.filePath, method: 'esrgan', category: 'item', name: 'up-explicit' }),
+      /放大失败|没有可用的放大模型/,
+      'an explicit esrgan request fails loudly instead of silently degrading',
+    )
+    const autoUp = await exec(upscaleTool, { image: first.filePath, method: 'auto', scale: 2, category: 'item', name: 'up-auto' })
+    assert(autoUp.image.method === 'lanczos', 'auto upscale falls back to Lanczos when the backend cannot upscale')
+    assert(typeof autoUp.note === 'string' && autoUp.note.includes('Lanczos'),
+      'auto upscale surfaces the fallback reason in its note (never hides the quality loss)')
+
+    for (const dispose of hangCtx.disposers) dispose()
+  } finally {
+    hangServer.closeAllConnections()
+    await new Promise((resolve) => hangServer.close(resolve))
+  }
+
+  // ── summary ──
+  await new Promise((resolve) => sdServer.close(resolve))
+  await new Promise((resolve) => comfyServer.close(resolve))
+  await rm(workRoot, { recursive: true, force: true }).catch(() => undefined)
+
+  console.log(`\n${passes} passed, ${failures} failed`)
+  process.exit(failures === 0 ? 0 : 1)
+}
+
+main().catch((error) => {
+  console.error('FATAL', error)
+  process.exit(1)
+})

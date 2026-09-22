@@ -1,0 +1,14 @@
+# dependencies / build artefacts
+node_modules/
+*.tsbuildinfo
+.tsbuildinfo
+
+# local scratch
+.tmp/
+tmp/
+*.log
+
+# OS noise
+Thumbs.db
+Desktop.ini
+.DS_Store

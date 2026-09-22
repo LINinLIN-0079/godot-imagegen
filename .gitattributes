@@ -1,0 +1,15 @@
+# Store every text file with LF in the repository and check it out as LF.
+# This project's sources are authored with LF; Windows' default core.autocrlf
+# would otherwise rewrite them to CRLF on checkout and churn the whole diff.
+* text=auto eol=lf
+
+# Genuinely binary assets must never be line-ending-normalised.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary

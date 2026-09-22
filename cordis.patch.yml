@@ -1,0 +1,27 @@
+# godot-imagegen bundle layer: registers the host plugin row.
+#
+# This file is the `dsh.bundle.patch` layer of the package: when the plugin is
+# installed through the official CLI —
+#
+#   dsh plugin --profile <name> add godot-imagegen
+#
+# — the command reconciles `dsh.profile.bundles` against installed packages
+# and, seeing this declaration, appends `godot-imagegen` to the bundle stack.
+# The profile boot then merges THIS patch (a single `insert` of the plugin row)
+# exactly like a manual mount line. The same package also declares
+# `dsh.client`, so the client-modules scan picks up `lib/client.js` as the
+# browser half automatically — no separate UI row is needed.
+#
+# Optional config (add under the inserted row in your profile's
+# cordis.patch.yml):
+#   unitName:       gallery storage unit name (default godot_imagegen)
+#   godotProject:   Godot project root; art lands in <root>/assets/generated
+#                   and gets a res:// path
+#   outDir:         explicit output root (wins over godotProject)
+#   sdwebuiRoot / sdwebuiPython / sdwebuiPort   (defaults target the 秋叶 v4.10 install on :7860)
+#   comfyRoot / comfyPython / comfyPort         (defaults target the 秋叶 v2 install on :8188)
+#   postPython:     Python used for cutout/upscale (defaults to the ComfyUI one)
+#   defaultBackend: sdwebui | comfyui (default sdwebui)
+- insert:
+    - id: godot-imagegen
+      name: godot-imagegen

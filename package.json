@@ -1,0 +1,38 @@
+{
+  "name": "godot-imagegen",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Local AI art generation for DeepSeek Harness game development: drives the machine's SD WebUI / ComfyUI backends through eight image_* model tools, a /gig REST surface and a 美术工坊 (Art Studio) better-sidebar panel, writing Godot-ready assets.",
+  "main": "godot-imagegen.ts",
+  "exports": {
+    ".": "./godot-imagegen.ts",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "godot-imagegen.ts",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node tests/test-imagegen.mjs && node tests/test-render-imagegen.mjs",
+    "test:offline": "node tests/test-imagegen.mjs",
+    "test:client": "node tests/test-render-imagegen.mjs",
+    "test:live": "node tests/test-imagegen-live.mjs",
+    "test:live:comfy": "node tests/test-imagegen-live-comfy.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "license": "MIT"
+}
