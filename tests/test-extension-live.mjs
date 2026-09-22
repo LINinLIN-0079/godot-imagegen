@@ -123,7 +123,10 @@ async function main() {
     if (serve) {
       const alreadyUp = await comfyAnswers()
       if (alreadyUp) {
-        console.log('INFO  ComfyUI 已在运行（不是本脚本启动的，结束时不关它）')
+        console.log('INFO  ComfyUI 已在运行')
+        console.log('SKIP  它是本次安装之前启动的，所以还没有加载这个扩展 ——')
+        console.log('      「ComfyUI 提供扩展文件」与「__pycache__ 被清掉」这两项只能在')
+        console.log('      “先安装、再由本脚本启动 ComfyUI”的顺序下验证。想验证就先关掉它再跑一次。')
       } else {
         assert(existsSync(COMFY_PYTHON), `秋叶内嵌 Python 存在：${COMFY_PYTHON}`)
         comfy = spawn(COMFY_PYTHON, ['-s', 'main.py', '--port', String(COMFY_PORT), '--listen', '127.0.0.1'], {
@@ -140,10 +143,11 @@ async function main() {
         }
         assert(up, `ComfyUI 启动并在 :${COMFY_PORT} 应答（由本脚本启动，结束时会关闭）`)
       }
-      if (await comfyAnswers()) {
+      if (startedByUs && await comfyAnswers()) {
         // ComfyUI discovers web extensions at boot and serves them under
         // /extensions/<dirname>/ — if this URL answers, the browser inside
-        // 美术工坊 will load the bridge for real.
+        // 美术工坊 will load the bridge for real. Only meaningful for an
+        // instance this script booted AFTER the install.
         const url = `http://127.0.0.1:${COMFY_PORT}/extensions/godot-imagegen-bridge/godot-imagegen-bridge.js`
         let served = null
         try {
@@ -154,7 +158,9 @@ async function main() {
         if (served !== null) {
           const manifest2 = JSON.parse(await readFile(manifestPath, 'utf8'))
           assert(served.includes(manifest2.token), 'ComfyUI 送出的就是本次安装的副本（含本次令牌）')
-          assert(served.includes('/gig/bridge/poll'), '送出的副本会回连宿主的 /gig/bridge/poll')
+          assert(!/\bfetch\s*\(/.test(served.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')),
+            '送出的副本里没有任何 fetch —— iframe 发的请求会被 DSH 拒掉，通道只能是 postMessage')
+          assert(served.includes('postMessage'), '送出的副本用 postMessage 与面板通信')
         }
         const list = await fetch(`http://127.0.0.1:${COMFY_PORT}/extensions`, { signal: AbortSignal.timeout(10000) })
           .then((r) => r.json()).catch(() => null)
@@ -168,7 +174,7 @@ async function main() {
     assert(uninstall.reason === 'ok', `卸载干净（${uninstall.detail}）`)
     assert(uninstall.removed.length === 2, '删除了 2 个已登记文件')
     assert(uninstall.pruned.length >= 2, '并回收了它自己创建的目录')
-    if (serve) {
+    if (serve && startedByUs) {
       // ComfyUI imports the package at boot, so Python leaves byte code behind
       // unless the uninstall takes it too.
       assert(uninstall.derived.length === 1, `ComfyUI 生成的 __pycache__ 字节码也一并清掉（${uninstall.derived.length} 个）`)

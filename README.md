@@ -335,13 +335,16 @@ node tests/test-workflow-library.mjs  # 252 条断言（工作流库、6 套模�
 node tests/test-imagegen.mjs          # 187 条断言（10 个工具 + REST + 真实 Python 后处理）
 node tests/test-extension.mjs         # 144 条断言（桥接：备份/清单/卸载/令牌/中继/零残留/真跑扩展）
 node tests/test-render-imagegen.mjs   # 158 条断言（客户端面板渲染，含三态窗口判定、浮窗几何补丁与画布中继）
-node tests/test-imagegen-live.mjs          # 真实 SD WebUI 端到端（后端没起时自动跳过）
-node tests/test-imagegen-live-comfy.mjs    # 真实 ComfyUI 端到端，含真跑内置模板（没起时跳过）
-node tests/test-extension-live.mjs         # 真实 ComfyUI 安装→卸载→零残留
-node tests/test-extension-live.mjs --serve # 再启动 ComfyUI，验证它真的把扩展 serve 出来
+node tests/test-imagegen-live.mjs          # 29 条断言：真实 SD WebUI 端到端（后端没起时自动跳过）
+node tests/test-imagegen-live-comfy.mjs    # 23 条断言：真实 ComfyUI 端到端，含真跑内置模板（没起时跳过）
+node tests/test-extension-live.mjs         # 17 条断言：真实 ComfyUI 安装→卸载→零残留
+node tests/test-extension-live.mjs --serve # 25 条断言：先安装、再自己启动 ComfyUI，
+                                           #   验证它真的把扩展 serve 出来（要 ComfyUI 先关着）
 node --check lib/client.js
 node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"   # 技能 frontmatter / 行尾校验
 ```
+
+后端都起着时总计 **880 条断言**（803 离线 + 29 SD WebUI + 23 ComfyUI + 25 桥接实时）。
 
 - **离线套件**用两个真实 HTTP 服务冒充 A1111 与 ComfyUI（覆盖 `/sdapi/v1/*`、`/controlnet/model_list`、
   `/tagger/v1/*`、`/prompt`、`/history`、`/view`），并用**真实的秋叶 Python** 跑抠图与放大，
@@ -358,6 +361,8 @@ node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"  
 - **实时套件**驱动真正安装的 SD WebUI / ComfyUI：真实出图、真实 rembg 抠图、真实 R-ESRGAN 放大、
   真实 ControlNet 引导，并断言产物真的落在 Godot 项目的 `assets/generated/<品类>/` 且带 `res://` 路径；
   桥接的实时套件则真的写进 `D:\AKI open\ComfyUI-aki-v2`，再真的卸干净并全树扫描确认无残片。
+  `--serve` 只有在"先安装、再由它启动 ComfyUI"的顺序下才能验证「ComfyUI 把扩展 serve 出来」——
+  它会自己启动、自己关掉；发现 ComfyUI 已经开着时**跳过**这两项并说明原因，而不是假装失败或假装通过。
 
 ## 11. 已知限制
 
