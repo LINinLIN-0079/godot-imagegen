@@ -27,6 +27,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
+import { runInNewContext } from 'node:vm'
 import * as plugin from '../godot-imagegen.ts'
 
 let failures = 0
@@ -152,6 +153,19 @@ async function main() {
   assert(!/\brequire\s*\(/.test(sourceJs), 'the extension uses no require()')
   assert(!/<[A-Za-z][^>]*>/.test(sourceJs.replace(/<[^>]*\.js>/g, '')), 'the extension contains no JSX')
   assert(sourceJs.includes('loadGraphData'), 'the extension loads a graph through app.loadGraphData')
+  // The transport. This is the assertion that keeps someone from "simplifying"
+  // the bridge back into an HTTP poll: DSH refuses every request from a frame
+  // whose origin is not the carrier origin, so a fetch from inside the ComfyUI
+  // iframe is answered 403 before routing, and CORS headers cannot change that.
+  // Comments are stripped first, so the rule is checked against code, not prose.
+  const sourceCode = sourceJs.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  assert(!/\bfetch\s*\(/.test(sourceCode), 'the extension never calls fetch — DSH refuses any request from a non-carrier frame')
+  assert(!/XMLHttpRequest|WebSocket/.test(sourceCode), 'and no XHR/WebSocket either (the same rule covers upgrades)')
+  assert(/addEventListener\(\s*'message'/.test(sourceCode), 'it listens for postMessage from the DSH page')
+  assert(/postMessage\(/.test(sourceCode), 'and answers the same way')
+  assert(/event\.origin !== DSH_ORIGIN/.test(sourceCode), 'it only accepts messages from the origin it was installed for')
+  assert(/data\.__gig !== TOKEN/.test(sourceCode), 'and only messages stamped with the token this install generated')
+  assert(sourceCode.includes("'canvas.load'") && sourceCode.includes("'canvas.result'"), 'it understands the load command and reports the result')
 
   // ── the fake ComfyUI install ──────────────────────────────────────────────
   const comfyRoot = join(workRoot, 'ComfyUI-aki-v2')
@@ -353,7 +367,90 @@ async function main() {
   const noApp = await missingComfy.install()
   assert(noApp.ok === false && /ComfyUI 安装目录不存在/.test(noApp.detail), 'install refuses when the ComfyUI install is not where the config says it is')
 
-  // ── J: the plugin-level bridge (routes + tools) ───────────────────────────
+  // ── J: run the INSTALLED extension and drive it ───────────────────────────
+  //
+  // The file that lands in the user's ComfyUI is the one that matters, and its
+  // message handling is pure logic — so it is executed here in a real VM with a
+  // fake window and a fake ComfyUI app. That catches "the extension never calls
+  // loadGraphData", "it answers the wrong window" and "a stale token slips
+  // through" without a browser.
+  const runtimeRoot = join(workRoot, 'ComfyUI-vm')
+  await mkdir(join(runtimeRoot, 'ComfyUI', 'custom_nodes'), { recursive: true })
+  const runtimeManager = plugin.createExtensionManager({ ...cfg, comfyRoot: runtimeRoot, dataRoot: join(workRoot, 'data-vm') })
+  await runtimeManager.install('http://127.0.0.1:43120')
+  const runtimeToken = JSON.parse(await readFile(join(workRoot, 'data-vm', 'installed-files.json'), 'utf8')).token
+  const runtimeScript = await readFile(join(runtimeManager.targetDir, 'web', 'godot-imagegen-bridge.js'), 'utf8')
+
+  function loadCanvasRuntime(script, { throwOnLoad = false } = {}) {
+    const listeners = []
+    const posted = []
+    const loaded = []
+    const app = {
+      graph: { _nodes: [{ type: 'KSampler' }, { type: 'CLIPTextEncode' }, { type: 'KSampler' }] },
+      workflowManager: { activeWorkflow: { name: 'item-icon' } },
+      registerExtension() {},
+      loadGraphData(graph) {
+        if (throwOnLoad) throw new Error('loadGraphData 炸了')
+        loaded.push(graph)
+      },
+    }
+    const parent = { postMessage: (message, origin) => posted.push({ message, origin }) }
+    const win = {
+      parent,
+      app,
+      addEventListener(type, fn) { if (type === 'message') listeners.push(fn) },
+    }
+    win.window = win
+    runInNewContext(script, { window: win, console, setInterval, clearInterval })
+    return { listeners, posted, loaded, parent, win }
+  }
+  const deliver = (runtime, event) => { for (const fn of runtime.listeners) fn(event) }
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 400))
+
+  {
+    const runtime = loadCanvasRuntime(runtimeScript)
+    await settle()
+    const ready = runtime.posted.find((p) => p.message.type === 'canvas.ready')
+    assert(ready !== undefined, 'the installed extension announces itself with a canvas.ready envelope')
+    assert(ready.origin === 'http://127.0.0.1:43120', 'and pins that announcement to the origin it was installed for')
+    assert(ready.message.state.nodeCount === 3, 'reporting the graph it can see')
+
+    const before = runtime.posted.length
+    deliver(runtime, { origin: 'http://127.0.0.1:8188', data: { __gig: runtimeToken, type: 'canvas.load', seq: 's1', graph: { nodes: [] } }, source: runtime.parent })
+    deliver(runtime, { origin: 'http://127.0.0.1:43120', data: { __gig: 'wrong-token', type: 'canvas.load', seq: 's2', graph: { nodes: [] } }, source: runtime.parent })
+    deliver(runtime, { origin: 'http://127.0.0.1:43120', data: { type: 'canvas.load', seq: 's3', graph: { nodes: [] } }, source: runtime.parent })
+    deliver(runtime, { origin: 'http://127.0.0.1:43120', data: 'not-an-envelope', source: runtime.parent })
+    await settle()
+    assert(runtime.loaded.length === 0, 'a message from the wrong origin, a wrong token, no token, or a junk payload loads nothing')
+    assert(runtime.posted.length === before, 'and provokes no reply at all')
+
+    deliver(runtime, { origin: 'http://127.0.0.1:43120', data: { __gig: runtimeToken, type: 'canvas.ping' }, source: runtime.parent })
+    await settle()
+    const state = runtime.posted[runtime.posted.length - 1].message
+    assert(state.type === 'canvas.state' && state.state.nodeCount === 3, 'a ping is answered with the canvas state')
+    assert(state.state.missingClasses.length === 0, 'with no missing node classes for a healthy graph')
+
+    const graph = { nodes: [{ id: 1, type: 'KSampler' }], links: [] }
+    deliver(runtime, { origin: 'http://127.0.0.1:43120', data: { __gig: runtimeToken, type: 'canvas.load', seq: 'seq-9', graph }, source: runtime.parent })
+    await settle()
+    assert(runtime.loaded.length === 1 && runtime.loaded[0] === graph, 'a properly stamped load really reaches app.loadGraphData')
+    const result = runtime.posted[runtime.posted.length - 1].message
+    assert(result.type === 'canvas.result' && result.seq === 'seq-9' && result.ok === true, 'and the canvas reports the outcome with the seq it was given')
+    assert(result.state.title === 'item-icon', 'including which workflow is now open')
+  }
+
+  {
+    // A canvas that refuses the graph must say so — the host records it instead of
+    // retrying forever behind the user's back.
+    const runtime = loadCanvasRuntime(runtimeScript, { throwOnLoad: true })
+    await settle()
+    deliver(runtime, { origin: 'http://127.0.0.1:43120', data: { __gig: runtimeToken, type: 'canvas.load', seq: 'seq-bad', graph: { nodes: [] } }, source: runtime.parent })
+    await settle()
+    const result = runtime.posted[runtime.posted.length - 1].message
+    assert(result.type === 'canvas.result' && result.ok === false && /loadGraphData 炸了/.test(result.error), 'a graph the canvas refuses is reported as a failure with the reason')
+  }
+
+  // ── K: the plugin-level bridge (routes + tools) ────────────────────────────
   const comfyRoot2 = join(workRoot, 'ComfyUI-live')
   await mkdir(join(comfyRoot2, 'ComfyUI', 'custom_nodes'), { recursive: true })
   const dataRoot7 = join(workRoot, 'data7')
@@ -379,18 +476,11 @@ async function main() {
   const bridgeStatus0 = unwrap(await exec(workshopTool, { action: 'bridge-status' }))
   assert(bridgeStatus0.bridge.installed === false && bridgeStatus0.bridge.canvasOnline === false, 'image_workshop action=bridge-status mirrors that')
 
-  // The poll route must refuse a caller without the right token.
-  const wrongToken = await callRoute(webServer, 'POST', '/gig/bridge/poll', { token: 'not-the-token', state: { nodeCount: 3 } })
-  assert(wrongToken.status === 403, 'POST /gig/bridge/poll rejects a wrong token with 403')
-  assert(wrongToken.headers['access-control-allow-origin'] === '*', 'and still answers with CORS headers, so the extension can read the status')
-  const noToken = await callRoute(webServer, 'POST', '/gig/bridge/poll', { state: { nodeCount: 3 } })
-  assert(noToken.status === 403 && /画布桥接未安装/.test(noToken.body.error), 'and a poll before any install explains that nothing is installed')
-
-  // Browsers preflight this call because of the JSON content-type.
-  const preflight = await callRoute(webServer, 'OPTIONS', '/gig/bridge/poll', undefined, { raw: true })
-  assert(preflight.status === 204, 'OPTIONS /gig/bridge/poll is answered with 204')
-  assert(preflight.headers['access-control-allow-origin'] === '*', 'the preflight allows the ComfyUI origin')
-  assert(/content-type/.test(preflight.headers['access-control-allow-headers'] ?? ''), 'and allows the content-type header the extension sends')
+  // There must be no cross-origin HTTP entry point at all: DSH Desktop refuses
+  // any request from a frame whose origin is not the carrier origin, so such a
+  // route could never be reached from inside the ComfyUI iframe.
+  const deadPoll = await callRoute(webServer, 'POST', '/gig/bridge/poll', { token: 'x' })
+  assert(deadPoll.status === 404, 'no /gig/bridge/poll route exists — the bridge never talks to the host from the iframe')
 
   const installRoute = await callRoute(webServer, 'POST', '/gig/extension/install', { origin: 'http://127.0.0.1:43120' })
   assert(installRoute.status === 200 && installRoute.body.ok === true, 'POST /gig/extension/install installs the bridge')
@@ -402,18 +492,27 @@ async function main() {
   assert(extAfter.body.installed === true && extAfter.body.files === 2, 'GET /gig/extension now reports the install')
   assert(extAfter.body.canvas.online === false, 'while the canvas is still not connected')
 
-  // A canvas answering on ComfyUI's origin, exactly as the extension does.
-  const poll = await callRoute(webServer, 'POST', '/gig/bridge/poll', {
-    token: liveManifest.token,
-    state: { nodeCount: 7, classes: ['CheckpointLoaderSimple', 'KSampler'], missingClasses: [], title: 'item-icon' },
-    ack: [],
+  // The relay: the panel reports what the canvas said, stamped with the token the
+  // install generated. This is the only path canvas state takes.
+  const noTokenInbound = await callRoute(webServer, 'POST', '/gig/canvas/inbound', {
+    messages: [{ __gig: 'not-the-token', type: 'canvas.state', state: { nodeCount: 3 } }],
   })
-  assert(poll.status === 200 && Array.isArray(poll.body.commands), 'a poll with the right token is answered with a command array')
-  assert(poll.body.commands.length === 0, 'and there is nothing queued yet')
+  assert(noTokenInbound.status === 200 && noTokenInbound.body.accepted === 0, 'an inbound message with the wrong token is refused')
+  assert(/令牌不匹配/.test(noTokenInbound.body.rejected.join(' ')), 'and the refusal names the reason (a stale install)')
+
+  const inbound = await callRoute(webServer, 'POST', '/gig/canvas/inbound', {
+    messages: [{
+      __gig: liveManifest.token,
+      type: 'canvas.ready',
+      state: { nodeCount: 7, classes: ['CheckpointLoaderSimple', 'KSampler'], missingClasses: [], title: 'item-icon' },
+    }],
+  })
+  assert(inbound.status === 200 && inbound.body.accepted === 1, 'a message stamped with the install token is accepted')
+  assert(inbound.body.canvas.online === true, 'and the canvas now counts as connected')
 
   const extConnected = await callRoute(webServer, 'GET', '/gig/extension')
-  assert(extConnected.body.canvas.online === true, 'the canvas now counts as connected')
-  assert(extConnected.body.canvas.nodeCount === 7 && extConnected.body.canvas.classes.length === 2, 'and its reported graph is visible to the host')
+  assert(extConnected.body.canvas.online === true, 'GET /gig/extension shows the canvas as connected')
+  assert(extConnected.body.canvas.nodeCount === 7 && extConnected.body.canvas.classes.length === 2, 'with the graph it reported')
   assert(extConnected.body.canvas.title === 'item-icon', 'including which workflow is open')
 
   const readCanvas = unwrap(await exec(workshopTool, { action: 'read-canvas' }))
@@ -424,27 +523,52 @@ async function main() {
   // A workflow opened on a connected canvas must reach ComfyUI, not only the panel.
   const opened = unwrap(await exec(workflowTool, { action: 'open', id: 'item-icon' }))
   assert(opened.canvas === true && /已直接推送到内嵌 ComfyUI 画布/.test(opened.canvasDetail), 'image_workflow action=open pushes the graph to the connected canvas')
-  const poll2 = await callRoute(webServer, 'POST', '/gig/bridge/poll', { token: liveManifest.token, state: { nodeCount: 7 }, ack: [] })
-  const loadCommand = poll2.body.commands.find((c) => c.kind === 'workflow.load')
-  assert(loadCommand !== undefined, 'the canvas poll receives a workflow.load command')
-  assert(loadCommand.payload.graph.nodes.length > 0, 'carrying the whole graph')
-  assert(typeof loadCommand.id === 'string' && loadCommand.label !== '', 'with an id to acknowledge and a human label')
 
-  const acked = await callRoute(webServer, 'POST', '/gig/bridge/poll', { token: liveManifest.token, state: { nodeCount: 7 }, ack: [loadCommand.id] })
-  assert(acked.body.commands.length === 0, 'acknowledging the command clears it, so the graph is not pushed twice')
+  const poll2 = await callRoute(webServer, 'POST', '/gig/ui/poll', {})
+  const relay = (poll2.body.canvasMessages || []).find((m) => m.type === 'canvas.load')
+  assert(relay !== undefined, 'the panel poll carries the canvas instruction to relay into the iframe')
+  assert(relay.__gig === liveManifest.token, 'stamped with the install token, so the extension can tell it is from its own host')
+  assert(relay.graph.nodes.length > 0, 'carrying the whole graph')
+  assert(typeof relay.seq === 'string' && typeof relay.label === 'string', 'with a seq to acknowledge and a human label')
+
+  // Relaying it again while the canvas has not answered yet is deliberate: the
+  // command stays queued until the canvas says what happened.
+  const poll2b = await callRoute(webServer, 'POST', '/gig/ui/poll', {})
+  assert((poll2b.body.canvasMessages || []).some((m) => m.seq === relay.seq), 'an unacknowledged instruction keeps being offered to the panel')
+
+  const result = await callRoute(webServer, 'POST', '/gig/canvas/inbound', {
+    messages: [{ __gig: liveManifest.token, type: 'canvas.result', seq: relay.seq, ok: true, state: { nodeCount: 7, title: 'item-icon' } }],
+  })
+  assert(result.body.accepted === 1, 'the canvas reporting success is accepted')
+  const poll3 = await callRoute(webServer, 'POST', '/gig/ui/poll', {})
+  assert(!(poll3.body.canvasMessages || []).some((m) => m.seq === relay.seq), 'acknowledging clears it, so the graph is not pushed twice')
+
+  // A refused graph must be visible to the agent, not silently retried forever.
+  const failedRelay = await callRoute(webServer, 'POST', '/gig/canvas/load', { id: 'item-icon' })
+  assert(failedRelay.status === 200, 'POST /gig/canvas/load queues a workflow for the canvas')
+  const poll4 = await callRoute(webServer, 'POST', '/gig/ui/poll', {})
+  const secondEnvelope = (poll4.body.canvasMessages || [])[0]
+  await callRoute(webServer, 'POST', '/gig/canvas/inbound', {
+    messages: [{ __gig: liveManifest.token, type: 'canvas.result', seq: secondEnvelope.seq, ok: false, error: 'loadGraphData 炸了' }],
+  })
+  const extErrors = await callRoute(webServer, 'GET', '/gig/extension')
+  assert(extErrors.body.errors.length === 1 && /loadGraphData 炸了/.test(extErrors.body.errors[0].error), 'a canvas load failure is recorded where the agent can read it')
 
   // The panel queue and the canvas queue must stay independent.
   const panelQueue = await callRoute(webServer, 'GET', '/gig/ui/queue')
-  assert(panelQueue.body.commands.some((c) => c.kind === 'workflow.load'), 'the panel queue still holds its own copy for the panel')
-  assert(panelQueue.body.state === null, 'and the canvas polls never marked the panel as having reported state')
+  assert(panelQueue.body.commands.some((c) => c.kind === 'workflow.load'), 'the panel queue holds its own copy for the panel')
+  assert(panelQueue.body.status.online === true, 'and tracks the panel on its own clock')
+  assert(panelQueue.body.state !== null && panelQueue.body.state.canvas === undefined, 'canvas traffic is never written into the panel\'s own state report')
 
   const bridgeInstallTool = unwrap(await exec(workshopTool, { action: 'install-bridge', origin: 'http://127.0.0.1:43121' }))
   assert(bridgeInstallTool.bridge.installed === true, 'image_workshop action=install-bridge installs through the tool surface')
   const manifestAfterTool = await readJson(join(dataRoot7, 'installed-files.json'))
   assert(manifestAfterTool.origin === 'http://127.0.0.1:43121', 'honouring the origin passed to the tool')
   assert(manifestAfterTool.token === liveManifest.token, 'and keeping the same token')
-  const staleTokenPoll = await callRoute(webServer, 'POST', '/gig/bridge/poll', { token: liveManifest.token, state: {} })
-  assert(staleTokenPoll.status === 200, 'the previously issued token still works, because the token is reused')
+  const stillWorks = await callRoute(webServer, 'POST', '/gig/canvas/inbound', {
+    messages: [{ __gig: liveManifest.token, type: 'canvas.state', state: { nodeCount: 5 } }],
+  })
+  assert(stillWorks.body.accepted === 1, 'the previously issued token still works, because the token is reused')
   const bridgeInstallNoOrigin = unwrap(await exec(workshopTool, { action: 'install-bridge' }))
   assert(bridgeInstallNoOrigin.bridge.installed === true, 'installing again without an origin keeps the install working')
   const manifestNoHint = await readJson(join(dataRoot7, 'installed-files.json'))
@@ -456,6 +580,16 @@ async function main() {
   assert(uninstallTool.bridge.removed === 2, 'and reports how many files it deleted')
   const uninstallAgain = unwrap(await exec(workshopTool, { action: 'uninstall-bridge' }))
   assert(uninstallAgain.bridge.installed === false && /本来就没有装过/.test(uninstallAgain.note), 'uninstalling again is a no-op with an explanation, not an error')
+
+  // After an uninstall the token is gone, so nothing can be relayed any more.
+  const afterUninstall = await callRoute(webServer, 'POST', '/gig/canvas/inbound', {
+    messages: [{ __gig: liveManifest.token, type: 'canvas.state', state: { nodeCount: 5 } }],
+  })
+  assert(afterUninstall.body.accepted === 0 && afterUninstall.body.rejected.length === 1, 'once uninstalled, no canvas message is accepted')
+
+  // ── L: the panel-side relay helpers are covered by the client render suite ──
+  // (relayToCanvas / isCanvasMessage live in lib/client.js, which only runs in a
+  // browser-shaped environment; tests/test-render-imagegen.mjs exercises them.)
 
   // The mock tools are reached through the registry only; this asserts the
   // plugin did not register anything under a name that shadows the real surface.

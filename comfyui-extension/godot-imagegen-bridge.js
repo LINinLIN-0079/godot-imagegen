@@ -6,27 +6,41 @@
  * result into the ComfyUI install:
  *
  *   __DSH_ORIGIN__  the DeepSeek Harness web origin (e.g. http://127.0.0.1:43120)
- *   __TOKEN__       a per-install secret, so no other local page can drive the canvas
+ *   __TOKEN__       a per-install secret, so a stray page cannot drive the canvas
  *
- * What it does: long-polls the DSH host on the poll interval and, when the host
- * has an instruction, either loads a workflow onto the canvas with
- * `app.loadGraphData` or applies a patch. It also reports the canvas back up, so
- * the agent can see what the user is actually working on rather than guessing.
+ * ── Why this talks over postMessage and NOT over HTTP ─────────────────────────
  *
- * Why there are no imports: ComfyUI's own extensions commonly do
- * `import { app } from "../../scripts/app.js"`, but that path only exists in some
- * frontend builds. Waiting for the app object instead works on every build and
- * does not depend on how the frontend chose to load this file (module or classic
- * script).
+ * The obvious design — this extension long-polls the DSH host on an HTTP route —
+ * DOES NOT WORK, and the reason is worth recording so nobody "simplifies" it back:
+ *
+ * DSH Desktop attaches a per-generation capability header to the Electron
+ * renderer's traffic, and its web server refuses any request that does not carry
+ * it. The header is attached only when `details.frame.origin` is the carrier
+ * origin (see `requestComesFromRendererOrigin`). This page runs on ComfyUI's own
+ * origin inside an iframe, so the header is deliberately NOT attached and every
+ * request it makes to the DSH origin is answered 403 "forbidden" — the capability
+ * must never travel away from the local carrier. CORS headers cannot help: the
+ * request is rejected before routing, and the same rule covers WebSocket upgrades.
+ *
+ * postMessage is the channel that DOES work: the parent frame is the DSH page
+ * itself, which already holds the capability. So the DSH panel relays for us —
+ * it hands commands down and carries our canvas report back up.
+ *
+ *  美术工坊 panel (DSH origin)  ──postMessage──►  this extension (ComfyUI origin)
+ *                               ◄──postMessage──
+ *
+ * ── Why there are no imports ─────────────────────────────────────────────────
+ *
+ * ComfyUI's own extensions commonly do `import { app } from "../../scripts/app.js"`,
+ * but that path only exists in some frontend builds. Waiting for the app object
+ * instead works on every build and does not depend on how the frontend chose to
+ * load this file (module or classic script).
  */
 (function () {
   'use strict'
 
   var DSH_ORIGIN = '__DSH_ORIGIN__'
   var TOKEN = '__TOKEN__'
-  var POLL_MS = 1500
-  /** After this many consecutive failures, back off instead of hammering. */
-  var MAX_ERRORS = 8
 
   /** The ComfyUI app object, whichever way this frontend build exposes it. */
   function findApp() {
@@ -79,8 +93,9 @@
     }
     var title = ''
     try {
-      if (app.workflowManager && typeof app.workflowManager.activeWorkflow === 'object' && app.workflowManager.activeWorkflow) {
-        title = String(app.workflowManager.activeWorkflow.name || '')
+      var manager = app.workflowManager
+      if (manager && typeof manager.activeWorkflow === 'object' && manager.activeWorkflow) {
+        title = String(manager.activeWorkflow.name || '')
       }
     } catch (e) { /* older builds */ }
     return {
@@ -91,18 +106,6 @@
     }
   }
 
-  /** Ask the host for instructions; report the canvas state on the way up. */
-  function poll(state, ack) {
-    return fetch(DSH_ORIGIN + '/gig/bridge/poll', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: TOKEN, state: state, ack: ack || [] }),
-    }).then(function (response) {
-      if (!response.ok) throw new Error('HTTP ' + response.status)
-      return response.json()
-    })
-  }
-
   /** Put a UI-format workflow on the canvas. */
   function loadGraph(graph) {
     var app = findApp()
@@ -111,55 +114,60 @@
     return app.loadGraphData(graph)
   }
 
-  function start(app) {
-    // Bookkeeping only: registering makes this extension visible in the
-    // extension list on builds that track it. The polling below does not depend
-    // on it.
+  /** Answer the parent frame, always pinned to the origin we were installed for. */
+  function reply(source, message) {
+    if (!source || typeof source.postMessage !== 'function') return
     try {
-      if (typeof app.registerExtension === 'function') {
+      source.postMessage(message, DSH_ORIGIN)
+    } catch (e) { /* the panel may have navigated away */ }
+  }
+
+  var ready = waitForApp(60000)
+
+  ready.then(function (app) {
+    // Announce once the canvas exists, so the panel learns it is live without
+    // waiting for its next relay round-trip.
+    reply(window.parent, { __gig: TOKEN, type: 'canvas.ready', state: summarizeGraph() })
+    if (!app) console.warn('[godot-imagegen] 等不到 ComfyUI app 对象，bridge 仍会等待指令')
+    else console.info('[godot-imagegen] bridge 已就绪，宿主：' + DSH_ORIGIN)
+  })
+
+  window.addEventListener('message', function (event) {
+    // Two independent gates: the message must come from the DSH page, and it must
+    // carry the token THIS install was generated with. A stale copy in another
+    // ComfyUI install therefore cannot be driven by this host.
+    if (event.origin !== DSH_ORIGIN) return
+    var data = event.data
+    if (!data || typeof data !== 'object' || data.__gig !== TOKEN) return
+
+    if (data.type === 'canvas.ping') {
+      reply(event.source, { __gig: TOKEN, type: 'canvas.state', state: summarizeGraph() })
+      return
+    }
+
+    if (data.type !== 'canvas.load' || !data.graph) return
+
+    ready.then(function () {
+      try {
+        loadGraph(data.graph)
+        reply(event.source, { __gig: TOKEN, type: 'canvas.result', seq: data.seq, ok: true, state: summarizeGraph() })
+      } catch (error) {
+        // Report the failure instead of swallowing it: the agent needs to know
+        // the canvas refused the graph.
+        var message = error && error.message ? error.message : String(error)
+        console.warn('[godot-imagegen] 载入工作流失败', message)
+        reply(event.source, { __gig: TOKEN, type: 'canvas.result', seq: data.seq, ok: false, error: message, state: summarizeGraph() })
+      }
+    })
+  })
+
+  // Bookkeeping only: registering makes this extension visible in the extension
+  // list on builds that track it. The relay above does not depend on it.
+  ready.then(function (app) {
+    try {
+      if (app && typeof app.registerExtension === 'function') {
         app.registerExtension({ name: 'godot-imagegen.bridge', setup: function () {} })
       }
     } catch (e) { /* ignore */ }
-
-    var errors = 0
-    var pendingAck = []
-
-    function tick() {
-      var state = summarizeGraph()
-      var ack = pendingAck
-      pendingAck = []
-      poll(state, ack).then(function (result) {
-        errors = 0
-        var commands = (result && result.commands) || []
-        for (var i = 0; i < commands.length; i++) {
-          var command = commands[i]
-          try {
-            if (command.kind === 'workflow.load' && command.payload && command.payload.graph) {
-              loadGraph(command.payload.graph)
-            }
-          } catch (e) {
-            // Report the failure instead of swallowing it: the agent needs to
-            // know the canvas refused the graph.
-            console.warn('[godot-imagegen] 载入工作流失败', e)
-          }
-          pendingAck.push(command.id)
-        }
-      }).catch(function () {
-        errors += 1
-      })
-      var delay = errors > MAX_ERRORS ? Math.min(POLL_MS * 8, POLL_MS * errors) : POLL_MS
-      setTimeout(tick, delay)
-    }
-
-    console.info('[godot-imagegen] bridge 已启动，宿主：' + DSH_ORIGIN)
-    tick()
-  }
-
-  waitForApp(60000).then(function (app) {
-    if (!app) {
-      console.warn('[godot-imagegen] 等不到 ComfyUI app 对象，bridge 未启动')
-      return
-    }
-    start(app)
   })
 })()

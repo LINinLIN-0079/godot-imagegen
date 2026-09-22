@@ -5568,7 +5568,7 @@ function registerImageTools(
 
   tools.register({
     name: 'image_workshop',
-    description: 'Drive the 美术工坊 (Art Studio) panel and its embedded ComfyUI canvas from the conversation, so the user does not have to retype what you already decided. action="fill-form" puts a prompt and parameters into the panel\'s form; "focus" brings a section forward; "select-image" highlights a produced image; "toast" shows a note in the panel; "read-state" returns what the user is currently looking at (their unsaved form, selected image, loaded workflow, canvas); "status" reports whether a panel is connected and how deep the queue is. For the embedded canvas: "bridge-status" reports whether the ComfyUI web-extension bridge is installed and whether a canvas is answering; "install-bridge" installs it (this writes into the ComfyUI install — back up first, and ComfyUI must be restarted for it to load); "uninstall-bridge" removes exactly the files it installed; "read-canvas" reports the node classes the canvas is actually showing. Instructions are delivered on the next poll (about 1.5s) and only while the panel is open — "status"/"read-state" tell you whether it is.',
+    description: 'Drive the 美术工坊 (Art Studio) panel and its embedded ComfyUI canvas from the conversation, so the user does not have to retype what you already decided. action="fill-form" puts a prompt and parameters into the panel\'s form; "focus" brings a section forward; "select-image" highlights a produced image; "toast" shows a note in the panel; "read-state" returns what the user is currently looking at (their unsaved form, selected image, loaded workflow, canvas); "status" reports whether a panel is connected and how deep the queue is. For the embedded canvas: "bridge-status" reports whether the ComfyUI web-extension bridge is installed and whether a canvas is answering; "install-bridge" installs it (the install backs the target up first; ComfyUI must be restarted for it to load); "uninstall-bridge" removes exactly the files it installed; "read-canvas" reports the node classes the canvas is actually showing. Instructions are delivered on the next poll (about 1.5s) and only while the panel is open — "status"/"read-state" tell you whether it is. The canvas is reached THROUGH the open panel (it is the only route into the ComfyUI iframe), so a closed panel means canvas instructions wait in the queue.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -5761,7 +5761,7 @@ function registerImageTools(
               ...(result.backupDir === undefined ? {} : { backupDir: result.backupDir }),
               restartRequired: result.restartRequired,
             }),
-            note: '这一版扩展已写入 ComfyUI 的 custom_nodes。重启 ComfyUI 后，美术工坊的「画布」就能与对话互通。',
+            note: '这一版扩展已写入 ComfyUI 的 custom_nodes。重启 ComfyUI 后，美术工坊的「画布」就能与对话互通（面板必须开着——它是唯一的通道）。',
           }
         }
 
@@ -5964,6 +5964,10 @@ export function apply(ctx: Context, config: unknown): void {
   // purpose: the panel and the canvas come and go on their own schedules, and
   // one being offline must never mark the other unreachable.
   const canvasQueue = createUiQueue()
+  // Why the canvas refused the last graphs. Kept in memory only, like the
+  // queues: the agent needs to see "app.loadGraphData threw" instead of silently
+  // retrying a graph that will never load.
+  const canvasErrors: Array<{ at: string; seq: string; error: string }> = []
 
   /**
    * The node layouts that let a workflow's widgets be addressed by name.
@@ -6060,7 +6064,10 @@ export function apply(ctx: Context, config: unknown): void {
         }
 
         // The panel's single round-trip: it reports what it is doing and takes
-        // away the instructions the agent queued for it.
+        // away the instructions the agent queued for it. The same response also
+        // carries the canvas envelopes, because the panel is the ONLY route into
+        // the ComfyUI iframe (see the relay routes below) — one round-trip keeps
+        // the relay and the panel's own poll in lockstep.
         if (method === 'POST' && pathname === '/gig/ui/poll') {
           const body = await readJsonBody(req)
           if (Array.isArray(body.ack)) {
@@ -6072,7 +6079,23 @@ export function apply(ctx: Context, config: unknown): void {
             // A poll with no state still counts as "the panel is alive".
             uiQueue.report(uiQueue.state() ?? {})
           }
-          sendJson(res, 200, { commands: uiQueue.pending(), status: uiQueue.status() })
+          const canvasToken = await extension.currentToken()
+          const canvasMessages = canvasToken === undefined
+            ? []
+            : canvasQueue.pending().map((command) => ({
+              __gig: canvasToken,
+              type: 'canvas.load',
+              seq: command.id,
+              label: command.label,
+              graph: command.payload.graph,
+            }))
+          sendJson(res, 200, {
+            commands: uiQueue.pending(),
+            status: uiQueue.status(),
+            canvasMessages,
+            canvasStatus: canvasQueue.status(),
+            canvasErrors,
+          })
           return
         }
 
@@ -6081,53 +6104,49 @@ export function apply(ctx: Context, config: unknown): void {
           return
         }
 
-        // ── ComfyUI canvas bridge ─────────────────────────────────────────
+        // ── ComfyUI canvas relay ──────────────────────────────────────────
         //
-        // The bridge extension runs on ComfyUI's OWN origin (127.0.0.1:8188)
-        // and calls back here cross-origin, so this is the one route whose
-        // responses carry CORS headers. It is gated by a per-install token that
-        // is baked into the installed file, so a stray local page cannot drive
-        // the canvas even though the origin is wildcarded.
-        if (pathname === '/gig/bridge/poll') {
-          const cors: Record<string, string> = {
-            'access-control-allow-origin': '*',
-            'access-control-allow-headers': 'content-type',
-            'access-control-allow-methods': 'POST, OPTIONS',
-            'access-control-max-age': '600',
+        // The panel cannot reach into the ComfyUI iframe and the iframe cannot
+        // reach this host: DSH Desktop attaches its renderer capability only to
+        // requests whose frame origin is the carrier origin, so a cross-origin
+        // subframe is refused before routing (403) and CORS cannot help. The DSH
+        // page is therefore the relay — it hands our stamped envelopes down with
+        // postMessage and carries the canvas's replies back up. These two routes
+        // are that relay's same-origin ends.
+        if (method === 'POST' && pathname === '/gig/canvas/inbound') {
+          const body = await readJsonBody(req)
+          const token = await extension.currentToken()
+          const raw = Array.isArray(body.messages) ? body.messages : []
+          const rejected: string[] = []
+          let accepted = 0
+          for (const entry of raw) {
+            if (token === undefined) { rejected.push('未安装画布桥接，却收到了画布消息'); break }
+            if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) { rejected.push('消息不是对象'); continue }
+            const envelope = entry as Record<string, unknown>
+            if (envelope.__gig !== token) { rejected.push('令牌不匹配（可能是旧安装的扩展）'); continue }
+            accepted += 1
+            if (envelope.type === 'canvas.load' || envelope.type === 'canvas.ping') continue
+            const state = envelope.state
+            if (state !== null && typeof state === 'object' && !Array.isArray(state)) {
+              canvasQueue.report({ canvas: state as PanelState['canvas'] })
+            } else {
+              canvasQueue.report(canvasQueue.state() ?? {})
+            }
+            // A load is only finished when the canvas says how it went; until
+            // then it stays queued so a canvas that appears later still gets it.
+            if (envelope.type === 'canvas.result' && typeof envelope.seq === 'string') {
+              canvasQueue.ack([envelope.seq])
+              if (envelope.ok !== true) {
+                canvasErrors.push({ at: new Date().toISOString(), seq: envelope.seq, error: String(envelope.error ?? '未知错误') })
+                if (canvasErrors.length > 10) canvasErrors.shift()
+              }
+            }
           }
-          const corsJson = (status: number, value: unknown): void => {
-            res.writeHead(status, { ...cors, 'content-type': 'application/json; charset=utf-8' })
-            res.end(JSON.stringify(value))
-          }
-          if (method === 'OPTIONS') {
-            res.writeHead(204, cors)
-            res.end()
-            return
-          }
-          if (method !== 'POST') {
-            corsJson(405, { error: 'method not allowed' })
-            return
-          }
-          const body = await readJsonBody(req).catch(() => ({} as Record<string, unknown>))
-          const expected = await extension.currentToken()
-          const token = typeof body.token === 'string' ? body.token : ''
-          if (expected === undefined || token === '' || token !== expected) {
-            corsJson(403, {
-              error: expected === undefined
-                ? '画布桥接未安装（没有已安装记录），扩展不应在轮询'
-                : 'bridge token 无效：宿主已重新生成令牌，请在美术工坊重新安装桥接扩展',
-            })
-            return
-          }
-          if (Array.isArray(body.ack)) {
-            canvasQueue.ack(body.ack.filter((id): id is string => typeof id === 'string'))
-          }
-          if (body.state !== null && typeof body.state === 'object' && !Array.isArray(body.state)) {
-            canvasQueue.report({ canvas: body.state as PanelState['canvas'] })
-          } else {
-            canvasQueue.report(canvasQueue.state() ?? {})
-          }
-          corsJson(200, { commands: canvasQueue.pending(), status: canvasQueue.status() })
+          sendJson(res, 200, {
+            accepted,
+            rejected,
+            canvas: { online: canvasQueue.online(), ...(canvasQueue.state()?.canvas ?? {}) },
+          })
           return
         }
 
@@ -6141,6 +6160,7 @@ export function apply(ctx: Context, config: unknown): void {
               lastPollSecondsAgo: canvasQueue.status().lastPollSecondsAgo,
               ...(reported ?? {}),
             },
+            errors: canvasErrors,
           })
           return
         }
@@ -6186,7 +6206,7 @@ export function apply(ctx: Context, config: unknown): void {
             queued: canvasQueue.status().pending,
             note: online
               ? `已把「${meta.name}」推到画布。`
-              : `画布还没连上：指令已排队，打开本页的「画布」后会自动载入。`,
+              : `画布还没应声：指令已排队，等它下一次上报（或重启 ComfyUI 后打开「画布」）就会载入。`,
           })
           return
         }

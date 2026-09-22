@@ -16,7 +16,7 @@
 | 层 | 内容 |
 | --- | --- |
 | 模型工具（10） | `image_backend_status` `image_generate` `image_edit` `image_variants` `image_upscale` `image_cutout` `image_interrogate` `image_gallery` `image_workflow` `image_workshop` |
-| REST（`/gig/*`） | 面板与宿主的同源通道：状态、图库、原图字节、生成/编辑/放大/抠图/反推任务、任务轮询与取消、后端启停、设置与预设、工作流库读写、面板指令轮询、**画布桥接安装/卸载与跨域轮询** |
+| REST（`/gig/*`） | 面板与宿主的同源通道：状态、图库、原图字节、生成/编辑/放大/抠图/反推任务、任务轮询与取消、后端启停、设置与预设、工作流库读写、面板指令与画布中继轮询、**画布桥接安装/卸载** |
 | 工作流库 | 插件本地（`$DSH_HOME/godot-imagegen/workflows/`，**从不写入你的 ComfyUI**）：6 套游戏美术模板 + 任意新建/改写；元数据写在文档自身的 `extra` 里 |
 | 画布桥接 | 随插件分发的 ComfyUI web 扩展（源码在仓库 `comfyui-extension/`），安装时把 **DSH origin + 一次性令牌** 烤进副本；装/卸都是一键，写入前必先备份 |
 | 对话驱动 | 代理可通过 `image_workflow` / `image_workshop` 改写工作流、把工作流直接推到 ComfyUI 画布、把提示词与参数填进面板、在面板里定位图片——你只需在对话里说 |
@@ -48,25 +48,52 @@
 
 ## 3. 画布桥接：对话直接改 ComfyUI 画布
 
-### 为什么需要它
+### 为什么需要它，以及为什么它走 postMessage 而不是 HTTP
 
 画布是 iframe，里面是**另一个源**（`127.0.0.1:8188`）的页面。浏览器不允许面板把手伸进 iframe 去点节点，
-面板里的 `fetch` 到 `:8188` 也会被 ComfyUI 的 `origin_only_middleware` 挡掉（它比对 host:port，
-DSH 源发来的请求一律 403）。而 iframe 本身是能用的——ComfyUI 不发 `X-Frame-Options`/CSP。
+所以唯一的通路是：**往 ComfyUI 里放一个属于它自己的 web 扩展**。
 
-所以唯一的通路是：**往 ComfyUI 里放一个属于它自己的 web 扩展**，让它从 ComfyUI 的源反向长轮询回 DSH。
+最直觉的做法——让扩展在 iframe 里 `fetch` 回 DSH 的 HTTP 路由——**在这台机器上不成立**，原因值得记下来，
+免得以后有人又"优化"回去：
+
+> DSH Desktop 会给 Electron 渲染进程的流量附加一枚**每代独有的能力头**
+> （`x-dsh-desktop-renderer`），其 Web 服务器会 403 掉任何没带这枚头的请求；
+> 而这枚头只在 `details.frame.origin === 载体 origin` 时附加
+> （见 `requestComesFromRendererOrigin`）。画布 iframe 的 frame origin 是 ComfyUI 的源，
+> 所以**头不会被附加**，它发给 DSH 的每一个请求都会在路由之前就被拒（403）。
+> 这是刻意的：能力不得离开本地载体。CORS 头救不了它——请求根本没走到路由；
+> WebSocket 升级受同一条规则约束。
+> （`dsh-desktop.mode: advanced` + `openBrowser: false` 下，普通浏览器访问本身就是关闭的，
+> 任何没有渲染器头的请求都会被拒。）
+
+**postMessage 才是能用的那条路**：父窗口就是 DSH 页面本身，它天生持有那枚能力头。
+于是面板充当**中继**——把指令递下去，把画布的状态捎上来：
 
 ```
- 对话 / 代理 ──image_workflow_open(to_canvas)──► 宿主队列
-                                                   │
- 美术工坊面板 ──POST /gig/canvas/load──────────────►│
-                                                   ▼
-                                  POST /gig/bridge/poll  ◄── ComfyUI 里的扩展（每 1.5s）
-                                  { token, state, ack }        （它同时上报画布上有什么）
-                                                   │
-                                                   └──► { commands: [workflow.load …] }
-                                                        → app.loadGraphData(graph)
+ 对话 / 代理 ──image_workflow_open(to_canvas)──► 宿主画布队列
+ 美术工坊面板 ──POST /gig/canvas/load──────────►│
+                                                ▼
+              POST /gig/ui/poll  ◄── 面板（DSH 源，同源，带渲染器头）
+              { canvasMessages: [ {__gig, type:'canvas.load', seq, graph} ] }
+                     │
+                     └──iframe.contentWindow.postMessage(msg, 'http://127.0.0.1:8188')──► 扩展
+                                                                                           │
+                                    POST /gig/canvas/inbound  ◄── 面板转交 ◄── postMessage ◄┘
 ```
+
+两端的门都是硬的：
+
+| 方向 | 校验 |
+| --- | --- |
+| 面板 → 扩展 | `event.origin === __DSH_ORIGIN__` 且 `data.__gig === __TOKEN__` |
+| 扩展 → 面板 | `event.source === iframe.contentWindow`（并预筛信封形状） |
+| 面板 → 宿主 | 面板把信封**原样转交**；宿主自己验 `__gig` 令牌 |
+
+令牌是**每次安装**烤进副本的，重新同步时复用；所以另一个 ComfyUI 安装里的旧副本既不能被本宿主驱动，
+它的上报也不会被本宿主采信。面板从不解读令牌，它只是个搬运工。
+
+**代价（已知且明确）**：通道经过面板，所以**面板必须开着**。面板关着时画布指令会留在队列里（10 分钟），
+下次打开再投递；用系统浏览器「外部打开」的 ComfyUI 也不在这个通道里（那边没有父窗口）。
 
 ### 安装 / 卸载（一键，且可逆）
 
@@ -82,22 +109,26 @@ DSH 源发来的请求一律 403）。而 iframe 本身是能用的——ComfyUI
 它是审计线索，不是临时文件。
 
 清单在 `<dataRoot>/installed-files.json`：令牌、origin、目标目录、每一个文件、每一个"我创建的目录"。
-令牌在重新同步时**复用**，所以扩展已加载的页面不会因为一次同步就失联。
+
+还有一个实测发现的坑：ComfyUI 启动时 `import` 这个包，Python 会在包里写下
+`__pycache__/__init__.cpython-3xx.pyc`。**它也算残留**，所以卸载会一并删掉——但只删文件名词干
+与"本次安装过的文件"对得上的 `.pyc`，别人放进去的 `.pyc` 会保留并如实报告。
 
 ### 对话里怎么用
 
 ```
-image_workshop  action="bridge-status"     # 装没装？画布连上没？画布上有几个节点？
-image_workshop  action="install-bridge"    # 装（需要你同意写入 D:\AKI open\，会先备份）
-image_workshop  action="uninstall-bridge"  # 卸（只删自己登记过的）
+image_workshop  action="bridge-status"     # 装没装？画布应声没？画布上有几个节点？
+image_workshop  action="install-bridge"    # 装（会先备份；需要重启 ComfyUI）
+image_workshop  action="uninstall-bridge"  # 卸（只删自己登记过的，零残留）
 image_workshop  action="read-canvas"       # 画布正在编辑什么、缺哪些节点类型
 image_workflow  action="open"  id="item-icon"                 # 载入面板 + 推到画布
 image_workflow  action="open"  id="item-icon" to_canvas=false  # 只给面板，不动画布
 image_workflow  action="patch" id="item-icon" edits=[…] to_canvas=true   # 改完立刻反映到画布
 ```
 
-**两个队列是分开的**：`/gig/ui/poll` 给面板，`/gig/bridge/poll` 给画布。面板没开不会让画布收不到，
-画布没连上也不会让面板看不到。
+**两个队列是分开的**：`/gig/ui/poll` 给面板，画布指令搭同一次往返；面板没开不会让画布收到，
+画布没连上也不会让面板看不到。画布载入失败（`loadGraphData` 抛错）会被记下来，
+`bridge-status` 和 `GET /gig/extension` 都能看到，而不是永远默默重试。
 
 **桥接没装时，`open` 不会偷偷把图排进画布队列**——它会把 `canvas:false` 和原因一起返回。
 否则那张图会在几分钟后你打开画布时凭空冒出来，而你早已忘了自己说过什么。
@@ -288,6 +319,8 @@ image_workflow  action="patch" id="item-icon" edits=[…] to_canvas=true   # 改
   3. 每个写过的文件都进清单，卸载**只删清单里的路径**，越出目标目录的记录会被拒绝执行并报错；
   4. 只回收**它自己创建的**目录（安装前就存在的目录不记录、不删）。
      目录里出现清单之外的文件时，卸载会**报告残留**而不是假装干净——那些不是它写的，它不删。
+- **画布通道不开任何网络入口**：扩展不发 HTTP、不开 socket，只用 postMessage 与父窗口（也就是本面板）通信，
+  并且双向都要过 origin + 每次安装的令牌。宿主这一侧没有任何跨域路由可以被打（`/gig` 全部同源）。
 - 工作流库、节点布局缓存、备份目录都在 `$DSH_HOME/godot-imagegen/` 下，不在你的 ComfyUI 安装里。
 - **不自动安装**：桥接扩展的首次安装必须是显式动作（面板按钮或 `install-bridge`）；
   只有"已经装过"时，后端启动才会顺手重新同步一次（因为重启正是新副本生效的时刻）。
@@ -296,12 +329,12 @@ image_workflow  action="patch" id="item-icon" edits=[…] to_canvas=true   # 改
 
 ```powershell
 cd D:\deepseek\my-imagegen            # 本仓库根目录
-npm test                              # = 下面五条离线套件（764 条断言）
+npm test                              # = 下面五条离线套件（800 条断言）
 node tests/test-workflow.mjs          # 62 条断言（工作流层，含真实 ComfyUI 导出文件）
 node tests/test-workflow-library.mjs  # 252 条断言（工作流库、6 套模板、布局缓存）
 node tests/test-imagegen.mjs          # 187 条断言（10 个工具 + REST + 真实 Python 后处理）
-node tests/test-extension.mjs         # 119 条断言（桥接：备份/清单/卸载/令牌/CORS/跨域轮询）
-node tests/test-render-imagegen.mjs   # 144 条断言（客户端面板渲染，含三态窗口判定与浮窗几何补丁）
+node tests/test-extension.mjs         # 141 条断言（桥接：备份/清单/卸载/令牌/中继/零残留/真跑扩展）
+node tests/test-render-imagegen.mjs   # 158 条断言（客户端面板渲染，含三态窗口判定、浮窗几何补丁与画布中继）
 node tests/test-imagegen-live.mjs          # 真实 SD WebUI 端到端（后端没起时自动跳过）
 node tests/test-imagegen-live-comfy.mjs    # 真实 ComfyUI 端到端，含真跑内置模板（没起时跳过）
 node tests/test-extension-live.mjs         # 真实 ComfyUI 安装→卸载→零残留
@@ -315,7 +348,11 @@ node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"  
   因此断言的是真实行为而不是 mock 行为；同时覆盖重启持久化与热重载时的 KV 单元释放。
 - **扩展套件**在一个临时假 ComfyUI 目录上把桥接的每条承诺都跑一遍：备份内容、清单内容、
   令牌复用、越界路径拒删、既有目录不回收、非本插件文件保留、卸载后零残留（含 ComfyUI 导入时
-  生成的 `__pycache__`），以及跨域轮询的 403 / CORS 预检 / 令牌校验 / 指令投递与 ack。
+  生成的 `__pycache__`），以及中继的令牌校验、指令投递与 ack、失败上报，并且断言
+  **不存在任何跨域 HTTP 入口**（扩展只会用 postMessage）。
+  它还把**真正装进 ComfyUI 的那个 .js** 放进一个 `node:vm` 里，配一个假的 window 与假的 ComfyUI app
+  跑起来：错 origin / 错令牌 / 无令牌 / 垃圾载荷都不得触发载入，正确的信封必须真的调到 `app.loadGraphData`
+  并回一个带 seq 的结果，画布拒绝载入时必须回 `ok:false` 与原因。
 - **客户端套件**用最小 React 替身递归执行每个组件函数（本机磁盘上没有 react/react-dom，
   DSH 的客户端运行时在 app.asar 内），因此未定义标识符、错误的解构、坏的 createElement 调用都会暴露。
 - **实时套件**驱动真正安装的 SD WebUI / ComfyUI：真实出图、真实 rembg 抠图、真实 R-ESRGAN 放大、
@@ -333,7 +370,8 @@ node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"  
   但需要先把 layerdiffuse 权重放进 `ComfyUI/models/layerdiffuse`（`extra_model_paths` 没有映射它）。
 - `image_cutout` 的 `rembg` 首次运行会下载约 176 MB 的 u2net 模型（本机已缓存则瞬间完成）。
 - 桥接扩展有 `.js` 改动就**必须重启 ComfyUI**（`WEB_DIRECTORY` 只在启动时读），不是热重载的。
-- 扩展与宿主之间是**轮询**（1.5s）而不是 WebSocket：轮询的响应头由本插件自己的路由控制，
-  所以跨域可以直接工作，不必在 ComfyUI 的进程里再开一条长连接。
+- 画布通道**经过面板**（postMessage），所以面板必须开着；用系统浏览器「外部打开」的 ComfyUI
+  不在通道里。这不是偷懒：DSH 会给"frame origin 不是载体 origin"的请求一律 403，
+  iframe 自己发不出任何请求，父窗口是唯一通路。
 - 面板不做九宫格切片、图集打包、调色板量化等"后期"加工——那些更适合放在 Godot 导入侧或技能里。
 - RTX 5060 Laptop 上 SDXL 出图偏慢，建议先用 SD1.5 试参数再放大。

@@ -133,10 +133,54 @@ assert(typeof plugin.apply === 'function', 'plugin exports apply')
 assert(typeof plugin.ArtStudio === 'function', 'exposes the tab component as a test handle')
 for (const handle of [
   'BackendCard', 'SettingsCard', 'PromptForm', 'JobsStrip', 'Lightbox', 'categoryLabel', 'humanSize',
-  'EntryView', 'WorkflowBar', 'CanvasPane', 'AgentHint', 'Section',
+  'EntryView', 'WorkflowBar', 'CanvasPane', 'BridgeCard', 'AgentHint', 'Section',
   'readPlacement', 'patchFloatGeometry', 'sendToConversation',
+  'relayToCanvas', 'isCanvasMessage',
 ]) {
   assert(plugin[handle] !== undefined, `exposes test handle ${handle}`)
+}
+
+// ── step 2b: the canvas relay ──────────────────────────────────────────────
+//
+// The panel is the ONLY route into the ComfyUI iframe: DSH Desktop attaches its
+// renderer capability only to requests whose frame origin is the carrier origin,
+// so the iframe's own requests are refused 403 and CORS cannot help. These two
+// helpers are that relay, and they are checked here because they also decide how
+// much the panel is allowed to trust an incoming window message.
+
+const sentMessages = []
+const fakeFrame = { postMessage: (message, origin) => { sentMessages.push({ message, origin }) } }
+{
+  const count = plugin.relayToCanvas(fakeFrame, 'http://127.0.0.1:8188', [
+    { __gig: 't', type: 'canvas.load', seq: 'ui_1', graph: { nodes: [] } },
+    null,
+    { __gig: 't', type: 'canvas.ping' },
+  ])
+  assert(count === 2 && sentMessages.length === 2, 'relayToCanvas delivers every envelope and skips junk entries')
+  assert(sentMessages[0].origin === 'http://127.0.0.1:8188', 'and pins every postMessage to the ComfyUI origin')
+  const before = sentMessages.length
+  assert(plugin.relayToCanvas(null, 'http://127.0.0.1:8188', [{ __gig: 't' }]) === 0 && sentMessages.length === before,
+    'a missing iframe (ComfyUI not running) is a no-op, so the instruction stays queued')
+  assert(plugin.relayToCanvas(fakeFrame, '', [{ __gig: 't' }]) === 0 && sentMessages.length === before,
+    'and an unknown origin is refused rather than posted to "*"')
+  const throwing = { postMessage: () => { throw new Error('frame navigated') } }
+  assert(plugin.relayToCanvas(throwing, 'http://127.0.0.1:8188', [{ __gig: 't' }]) === 0,
+    'a frame that navigated mid-post is swallowed, not thrown into the poll loop')
+}
+
+{
+  const frame = { postMessage() {} }
+  assert(plugin.isCanvasMessage({ source: frame, data: { __gig: 't', type: 'canvas.state' } }, frame) === true,
+    'isCanvasMessage accepts a well-formed envelope from our own iframe')
+  assert(plugin.isCanvasMessage({ source: frame, data: { __gig: 't', type: 'canvas.state' } }, null) === false,
+    'but never when there is no iframe yet')
+  const other = { postMessage() {} }
+  assert(plugin.isCanvasMessage({ source: other, data: { __gig: 't', type: 'canvas.state' } }, frame) === false,
+    'and never from a different window, whatever the payload claims')
+  assert(plugin.isCanvasMessage({ source: frame, data: { type: 'canvas.state' } }, frame) === false,
+    'an envelope without the token is ignored')
+  assert(plugin.isCanvasMessage({ source: frame, data: 'canvas.state' }, frame) === false, 'and a non-object payload is ignored')
+  assert(plugin.isCanvasMessage({ source: frame, data: null }, frame) === false, 'including a null payload')
 }
 
 // ── step 3: apply() against a capturing betterSidebar ──
