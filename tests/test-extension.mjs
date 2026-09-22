@@ -520,6 +520,19 @@ async function main() {
   assert(readCanvas.bridge.canvasTitle === 'item-icon', 'and the workflow title')
   assert(readCanvas.bridge.canvasMissingClasses === undefined, 'and omits the missing-class list when nothing is missing')
 
+  // The panel's normal path: it relays the canvas's replies in the poll it is
+  // already making, so the canvas costs no extra round trip. This must accept
+  // them too — a refactor that dropped `inbound` here would silently kill the
+  // canvas state while every unit test of the dedicated route still passed.
+  const piggyback = await callRoute(webServer, 'POST', '/gig/ui/poll', {
+    inbound: [{ __gig: liveManifest.token, type: 'canvas.state', state: { nodeCount: 9, title: 'piggybacked' } }],
+  })
+  assert(piggyback.body.canvasInbound.accepted === 1, 'the panel poll also accepts canvas replies (piggyback carries them)')
+  assert(piggyback.body.canvasStatus.online === true, 'and that keeps the canvas marked as connected')
+  const afterPiggyback = await callRoute(webServer, 'GET', '/gig/extension')
+  assert(afterPiggyback.body.canvas.nodeCount === 9 && afterPiggyback.body.canvas.title === 'piggybacked',
+    'the piggybacked state is what the host now believes about the canvas')
+
   // A workflow opened on a connected canvas must reach ComfyUI, not only the panel.
   const opened = unwrap(await exec(workflowTool, { action: 'open', id: 'item-icon' }))
   assert(opened.canvas === true && /已直接推送到内嵌 ComfyUI 画布/.test(opened.canvasDetail), 'image_workflow action=open pushes the graph to the connected canvas')

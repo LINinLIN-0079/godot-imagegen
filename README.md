@@ -329,11 +329,11 @@ image_workflow  action="patch" id="item-icon" edits=[…] to_canvas=true   # 改
 
 ```powershell
 cd D:\deepseek\my-imagegen            # 本仓库根目录
-npm test                              # = 下面五条离线套件（800 条断言）
+npm test                              # = 下面五条离线套件（803 条断言）
 node tests/test-workflow.mjs          # 62 条断言（工作流层，含真实 ComfyUI 导出文件）
 node tests/test-workflow-library.mjs  # 252 条断言（工作流库、6 套模板、布局缓存）
 node tests/test-imagegen.mjs          # 187 条断言（10 个工具 + REST + 真实 Python 后处理）
-node tests/test-extension.mjs         # 141 条断言（桥接：备份/清单/卸载/令牌/中继/零残留/真跑扩展）
+node tests/test-extension.mjs         # 144 条断言（桥接：备份/清单/卸载/令牌/中继/零残留/真跑扩展）
 node tests/test-render-imagegen.mjs   # 158 条断言（客户端面板渲染，含三态窗口判定、浮窗几何补丁与画布中继）
 node tests/test-imagegen-live.mjs          # 真实 SD WebUI 端到端（后端没起时自动跳过）
 node tests/test-imagegen-live-comfy.mjs    # 真实 ComfyUI 端到端，含真跑内置模板（没起时跳过）

@@ -5991,6 +5991,57 @@ export function apply(ctx: Context, config: unknown): void {
 
   registerImageTools(tools, ops, { library, queue: uiQueue, canvas: canvasQueue, extension, layouts })
 
+  /**
+   * Take the canvas's replies, which the panel relays for it.
+   *
+   * Shared by the two same-origin ends of the relay: the panel's poll (the normal
+   * path — it batches them into the round trip it already makes) and the
+   * dedicated route. Every envelope must carry the token THIS install was
+   * generated with, so a stale copy of the extension in another ComfyUI install
+   * can neither be driven by this host nor have its reports believed here.
+   */
+  async function acceptCanvasMessages(raw: unknown): Promise<{ accepted: number; rejected: string[] }> {
+    const entries = Array.isArray(raw) ? raw : []
+    if (entries.length === 0) return { accepted: 0, rejected: [] }
+    const token = await extension.currentToken()
+    const rejected: string[] = []
+    let accepted = 0
+    for (const entry of entries) {
+      if (token === undefined) {
+        rejected.push('未安装画布桥接，却收到了画布消息')
+        break
+      }
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+        rejected.push('消息不是对象')
+        continue
+      }
+      const envelope = entry as Record<string, unknown>
+      if (envelope.__gig !== token) {
+        rejected.push('令牌不匹配（可能是旧安装的扩展）')
+        continue
+      }
+      accepted += 1
+      if (envelope.type === 'canvas.load' || envelope.type === 'canvas.ping') continue
+      const state = envelope.state
+      if (state !== null && typeof state === 'object' && !Array.isArray(state)) {
+        canvasQueue.report({ canvas: state as PanelState['canvas'] })
+      } else {
+        // A reply without state still proves the canvas is alive.
+        canvasQueue.report(canvasQueue.state() ?? {})
+      }
+      // A load is only finished when the canvas says how it went; until then it
+      // stays queued, so a canvas that appears later still receives the graph.
+      if (envelope.type === 'canvas.result' && typeof envelope.seq === 'string') {
+        canvasQueue.ack([envelope.seq])
+        if (envelope.ok !== true) {
+          canvasErrors.push({ at: new Date().toISOString(), seq: envelope.seq, error: String(envelope.error ?? '未知错误') })
+          if (canvasErrors.length > 10) canvasErrors.shift()
+        }
+      }
+    }
+    return { accepted, rejected }
+  }
+
   // Disposal must cancel in-flight work AND release the gallery unit: a KV unit
   // allows exactly one live handle per backend, so leaking it would make a later
   // re-apply (hot patch reload) fail with "unit is already open".
@@ -6079,6 +6130,9 @@ export function apply(ctx: Context, config: unknown): void {
             // A poll with no state still counts as "the panel is alive".
             uiQueue.report(uiQueue.state() ?? {})
           }
+          // The panel relays the canvas's replies in the poll it already makes,
+          // so the canvas side costs no extra round trip.
+          const inbound = await acceptCanvasMessages(body.inbound)
           const canvasToken = await extension.currentToken()
           const canvasMessages = canvasToken === undefined
             ? []
@@ -6094,6 +6148,7 @@ export function apply(ctx: Context, config: unknown): void {
             status: uiQueue.status(),
             canvasMessages,
             canvasStatus: canvasQueue.status(),
+            canvasInbound: inbound,
             canvasErrors,
           })
           return
@@ -6111,40 +6166,13 @@ export function apply(ctx: Context, config: unknown): void {
         // requests whose frame origin is the carrier origin, so a cross-origin
         // subframe is refused before routing (403) and CORS cannot help. The DSH
         // page is therefore the relay — it hands our stamped envelopes down with
-        // postMessage and carries the canvas's replies back up. These two routes
-        // are that relay's same-origin ends.
+        // postMessage and carries the canvas's replies back up. Both ends below
+        // are ordinary same-origin routes, and they share one validator.
         if (method === 'POST' && pathname === '/gig/canvas/inbound') {
           const body = await readJsonBody(req)
-          const token = await extension.currentToken()
-          const raw = Array.isArray(body.messages) ? body.messages : []
-          const rejected: string[] = []
-          let accepted = 0
-          for (const entry of raw) {
-            if (token === undefined) { rejected.push('未安装画布桥接，却收到了画布消息'); break }
-            if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) { rejected.push('消息不是对象'); continue }
-            const envelope = entry as Record<string, unknown>
-            if (envelope.__gig !== token) { rejected.push('令牌不匹配（可能是旧安装的扩展）'); continue }
-            accepted += 1
-            if (envelope.type === 'canvas.load' || envelope.type === 'canvas.ping') continue
-            const state = envelope.state
-            if (state !== null && typeof state === 'object' && !Array.isArray(state)) {
-              canvasQueue.report({ canvas: state as PanelState['canvas'] })
-            } else {
-              canvasQueue.report(canvasQueue.state() ?? {})
-            }
-            // A load is only finished when the canvas says how it went; until
-            // then it stays queued so a canvas that appears later still gets it.
-            if (envelope.type === 'canvas.result' && typeof envelope.seq === 'string') {
-              canvasQueue.ack([envelope.seq])
-              if (envelope.ok !== true) {
-                canvasErrors.push({ at: new Date().toISOString(), seq: envelope.seq, error: String(envelope.error ?? '未知错误') })
-                if (canvasErrors.length > 10) canvasErrors.shift()
-              }
-            }
-          }
+          const outcome = await acceptCanvasMessages(body.messages)
           sendJson(res, 200, {
-            accepted,
-            rejected,
+            ...outcome,
             canvas: { online: canvasQueue.online(), ...(canvasQueue.state()?.canvas ?? {}) },
           })
           return
