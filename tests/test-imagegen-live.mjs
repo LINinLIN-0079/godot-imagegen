@@ -99,6 +99,54 @@ const exec = (tool, args) => tool.execute(args, { signal: { aborted: false } })
 const readPngSize = (bytes) => ({ width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) })
 const readPngColorType = (bytes) => bytes[25]
 
+// ── a minimal host for the panel's own REST surface ──────────────────────────
+//
+// The tools go through createOps directly; the panel does not. It posts to /gig/*,
+// so this half has to speak HTTP to the same routes the browser does.
+
+function makePanelCtx(webServer) {
+  const registered = []
+  const ctx = {
+    tools: { register(definition) { registered.push(definition); return () => {} } },
+    storage: { backend: makeStorageBackend() },
+    get(name) { return name === 'webServer' ? webServer : undefined },
+    inject(deps, callback) {
+      if (deps.includes('webServer') && webServer !== undefined) {
+        callback(Object.assign(Object.create(ctx), { webServer }))
+      }
+      return () => {}
+    },
+    effect(callback) { const cleanup = callback(); return cleanup },
+  }
+  return { ctx, registered }
+}
+
+function makePanelWebServer() {
+  const routes = []
+  return { routes, register(opts) { routes.push(opts); return () => {} } }
+}
+
+async function panelRoute(webServer, method, pathname, body) {
+  const route = webServer.routes.find((r) => r.path === '/gig')
+  const captured = {}
+  const res = {
+    writeHead(status, headers) { captured.status = status; captured.headers = headers },
+    end(payload) { captured.body = payload },
+  }
+  const req = {
+    method,
+    url: pathname,
+    async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify(body ?? {}), 'utf8') },
+  }
+  await route.handler(req, res)
+  // /gig/file answers with raw bytes rather than JSON.
+  const isBinary = typeof captured.body !== 'string' && captured.body !== undefined
+  let parsed = null
+  if (typeof captured.body === 'string') { try { parsed = JSON.parse(captured.body) } catch { parsed = captured.body } }
+  const raw = isBinary ? Buffer.from(captured.body) : (typeof captured.body === 'string' && parsed === captured.body ? Buffer.from(captured.body) : null)
+  return { status: captured.status, body: parsed, raw }
+}
+
 async function backendListening() {
   try {
     const controller = new AbortController()
@@ -316,6 +364,108 @@ async function main() {
   assert(listed.images.length === produced + 1, `gallery holds every real generation (${listed.images.length})`)
   assert(listed.images.every((i) => existsSync(i.filePath)), 'every gallery record points at a real file on disk')
   assert(listed.images.filter((i) => i.resPath !== undefined).length === listed.images.length, 'every record carries a res:// path')
+
+  // ── 8. the route the panel's 生成 button actually posts to ──
+  //
+  // Everything above drives the model tools. The user's 生成 button does not: it
+  // POSTs /gig/generate with its own body shape (an empty negativePrompt string,
+  // backend forced to sdwebui, the planner project id), then polls /gig/jobs and
+  // renders the bytes from /gig/file. That whole path is exercised here against
+  // the real backend, because "the tool works" and "the button works" are not the
+  // same claim.
+  {
+    const panelRoot = await mkdtemp(join(tmpdir(), 'gig-panel-'))
+    const panelData = join(panelRoot, 'data')
+    const panelWebServer = makePanelWebServer()
+    const panelCtx = makePanelCtx(panelWebServer)
+    plugin.apply(panelCtx.ctx, {
+      unitName: 'godot_imagegen_live_panel',
+      sdwebuiPort: SD_PORT,
+      sdwebuiRoot: SD_ROOT,
+      sdwebuiPython: `${SD_ROOT}/python/python.exe`,
+      comfyPort: COMFY_PORT,
+      postPython: AKI_PYTHON,
+      godotProject,
+      dataRoot: panelData,
+      defaultBackend: 'sdwebui',
+      requestTimeoutMs: 30 * 60 * 1000,
+      startTimeoutMs: 5000,
+    })
+
+    const t6 = Date.now()
+    // Byte-for-byte the body the panel sends (see the generate callback in
+    // lib/client.js): negativePrompt is always present, even when empty.
+    const posted = await panelRoute(panelWebServer, 'POST', '/gig/generate', {
+      prompt: 'a red potion bottle, game item icon, white background',
+      negativePrompt: '',
+      category: 'item',
+      width: 512, height: 512, steps: 12,
+      cfgScale: 7, seed: 20260923,
+      backend: 'sdwebui',
+      transparent: false,
+      transparentMethod: 'auto',
+      seamless: false,
+      projectId: 'panel-live',
+    })
+    assert(posted.status === 200 && typeof posted.body.jobId === 'string', 'POST /gig/generate (the panel body) is accepted')
+    assert(posted.body.status === undefined, 'and answers immediately with just the job id — the work is detached, so the click never blocks')
+
+    // Poll the way the panel does, and watch what the panel would DISPLAY: the
+    // progress line is the only feedback the user gets during a long run.
+    const seen = []
+    let job = null
+    const deadline = Date.now() + 8 * 60 * 1000
+    while (Date.now() < deadline) {
+      const jobs = await panelRoute(panelWebServer, 'GET', '/gig/jobs')
+      job = (jobs.body.jobs || []).find((j) => j.id === posted.body.jobId)
+      if (job !== undefined && (seen.length === 0 || seen[seen.length - 1] !== job.message)) seen.push(job.message)
+      if (job !== undefined && job.status !== 'running') break
+      await new Promise((r) => setTimeout(r, 700))
+    }
+    const panelMs = Date.now() - t6
+    assert(job !== null && job.status === 'done', `the panel job really finished on the real backend (${job && job.status}: ${job && job.message})`)
+    const sampling = seen.filter((m) => /采样 \d+\/\d+/.test(m))
+    assert(sampling.length > 0, `the panel job reported step progress while it ran (${sampling[0] || '—'} … ${sampling[sampling.length - 1] || '—'})`)
+    // The ETA must be OUR step-based estimate. A1111's own eta_relative on this
+    // machine claimed 34 minutes for a job that finished in ~2, which is the kind
+    // of number that makes a user kill a healthy render.
+    const etas = sampling.map((m) => Number((m.match(/剩余约 (\d+)s/) || [])[1])).filter((n) => Number.isFinite(n))
+    assert(etas.length > 0, 'and an ETA once a step had completed')
+    assert(etas.every((n) => n > 0 && n < 60 * 30), `none of them is absurd (max ${Math.max(...etas)}s, actual run ${Math.round(panelMs / 1000)}s)`)
+    if (sampling.some((m) => /采样 0\//.test(m))) {
+      const first = sampling.find((m) => /采样 0\//.test(m))
+      assert(!/剩余约/.test(first), `before the first step completes it says it is preparing instead of guessing (${first})`)
+    }
+
+    const gallery = await panelRoute(panelWebServer, 'GET', '/gig/gallery?project=panel-live')
+    const image = (gallery.body.images || [])[0]
+    console.log(`\n— 面板那条路（POST /gig/generate）—\n  ${secs(panelMs)} → ${image && image.resPath}`)
+    console.log(`  模型：${image && image.model}`)
+    console.log(`  进度行示例：${sampling[0] || '—'} … ${sampling[sampling.length - 1] || '—'}`)
+    assert(image !== undefined, 'the panel job filed its result in the gallery')
+    assert(image.resPath !== undefined && image.resPath.startsWith('res://assets/generated/item/'), `with a res:// path under the category (${image && image.resPath})`)
+
+    // The output root precedence the panel relies on: an explicit outDir wins over
+    // the Godot project, which is why this instance (godotProject only) produced a
+    // res:// path at all. Separators are normalized before comparing — the plugin
+    // resolves config paths to forward slashes, the test builds them with join().
+    const slash = (p) => String(p).replace(/\\/g, '/')
+    const outputState = await panelRoute(panelWebServer, 'GET', '/gig/state')
+    assert(slash(outputState.body.output.godotProject) === slash(godotProject),
+      `GET /gig/state reports the Godot project the panel maps res:// paths through (${outputState.body.output.godotProject})`)
+    assert(!/-\d{8}-\d{6}-\d{8}-\d{6}-/.test(image.filePath), `the file name carries ONE timestamp, not two (${image.filePath.split(/[\\/]/).pop()})`)
+
+    const bytes = await panelRoute(panelWebServer, 'GET', `/gig/file?id=${image.id}`)
+    assert(bytes.raw !== null && bytes.raw.length > 10_000, `and /gig/file serves the real PNG bytes the panel renders (${bytes.raw ? bytes.raw.length : 0} B)`)
+    const onDisk = await readFile(image.filePath)
+    assert(bytes.raw !== null && bytes.raw.length === onDisk.length, 'which are exactly the bytes on disk')
+    assert(onDisk[0] === 0x89 && onDisk[1] === 0x50, 'and it is a real PNG')
+
+    const state = await panelRoute(panelWebServer, 'GET', '/gig/state')
+    assert(state.body.output.root.length > 0, 'GET /gig/state reports where the panel writes')
+    console.log(`  产物目录：${state.body.output.root}`)
+    await rm(panelRoot, { recursive: true, force: true })
+  }
 
   console.log('\n— 实测耗时 —')
   console.log(`  SD1.5 512²/14 步 : ${secs(genMs)}（含可能的换模型）`)

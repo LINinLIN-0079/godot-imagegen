@@ -417,6 +417,15 @@ assert(formText.includes('角色'), 'PromptForm renders the category labels')
 assert(formText.includes('openpose'), 'PromptForm renders the ControlNet types')
 assert(formText.includes('透明方式'), 'PromptForm renders the cutout-method selector when transparency is on')
 assert(formText.includes('wai.safetensors'), 'PromptForm renders the model list')
+// "No model chosen" must not be a mystery: A1111 keeps whatever is loaded, and
+// that difference measured 231s vs ~5s for the same 512²/12-step request here.
+assert(formText.includes('— 后端默认 —'), 'with no backend reporting a loaded model it says 后端默认')
+const formWithCurrent = renderTree(React.createElement(plugin.PromptForm, {
+  form, setForm() {}, presets, categories: ['item'], defaults: {}, controlTypes: [], models: ['wai.safetensors'],
+  busy: false, onGenerate() {}, onSavePreset() {}, currentModel: 'waiIllustriousSDXL_v150.safetensors',
+}))
+assert(formWithCurrent.includes('— 后端当前：waiIllustriousSDXL_v150.safetensors —'),
+  'and names the checkpoint that an unspecified model would actually use')
 
 let formHidden = ''
 try {

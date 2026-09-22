@@ -903,6 +903,15 @@ interface BackendStatus {
   capabilities: Record<string, boolean | number>
   /** Human-readable capability lines, exposed to the model through the tool. */
   strengths: string[]
+  /**
+   * The checkpoint the backend currently has LOADED, when it can tell us.
+   *
+   * This is what an unspecified model actually means: A1111 keeps whatever was
+   * last loaded, so a 512²/12-step request ran on SDXL here and took 231s instead
+   * of the ~5s the same request takes on SD1.5. The panel shows it next to the
+   * form's "no model chosen" option so that choice is never invisible again.
+   */
+  currentModel?: string
   /** True when this plugin spawned the process (never kills user instances). */
   managed: boolean
 }
@@ -1123,6 +1132,9 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
         '后处理抠图：rembg(u2net) / 色键 可用',
       ]
       base.detail = `当前模型 ${String(options.sd_model_checkpoint ?? '?')}；ControlNet ${cnList.length} 个；放大 ${names(upscalers).length} 个`
+      if (typeof options.sd_model_checkpoint === 'string' && options.sd_model_checkpoint !== '') {
+        base.currentModel = options.sd_model_checkpoint
+      }
       return base
     }
     const stats = await probeJson(`${comfyBase}/system_stats`)
@@ -1274,6 +1286,17 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
     if (signal !== undefined) signal.addEventListener('abort', onOuterAbort)
     const poll = (async () => {
       if (onProgress === undefined) return
+      // Our own remaining-time estimate, measured from COMPLETED steps.
+      //
+      // A1111's `eta_relative` extrapolates from the whole request so far, and in
+      // the early seconds that includes the model swap: on this machine it
+      // reported "剩余约 2066s" (34 minutes) for a job that finished in 128
+      // seconds, which is worse than saying nothing. Once one step has completed
+      // we know the real per-step cost and use that instead of the backend's
+      // guess; before that we say what is actually happening rather than
+      // inventing a number.
+      let firstStepAt: number | undefined
+      let previousStep = 0
       while (!pollControl.signal.aborted) {
         try {
           await delay(900, pollControl.signal)
@@ -1288,8 +1311,22 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
         const ratio = typeof p.progress === 'number' ? clamp(p.progress, 0, 1) : undefined
         const step = p.state?.sampling_step
         const steps = p.state?.sampling_steps
+        let eta = ''
+        if (step !== undefined && steps !== undefined && steps > 0) {
+          // A step count smaller than last time is a NEW sampling run (hires fix,
+          // an upscale pass), so the clock restarts instead of reporting a rate
+          // carried over from the previous pass.
+          if (step < previousStep) firstStepAt = undefined
+          previousStep = step
+          if (step > 0) {
+            firstStepAt ??= Date.now()
+            const perStep = (Date.now() - firstStepAt) / 1000 / step
+            eta = `，剩余约 ${Math.max(1, Math.round(perStep * (steps - step)))}s`
+          } else {
+            eta = '（正在准备，换模型时这一步会久一些）'
+          }
+        }
         const label = step !== undefined && steps !== undefined ? `采样 ${step}/${steps}` : '生成中'
-        const eta = typeof p.eta_relative === 'number' && p.eta_relative > 0 ? `，剩余约 ${Math.ceil(p.eta_relative)}s` : ''
         onProgress(ratio, `${label}${eta}`, p.current_image ?? undefined)
       }
     })()
@@ -2329,7 +2366,13 @@ function createOps(deps: OpsDeps) {
   ): Promise<{ filePath: string; resPath?: string; size: number }> {
     const dir = join(plan.root, category)
     await mkdir(dir, { recursive: true })
-    const fileName = `${slugify(name)}${suffix}-${timestampLabel()}-${randomUUID().slice(0, 4)}.png`
+    // The default asset name already carries a timestamp (`item-20260922-160925`),
+    // because that is what the gallery shows for an unnamed generation. Stamping
+    // it again produced names like `item-…-160925-20260923-…-161346-b2f4.png`, so
+    // only add one when the name does not already end with it.
+    const base = slugify(name)
+    const stamped = /\d{8}-\d{6}$/.test(base) ? '' : `-${timestampLabel()}`
+    const fileName = `${base}${suffix}${stamped}-${randomUUID().slice(0, 4)}.png`
     const filePath = join(dir, fileName)
     await writeFile(filePath, bytes)
     const info = await statSafe(filePath)
@@ -4816,6 +4859,7 @@ function registerImageTools(
                 detail: { type: 'string' },
                 models: { type: 'array', items: { type: 'string' } },
                 strengths: { type: 'array', items: { type: 'string' } },
+                currentModel: { type: 'string' },
               },
               required: ['id', 'label', 'port', 'root', 'running', 'managed', 'detail', 'models', 'strengths'],
             },
@@ -4879,6 +4923,10 @@ function registerImageTools(
           detail: s.detail,
           models: s.models,
           strengths: s.strengths,
+          // Projected explicitly: the tool output is a strict schema, so anything
+          // not listed here is silently dropped (which is how `capabilities`
+          // vanished once before).
+          ...(s.currentModel === undefined ? {} : { currentModel: s.currentModel }),
         })),
         postProcessing: post.reason(),
         outputRoot: plan.root,

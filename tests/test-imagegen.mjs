@@ -114,6 +114,23 @@ function readPngColorType(bytes) {
 
 // ─────────────────────────── fake A1111 backend ───────────────────────────
 
+/**
+ * What the fake A1111 reports on /sdapi/v1/progress.
+ *
+ * Mutable so a test can reproduce the case that matters: A1111's own
+ * `eta_relative` is extrapolated from the whole request including the model swap,
+ * and it really does report absurd values early on (measured against the live
+ * server: 2066s for a job that finished in 128s).
+ */
+let fakeProgress = { progress: 0.5, eta_relative: 1.5, current_image: null, state: { sampling_step: 14, sampling_steps: 28 } }
+
+/**
+ * Artificial delay on /sdapi/v1/txt2img, so the progress poller (900ms) gets a
+ * chance to report while a job is still running. Zero by default: most tests want
+ * the fake backend to answer instantly.
+ */
+let fakeA1111Txt2ImgDelayMs = 0
+
 function startFakeA1111(port, requests) {
   const server = createServer(async (req, res) => {
     const chunks = []
@@ -157,9 +174,10 @@ function startFakeA1111(port, requests) {
       })
     }
     if (req.method === 'GET' && url === '/sdapi/v1/progress') {
-      return json({ progress: 0.5, eta_relative: 1.5, current_image: null, state: { sampling_step: 14, sampling_steps: 28 } })
+      return json(fakeProgress)
     }
     if (req.method === 'POST' && url === '/sdapi/v1/txt2img') {
+      if (fakeA1111Txt2ImgDelayMs > 0) await new Promise((r) => setTimeout(r, fakeA1111Txt2ImgDelayMs))
       const n = body.batch_size || 1
       return json({
         images: Array.from({ length: n }, () => SAMPLE_PNG_B64),
@@ -514,6 +532,11 @@ async function main() {
   assert(sd.running === true, 'detects the running SD WebUI')
   assert(sd.models.length === 2 && sd.models[0].includes('waiIllustriousSDXL'), 'lists SD WebUI checkpoints')
   assert(sd.detail.includes('ControlNet 3'), 'reports the ControlNet model count')
+  // The loaded checkpoint is what an unspecified model means — the panel names it
+  // rather than leaving the choice invisible.
+  assert(sd.currentModel === 'waiIllustriousSDXL_v150.safetensors',
+    `reports the checkpoint that is actually LOADED (${sd.currentModel})`)
+  assert(comfy.currentModel === undefined, 'and ComfyUI, which has no notion of a loaded checkpoint, reports none')
   assert(Array.isArray(sd.strengths) && sd.strengths.some((s) => s.includes('ControlNet 3')),
     'exposes human-readable capability strengths to the model')
   assert(sd.strengths.some((s) => s.startsWith('反推提示词')), 'reports which prompt-interrogation route is available')
@@ -847,6 +870,49 @@ async function main() {
   const panelJob = (await callRoute(webServer, 'GET', '/gig/jobs')).body.jobs.find((j) => j.id === panelShaped.body.jobId)
   assert(panelJob !== undefined && panelJob.status === 'done',
     `the panel-shaped generation completes (status=${panelJob && panelJob.status} msg=${panelJob && panelJob.message})`)
+
+  // ── R-progress: what the panel SHOWS while a job runs ──
+  //
+  // The progress line is the only feedback during a long render, and the backend's
+  // own eta_relative is unusable early on: measured live, A1111 claimed 2066s (34
+  // minutes) for a job that finished in 128s. So the plugin computes its own
+  // remaining time from COMPLETED steps and says "preparing" before the first one.
+  // This reproduces both branches with a slowed-down fake backend.
+  {
+    const progressJob = async (progressShape, delayMs) => {
+      fakeProgress = progressShape
+      fakeA1111Txt2ImgDelayMs = delayMs
+      const posted = await callRoute(webServer, 'POST', '/gig/generate', {
+        prompt: 'progress probe', category: 'item', width: 512, height: 512, steps: 12, backend: 'sdwebui', projectId: 'progress',
+      })
+      const seen = []
+      const deadline = Date.now() + 20_000
+      let job
+      while (Date.now() < deadline) {
+        job = (await callRoute(webServer, 'GET', '/gig/jobs')).body.jobs.find((j) => j.id === posted.body.jobId)
+        if (job !== undefined && (seen.length === 0 || seen[seen.length - 1] !== job.message)) seen.push(job.message)
+        if (job !== undefined && job.status !== 'running') break
+        await new Promise((r) => setTimeout(r, 150))
+      }
+      fakeA1111Txt2ImgDelayMs = 0
+      return { job, seen }
+    }
+
+    const early = await progressJob({ progress: 0, eta_relative: 2066, current_image: null, state: { sampling_step: 0, sampling_steps: 12 } }, 2200)
+    assert(early.job !== undefined && early.job.status === 'done', 'a slowed-down generation still finishes')
+    assert(early.seen.some((m) => /正在准备/.test(m)), `before the first step the panel is told it is preparing (${early.seen.join(' | ')})`)
+    assert(!early.seen.some((m) => /2066/.test(m)), 'and the backend\'s absurd 34-minute estimate is never shown to the user')
+    assert(!early.seen.some((m) => /剩余约/.test(m)), 'no number is invented before any step has completed')
+
+    const measured = await progressJob({ progress: 0.25, eta_relative: 9999, current_image: null, state: { sampling_step: 3, sampling_steps: 12 } }, 2200)
+    const withEta = measured.seen.find((m) => /剩余约/.test(m))
+    assert(withEta !== undefined, `once a step has completed the panel gets a real estimate (${measured.seen.join(' | ')})`)
+    const seconds = Number((withEta || '').match(/剩余约 (\d+)s/)[1])
+    assert(Number.isFinite(seconds) && seconds > 0 && seconds < 300,
+      `and it is derived from the observed step time, not the backend's eta_relative=9999 (got ${seconds}s)`)
+    assert(measured.seen.some((m) => /采样 3\/12/.test(m)), 'the step counter is still reported verbatim')
+    fakeProgress = { progress: 0.5, eta_relative: 1.5, current_image: null, state: { sampling_step: 14, sampling_steps: 28 } }
+  }
 
   const blankEdit = await callRoute(webServer, 'POST', '/gig/edit', {
     image: first.filePath,
