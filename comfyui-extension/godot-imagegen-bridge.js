@@ -256,7 +256,16 @@
     ready.then(function () {
       try {
         loadGraph(data.graph)
-        reply(event.source, { __gig: TOKEN, type: 'canvas.result', seq: data.seq, ok: true, state: summarizeGraph() })
+        // The frontend swaps the graph object asynchronously, so reading the nodes
+        // in this same tick reports the graph being REPLACED — which made the host
+        // (and so the panel) briefly see "0 个节点 / 没有工作流". Report one tick
+        // later, when the canvas really is showing the new graph. Still exactly one
+        // reply: a bare VM harness without timers gets it immediately instead.
+        var report = function () {
+          reply(event.source, { __gig: TOKEN, type: 'canvas.result', seq: data.seq, ok: true, state: summarizeGraph() })
+        }
+        if (typeof setTimeout === 'function') setTimeout(report, 250)
+        else report()
       } catch (error) {
         // Report the failure instead of swallowing it: the agent needs to know
         // the canvas refused the graph.
