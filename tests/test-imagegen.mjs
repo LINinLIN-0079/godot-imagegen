@@ -212,6 +212,14 @@ function startFakeA1111(port, requests) {
  */
 let fakeComfyHoldPolls = 0
 
+/**
+ * When true, the fake names the SAME saved file under two output nodes. ComfyUI
+ * does that when more than one node reports the same image, and the plugin used to
+ * fetch and save it twice — one Qwen run really did land two identical PNGs a
+ * second apart, which reads as "it ran twice" and doubles the apparent cost.
+ */
+let fakeComfyDuplicateOutputs = false
+
 /** Every WebSocket the plugin opened, with a handle to feed it frames. */
 const fakeSockets = []
 class FakeWebSocket {
@@ -304,8 +312,11 @@ function startFakeComfy(port, requests) {
     }
     if (req.method === 'POST' && url === '/prompt') {
       const id = 'prompt-' + (history.size + pending.size + 1)
+      const images = [{ filename: 'ComfyUI_test.png', subfolder: '', type: 'output' }]
       const result = {
-        outputs: { '9': { images: [{ filename: 'ComfyUI_test.png', subfolder: '', type: 'output' }] } },
+        outputs: fakeComfyDuplicateOutputs
+          ? { '9': { images }, '10': { images } }
+          : { '9': { images } },
         status: { status_str: 'success', completed: true },
       }
       // Held runs stay "not in /history yet" for N polls, which is what a real
@@ -1478,6 +1489,73 @@ async function main() {
   } finally {
     hangServer.closeAllConnections()
     await new Promise((resolve) => hangServer.close(resolve))
+  }
+
+  // ── 记录里的三件事：去重、尺寸、耗时 ──
+  //
+  // 用户看到的是"一次运行落两张图""尺寸显示 ?×?""跑完不知道花了多久"。
+  // 三件都在这里钉住。
+  {
+    // 尺寸：纯函数先单独验，不依赖后端。
+    const pngHeader = (w, h) => {
+      const header = Buffer.alloc(24)
+      header.writeUInt32BE(0x89504e47, 0)
+      header.writeUInt32BE(0x0d0a1a0a, 4)
+      header.writeUInt32BE(13, 8)
+      header.write('IHDR', 12, 'latin1')
+      header.writeUInt32BE(w, 16)
+      header.writeUInt32BE(h, 20)
+      return header
+    }
+    assert(plugin.pngDimensions(pngHeader(1024, 1024))?.width === 1024, 'PNG 尺寸能从 IHDR 读出来（工作流出图不再显示 ?×?）')
+    assert(plugin.pngDimensions(pngHeader(832, 1216))?.height === 1216, '竖构图也对')
+    assert(plugin.pngDimensions(Buffer.from('definitely not a png file')) === undefined, '不是 PNG 就返回 undefined 而不是抛错')
+    assert(plugin.pngDimensions(Buffer.alloc(8)) === undefined, '文件太短也返回 undefined')
+    assert(plugin.graphSteps({ '5': { class_type: 'KSampler', inputs: { steps: 25 } } }) === 25, '能从 API 图里读出采样步数')
+    assert(plugin.graphSteps({ '5': { class_type: 'KSampler', inputs: { seed: 3 } } }) === undefined, '图里没有步数就返回 undefined')
+
+    // Qwen/GGUF 的预检：老那条预警只认 CheckpointLoaderSimple + 大 latent，Qwen 图
+    //（UnetLoaderGGUF + 5.88GB 文本编码器 / 7.96GB 显存）从它眼皮下溜过去。
+    const qwenParts = [
+      { label: '主模型', bytes: 3.90 * 1024 ** 3 },
+      { label: '文本编码器', bytes: 5.88 * 1024 ** 3 },
+      { label: 'VAE', bytes: 0.63 * 1024 ** 3 },
+    ]
+    const total = qwenParts.reduce((sum, part) => sum + part.bytes, 0)
+    const verdict = plugin.weightAdvisory(total, qwenParts, 7.96 * 1024 ** 3, 2.1 * 1024 ** 3)
+    assert(/权重合计 10\.41GB/.test(verdict) && /超过 7\.96GB 显存/.test(verdict),
+      `Qwen 那种权重超显存的图会被点名（${String(verdict).slice(0, 40)}…）`)
+    assert(/文本编码器 5\.88GB/.test(verdict), '并列出每一项占多少，用户才知道该砍哪个')
+    assert(/可用内存只剩 2\.10GB/.test(verdict), '内存装不下时另说一句，因为那是换页、是越跑越慢')
+    assert(plugin.weightAdvisory(1 * 1024 ** 3, [{ label: '主模型', bytes: 1024 ** 3 }], 7.96 * 1024 ** 3, 8 * 1024 ** 3) === undefined,
+      '装得下就不吵人')
+    assert(plugin.weightAdvisory(total, qwenParts, undefined, 32 * 1024 ** 3) === undefined,
+      '读不到显卡信息时不瞎猜，只在真的超了内存时才说')
+
+    // 去重 + 耗时：让假的 ComfyUI 把同一张图挂在两个输出节点上。用一个自己的实例，
+    // 免得跟在别的用例后面被 dispose 掉。
+    const dupServer = makeWebServer()
+    const dupCtx = makeCtx(storage, { webServer: dupServer })
+    plugin.apply(dupCtx.ctx, Object.assign({}, config, {
+      unitName: 'godot_imagegen_test_dup',
+      dataRoot: join(workRoot, 'data-dup'),
+    }))
+    const dupWorkflow = byName(dupCtx.registered, 'image_workflow')
+    fakeComfyDuplicateOutputs = true
+    const dup = unwrap(await exec(dupWorkflow, { action: 'run', id: 'sd15-basic', category: 'concept', project_id: 'dup' }))
+    assert(dup.images.length === 1, `同一张图被两个输出节点引用时只产出一张（实际 ${dup.images.length}）`)
+    assert(new Set(dup.images.map((i) => i.filePath)).size === dup.images.length, '也不会为同一张图落两个文件')
+    fakeComfyDuplicateOutputs = false
+
+    const dupGallery = await callRoute(dupServer, 'GET', '/gig/gallery?project=dup')
+    const record = (dupGallery.body.images || [])[0]
+    assert(record !== undefined, '这次运行进了图库')
+    assert(typeof record.meta?.seconds === 'number' && record.meta.seconds >= 1,
+      `记录里带上了整轮耗时（${record && record.meta && record.meta.seconds}s）`)
+    assert(record.meta?.steps === 20 || typeof record.meta?.steps === 'number',
+      `以及采样步数（${record && record.meta && record.meta.steps}），耗时才有比较意义`)
+    assert(record.width > 0 && record.height > 0,
+      `并从 PNG 本身补上了尺寸（${record && record.width}×${record && record.height}）`)
   }
 
   // ── summary ──

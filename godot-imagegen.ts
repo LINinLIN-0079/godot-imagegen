@@ -34,8 +34,9 @@
 import { spawn as nodeSpawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { copyFile, mkdir, readFile, readdir, rm, rmdir, stat, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, open, readFile, readdir, rm, rmdir, stat, writeFile } from 'node:fs/promises'
 import { request as httpRequest } from 'node:http'
+import { freemem } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -567,6 +568,42 @@ function fileExists(path: string): boolean {
     return existsSync(path)
   } catch {
     return false
+  }
+}
+
+/**
+ * A PNG's pixel size, read out of its IHDR chunk.
+ *
+ * Width/height are only known to the CALLER when it chose them. A library workflow
+ * carries its own latent size inside the graph, so those runs reached `record()`
+ * with neither and every one of them was listed as `?×?` — which also made it
+ * impossible to tell what a Qwen run had actually produced. The file itself is the
+ * one source that is always right, and it costs 24 bytes to ask.
+ */
+export function pngDimensions(header: Buffer): { width: number; height: number } | undefined {
+  if (header.length < 24) return undefined
+  // 8-byte signature, then the first chunk: length(4) "IHDR"(4) width(4) height(4).
+  if (header.readUInt32BE(0) !== 0x89504e47 || header.readUInt32BE(4) !== 0x0d0a1a0a) return undefined
+  if (header.toString('latin1', 12, 16) !== 'IHDR') return undefined
+  const width = header.readUInt32BE(16)
+  const height = header.readUInt32BE(20)
+  return width > 0 && height > 0 ? { width, height } : undefined
+}
+
+/** `pngDimensions` for a file, without reading the whole image. */
+async function pngDimensionsOf(filePath: string): Promise<{ width: number; height: number } | undefined> {
+  try {
+    const handle = await open(filePath, 'r')
+    try {
+      const header = Buffer.alloc(24)
+      const { bytesRead } = await handle.read(header, 0, 24, 0)
+      if (bytesRead < 24) return undefined
+      return pngDimensions(header)
+    } finally {
+      await handle.close()
+    }
+  } catch {
+    return undefined
   }
 }
 
@@ -1953,6 +1990,37 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
    * the job, while it runs, and in the result) is the difference between waiting and
    * concluding it hung.
    */
+  /**
+   * Weight-vs-hardware advisory, summed from the graph itself.
+   *
+   * The map above only fires for a `CheckpointLoaderSimple` with a big latent — i.e.
+   * NEVER for a Qwen/GGUF workflow, which is precisely the shape that paged for
+   * minutes on this machine (3.90GB unet + 5.88GB text encoder + 0.63GB VAE against
+   * 7.96GB of usable VRAM). Adding up the model files the graph asks for works for
+   * every shape, and it is that number — not the node count — that decides whether
+   * sampling streams from RAM or from disk.
+   */
+  async function comfyWeightAdvisory(graph: Record<string, unknown>): Promise<string | undefined> {
+    const parts: Array<{ label: string; bytes: number }> = []
+    for (const spec of WEIGHT_INPUTS) {
+      const name = literalInput(graph, spec.classType, spec.input)
+      if (typeof name !== 'string' || name === '') continue
+      const file = spec.dirs
+        .map((dir) => join(cfg.comfyRoot, 'ComfyUI', dir, name))
+        .find((candidate) => fileExists(candidate))
+      if (file === undefined) continue
+      const info = await statSafe(file)
+      if (info === undefined) continue
+      parts.push({ label: spec.label, bytes: info.size })
+    }
+    if (parts.length === 0) return undefined
+    const total = parts.reduce((sum, part) => sum + part.bytes, 0)
+    const stats = (await probeJson(`${comfyBase}/system_stats`, 4000).catch(() => undefined)) as
+      | { devices?: Array<{ vram_total?: number }> }
+      | undefined
+    return weightAdvisory(total, parts, stats?.devices?.[0]?.vram_total, freemem())
+  }
+
   async function comfyVramAdvisory(graph: Record<string, unknown>): Promise<string | undefined> {
     const checkpoint = literalInput(graph, 'CheckpointLoaderSimple', 'ckpt_name')
     if (typeof checkpoint !== 'string' || !/xl|sdxl|illustrious|sd_xl/i.test(checkpoint)) return undefined
@@ -2019,8 +2087,19 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
             throw new Error(`ComfyUI 执行失败：${entry.status?.status_str ?? 'unknown'}`)
           }
           const refs: Array<{ filename: string; subfolder: string; type: string }> = []
+          // Deduplicated. ComfyUI's history can name the SAME saved file under more
+          // than one output node, and each duplicate used to be re-fetched and
+          // re-saved: one Qwen run landed two byte-identical PNGs a second apart,
+          // which reads as "it ran twice" and made the run look twice as expensive
+          // as it was.
+          const seen = new Set<string>()
           for (const output of Object.values(entry.outputs ?? {})) {
-            for (const image of output.images ?? []) refs.push(image)
+            for (const image of output.images ?? []) {
+              const key = `${image.type}/${image.subfolder}/${image.filename}`
+              if (seen.has(key)) continue
+              seen.add(key)
+              refs.push(image)
+            }
           }
           // A workflow that finished successfully but saved nothing (no SaveImage /
           // PreviewImage node) would otherwise keep this loop spinning until the
@@ -2131,6 +2210,7 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
     sdInterrogate,
     comfyRun: (params: Parameters<typeof comfyRun>[0]) => interruptOnFailure('comfyui', () => comfyRun(params)),
     comfyVramAdvisory,
+    comfyWeightAdvisory,
     comfyGraph,
     comfyUpload,
     /**
@@ -2739,6 +2819,14 @@ function createOps(deps: OpsDeps) {
     saved: { filePath: string; resPath?: string; size: number },
     fields: Partial<GalleryImage> & { name: string; category: ArtCategory; op: GalleryImage['op'] },
   ): Promise<GalleryImage> {
+    // Whoever knows the size wins; otherwise ask the file. This is what filled in
+    // the size of every workflow image, which the caller cannot know because the
+    // latent size lives inside the graph.
+    const measured = fields.width === undefined || fields.height === undefined
+      ? await pngDimensionsOf(saved.filePath)
+      : undefined
+    const width = fields.width ?? measured?.width
+    const height = fields.height ?? measured?.height
     const image: GalleryImage = {
       id: `img_${randomUUID().slice(0, 12)}`,
       op: fields.op,
@@ -2753,8 +2841,8 @@ function createOps(deps: OpsDeps) {
       ...(fields.seed === undefined ? {} : { seed: fields.seed }),
       ...(fields.model === undefined ? {} : { model: fields.model }),
       ...(fields.backend === undefined ? {} : { backend: fields.backend }),
-      ...(fields.width === undefined ? {} : { width: fields.width }),
-      ...(fields.height === undefined ? {} : { height: fields.height }),
+      ...(width === undefined ? {} : { width }),
+      ...(height === undefined ? {} : { height }),
       ...(fields.steps === undefined ? {} : { steps: fields.steps }),
       ...(fields.cfgScale === undefined ? {} : { cfgScale: fields.cfgScale }),
       ...(fields.sampler === undefined ? {} : { sampler: fields.sampler }),
@@ -3197,10 +3285,15 @@ function createOps(deps: OpsDeps) {
     // explanation.
     const advisories = [
       comfyPromptAdvisory(input.apiGraph),
+      await backends.comfyWeightAdvisory(input.apiGraph).catch(() => undefined),
       await backends.comfyVramAdvisory(input.apiGraph).catch(() => undefined),
     ].filter((text): text is string => text !== undefined)
     if (advisories.length > 0) job.advisory = advisories.join('\n')
     job.message = job.advisory ?? `ComfyUI 执行工作流（${nodeCount} 个节点）`
+    // Timed here rather than inferred from file timestamps afterwards: "108 秒"
+    // only means something next to the step count, and until now the only way to
+    // get either was to watch the clock and the output directory by hand.
+    const startedAt = Date.now()
     const produced = await backends.comfyRun({
       graph: input.apiGraph,
       signal: job.controller.signal,
@@ -3211,6 +3304,8 @@ function createOps(deps: OpsDeps) {
         job.message = message
       },
     })
+    const seconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000))
+    const steps = graphSteps(input.apiGraph)
     const images: GalleryImage[] = []
     for (const item of produced) {
       const saved = await saveImage(item.bytes, plan, input.category, input.name, '-wf')
@@ -3226,8 +3321,9 @@ function createOps(deps: OpsDeps) {
         op: 'generate',
         backend: 'comfyui',
         ...(method === undefined ? {} : { method }),
+        ...(steps === undefined ? {} : { steps }),
         projectId: input.projectId,
-        meta: { workflow: true, nodes: nodeCount },
+        meta: { workflow: true, nodes: nodeCount, seconds, ...(steps === undefined ? {} : { steps }) },
       }))
     }
     if (images.length === 0) throw new Error('工作流执行完成但没有产出任何图片')
@@ -3933,7 +4029,7 @@ export const WORKFLOW_TEMPLATES: WorkflowTemplate[] = [
   {
     id: 'sdxl-basic',
     name: 'SDXL 文生图（wai Illustrious）',
-    description: '画质更好但本机很慢：实测 60–77 秒/步，768² 的 18 步要十几分钟。只在确实需要时用。',
+    description: '画质更好但本机偏慢：768² 一轮约 17–26 秒，1152×768 每步约 8 秒、1.01MP 会开始换页。只在确实需要时用。',
     category: 'character',
     nodes: [
       { id: 1, type: 'CheckpointLoaderSimple', title: '底模', widgets: ['waiIllustriousSDXL_v150.safetensors'], outputs: [{ name: 'MODEL', type: 'MODEL', links: [1] }, { name: 'CLIP', type: 'CLIP', links: [2, 3] }, { name: 'VAE', type: 'VAE', links: [9] }] },
@@ -5000,11 +5096,76 @@ function wireImage(image: GalleryImage): Record<string, unknown> {
 }
 
 /** One-line human summary of a produced image. */
+/**
+ * The verdict for a set of model weights, split out from the filesystem work so it
+ * can be reasoned about (and tested) on its own.
+ *
+ * This is the number the old advisory never computed: it only fired for a
+ * `CheckpointLoaderSimple` with a large latent, so a Qwen/GGUF graph — 3.90GB unet
+ * plus a 5.88GB text encoder on a 7.96GB card — sailed past it and paged for
+ * minutes instead. Two separate facts, two separate sentences, because they have
+ * different fixes: weights over VRAM stream every step, weights over free RAM get
+ * swapped to disk and make the run get slower as it goes.
+ */
+export function weightAdvisory(
+  totalBytes: number,
+  parts: Array<{ label: string; bytes: number }>,
+  vramBytes: number | undefined,
+  freeRamBytes: number,
+): string | undefined {
+  const gb = (bytes: number): string => (bytes / 1024 ** 3).toFixed(2)
+  const detail = parts.map((part) => `${part.label} ${gb(part.bytes)}GB`).join(' + ')
+  const warnings: string[] = []
+  if (vramBytes !== undefined && vramBytes > 0 && totalBytes > vramBytes) {
+    warnings.push(`权重合计 ${gb(totalBytes)}GB（${detail}）超过 ${gb(vramBytes)}GB 显存：`
+      + '采样时只能动态流式加载，上一次跑过的模型还会赖在显存里，所以"先跑别的再跑它"会明显更慢。')
+  }
+  if (totalBytes > freeRamBytes) {
+    warnings.push(`系统可用内存只剩 ${gb(freeRamBytes)}GB，装不下这 ${gb(totalBytes)}GB：`
+      + '权重会被换出到磁盘，采样每一步都要从 SSD 读，越跑越慢。')
+  }
+  if (warnings.length === 0) return undefined
+  return `⚠ ${warnings.join('')}（本机实测同一个 Qwen 工作流：108 秒 ↔ 242 秒，差别就在这里。）`
+}
+
+/** Where the model files an API graph can ask for actually live. */
+const WEIGHT_INPUTS: Array<{ classType: string; input: string; dirs: string[]; label: string }> = [
+  { classType: 'UnetLoaderGGUF', input: 'unet_name', dirs: ['models/unet', 'models/diffusion_models'], label: '主模型' },
+  { classType: 'UnetLoaderGGUFAdvanced', input: 'unet_name', dirs: ['models/unet', 'models/diffusion_models'], label: '主模型' },
+  { classType: 'UnetLoader', input: 'unet_name', dirs: ['models/unet', 'models/diffusion_models'], label: '主模型' },
+  { classType: 'CheckpointLoaderSimple', input: 'ckpt_name', dirs: ['models/checkpoints'], label: '底模' },
+  { classType: 'CLIPLoader', input: 'clip_name', dirs: ['models/text_encoders', 'models/clip'], label: '文本编码器' },
+  { classType: 'DualCLIPLoader', input: 'clip_name1', dirs: ['models/text_encoders', 'models/clip'], label: '文本编码器' },
+  { classType: 'VAELoader', input: 'vae_name', dirs: ['models/vae'], label: 'VAE' },
+]
+
+/**
+ * The sampler step count of an API graph, when it has one.
+ *
+ * A duration on its own says nothing — the same 25 steps can take 108s or 13
+ * minutes depending on whether the weights fit. Recording the two together is what
+ * makes a run comparable to the next one.
+ */
+export function graphSteps(apiGraph: Record<string, unknown>): number | undefined {
+  for (const node of Object.values(apiGraph)) {
+    const inputs = (node as { inputs?: Record<string, unknown> } | null | undefined)?.inputs
+    const value = inputs?.steps
+    if (typeof value === 'number' && value > 0) return value
+  }
+  return undefined
+}
+
 function describeImage(image: GalleryImage): string {
   const where = image.resPath ?? image.filePath
+  const seconds = typeof image.meta?.seconds === 'number' ? image.meta.seconds : undefined
+  const steps = typeof image.meta?.steps === 'number' ? image.meta.steps : undefined
+  const timing = seconds === undefined
+    ? ''
+    : `${seconds}s${steps === undefined ? '' : `（${(seconds / steps).toFixed(1)}s/步）`}`
   const extra = [
     `${image.width ?? '?'}×${image.height ?? '?'}`,
     humanSize(image.size),
+    timing,
     image.seed === undefined ? '' : `seed ${image.seed}`,
     image.method === undefined ? '' : image.method,
   ].filter((s) => s !== '')
@@ -5313,14 +5474,17 @@ function registerImageTools(
       const notes: string[] = [`后端：${ranOn ?? '?'}`]
       if (input.transparent) notes.push(`已抠成透明 PNG（${images[0]?.method ?? '?'}）`)
       if (input.seamless && (input.category === 'tile' || input.category === 'texture')) notes.push('已做无缝平铺处理')
-      // Measured on this machine: the SDXL family costs ~60-77 s/step at 768²
-      // on an 8 GB laptop GPU, so an 18-step image is ~20 minutes. SD1.5 is
-      // roughly two orders of magnitude cheaper — worth saying out loud.
+      // Measured on this machine: an SDXL workflow at 768² finishes a whole prompt
+      // in ~17-26 s, at 1152×768 each step costs ~8 s, and 1.01 MP is where the
+      // weights stop fitting and paging starts (13+ minutes, unfinished).
       const modelName = String(images[0]?.model ?? '')
       if (/xl|illustrious/i.test(modelName) && input.width * input.height >= 768 * 768) {
+        const megapixels = (input.width * input.height) / 1e6
         notes.push(
-          `注意：${modelName} 属 SDXL 系，本机（RTX 5060 Laptop / 8GB 显存）768×768 实测约 60–77 秒/步，`
-          + `${input.steps} 步约需 ${Math.round((input.steps * 68) / 60)} 分钟。草稿阶段建议降到 ≤640×640 或改用 SD1.5（anything-v5），定稿后再用 image_upscale 放大。`,
+          `注意：${modelName} 属 SDXL 系，本机（RTX 5060 Laptop / 8GB 显存）768×768 一轮约 17–26 秒，`
+          + `1152×768 每步约 8 秒；本次 ${input.width}×${input.height}（${megapixels.toFixed(2)}MP）`
+          + `${megapixels > 0.9 ? '已过 0.9MP 的换页线，可能慢到十几分钟' : `预计 ${Math.round(input.steps * 8 * (megapixels / 0.88))} 秒左右`}。`
+          + '草稿阶段建议降到 ≤640×640 或改用 SD1.5（anything-v5），定稿后再用 image_upscale 放大。',
         )
       }
       return { images: images.map(wireImage), count: images.length, hint: notes.join('；') }
