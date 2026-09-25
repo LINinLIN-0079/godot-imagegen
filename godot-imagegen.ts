@@ -995,6 +995,82 @@ interface BackendImage {
 /** Progress callback used while a backend operation runs. */
 type ProgressFn = (progress: number | undefined, message: string, preview?: string) => void
 
+/**
+ * What a ComfyUI run is doing right now, reported from the backend layer so the
+ * embedded canvas can show the run that is ACTUALLY happening.
+ *
+ * `submit` is the only phase carrying the graph, and it is the whole point: the
+ * canvas swaps to the exact API graph that went to `/prompt` — resolved prompt,
+ * seed, size and all — instead of whatever the user happened to be looking at.
+ * The later phases only carry the node/step the run has reached.
+ */
+export interface ComfyActivity {
+  phase: 'submit' | 'node' | 'step' | 'done'
+  /** Human label of the job, straight from the job registry. */
+  label?: string
+  /** The API graph being submitted — present on `submit` only. */
+  graph?: Record<string, unknown>
+  /**
+   * The UI document the API graph was compiled FROM, when there is one.
+   *
+   * A library run should put the user's own graph — with its hand-placed layout and
+   * its real widget values — on the canvas rather than a reconstruction. Nothing
+   * runs the library document directly, so the compiled `graph` stays the source of
+   * truth; this is only the nicer rendering of the same thing.
+   */
+  uiGraph?: UiWorkflow
+  /** ComfyUI's node id, which `apiToUi` preserves, so the canvas can highlight it. */
+  nodeId?: string
+  value?: number
+  max?: number
+}
+
+/**
+ * The run the canvas overlay is following. Serialised into every panel ping, so
+ * it has to stay plain JSON — the graph itself never travels here (it goes
+ * through the canvas command queue, which is acknowledged).
+ */
+export interface CanvasRun {
+  label: string
+  /** How many nodes the submitted graph has. */
+  nodes: number
+  startedAt: string
+  nodeId?: string
+  value?: number
+  max?: number
+}
+
+/**
+ * Fold one activity event into the canvas's run state.
+ *
+ * Pure on purpose: this is the state machine the canvas overlay depends on, and
+ * it is the cheapest part of the feature to test directly. Kept apart from the
+ * graph push because the two have different lifetimes — the graph stays on the
+ * canvas after the run, the run state disappears with it.
+ */
+export function applyComfyActivity(
+  run: CanvasRun | undefined,
+  activity: ComfyActivity,
+  at: string = new Date().toISOString(),
+): CanvasRun | undefined {
+  if (activity.phase === 'done') return undefined
+  if (activity.phase === 'submit') {
+    return {
+      label: activity.label ?? 'ComfyUI 运行',
+      nodes: Object.keys(activity.graph ?? {}).length,
+      startedAt: at,
+    }
+  }
+  // node / step events only refine a run we already know about: a stray one that
+  // arrives after `done` must not resurrect a finished run on the canvas.
+  if (run === undefined) return undefined
+  const next: CanvasRun = { ...run }
+  if (activity.nodeId !== undefined) next.nodeId = activity.nodeId
+  if (activity.value !== undefined) next.value = activity.value
+  if (activity.max !== undefined) next.max = activity.max
+  return next
+}
+
 /** Resolve the checkpoint to use for a call. */
 function pickModel(requested: string | undefined, configured: string | undefined, available: string[]): string | undefined {
   if (requested !== undefined) {
@@ -1104,6 +1180,13 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
    * NEXT restart — the copy has to be current before the process starts.
    */
   onBeforeLaunch?: (id: ResolvedBackend) => void | Promise<void>
+  /**
+   * Fired as a ComfyUI run progresses, so the 美术工坊 canvas can follow it.
+   *
+   * Observational only: the hook must never throw into a render, and it must not
+   * be awaited on the hot path — the canvas is a nicety, the image is the job.
+   */
+  onComfyActivity?: (activity: ComfyActivity) => void
 }) {
   const spawnProcess = makeSpawner(subprocess)
   const processes: Partial<Record<ResolvedBackend, RunningProcess>> = {}
@@ -1766,6 +1849,7 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
     totalNodes: number,
     onProgress: ProgressFn | undefined,
     signal: AbortSignal | undefined,
+    label?: string,
   ): { close: () => void } | undefined {
     if (onProgress === undefined) return undefined
     // Structural view of the browser/undici WebSocket: enough for what is used
@@ -1813,6 +1897,7 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
             eta = '（正在准备，换模型时这一步会久一些）'
           }
           onProgress(clamp(value / max, 0, 1), `采样 ${value}/${max}${eta}`)
+          hooks?.onComfyActivity?.({ phase: 'step', label, value, max })
           return
         }
         if (message.type === 'executing') {
@@ -1820,11 +1905,18 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
           if (typeof node === 'string' && node !== '') {
             executed += 1
             onProgress(undefined, `执行节点 ${Math.min(executed, totalNodes)}/${totalNodes}`)
+            // The id is what lets the canvas light up the node that is running:
+            // `apiToUi` keeps ComfyUI's node ids, so the graph on the canvas and
+            // the id in this event refer to the same node.
+            hooks?.onComfyActivity?.({ phase: 'node', label, nodeId: node })
+          } else if (node === null) {
+            hooks?.onComfyActivity?.({ phase: 'done', label })
           }
           return
         }
         if (message.type === 'execution_start') {
           onProgress(undefined, `开始执行（共 ${totalNodes} 个节点）`)
+          hooks?.onComfyActivity?.({ phase: 'step', label })
         }
       } catch {
         // A progress message must never be able to fail the render that produced it.
@@ -1884,6 +1976,10 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
     graph: Record<string, unknown>
     signal?: AbortSignal
     onProgress?: ProgressFn
+    /** Job label, carried to the canvas so the user knows WHICH run this is. */
+    label?: string
+    /** The UI document this graph came from, when the caller has one. */
+    uiGraph?: UiWorkflow
   }): Promise<BackendImage[]> {
     const clientId = randomUUID()
     const queued = (await fetchJson(`${comfyBase}/prompt`, {
@@ -1896,11 +1992,18 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
     if (typeof promptId !== 'string' || promptId === '') {
       throw new Error(`ComfyUI 拒绝了工作流：${JSON.stringify(queued.node_errors ?? queued).slice(0, 400)}`)
     }
+    // Only once ComfyUI has ACCEPTED it: the canvas must never be told about a
+    // graph that was rejected, or a failed submission would look like a run.
+    try {
+      hooks?.onComfyActivity?.({ phase: 'submit', label: params.label, graph: params.graph, uiGraph: params.uiGraph })
+    } catch {
+      /* the canvas is a nicety — it must not be able to fail the run */
+    }
     const deadline = Date.now() + cfg.requestTimeoutMs
     const started = Date.now()
     // ComfyUI reports step progress only over its WebSocket; the REST poll below
     // stays the source of truth for completion.
-    const progress = openComfyProgress(clientId, Object.keys(params.graph).length, params.onProgress, params.signal)
+    const progress = openComfyProgress(clientId, Object.keys(params.graph).length, params.onProgress, params.signal, params.label)
     try {
       while (Date.now() < deadline) {
         if (params.signal?.aborted === true) {
@@ -1947,6 +2050,9 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
       }
     } finally {
       progress?.close()
+      // Whatever happened — success, rejection, abort — the canvas stops claiming
+      // a run is in flight.
+      hooks?.onComfyActivity?.({ phase: 'done', label: params.label })
     }
     throw new Error('ComfyUI 执行超时')
   }
@@ -2788,6 +2894,7 @@ function createOps(deps: OpsDeps) {
           rgba: input.transparent && input.transparentMethod === 'generative',
         }),
         signal: job.controller.signal,
+        label: job.label,
         onProgress: (progress, message) => {
           job.progress = progress
           job.message = message
@@ -2862,6 +2969,7 @@ function createOps(deps: OpsDeps) {
           denoise: input.denoise,
         }),
         signal: job.controller.signal,
+        label: job.label,
         onProgress: (progress, message) => {
           job.progress = progress
           job.message = message
@@ -3076,6 +3184,8 @@ function createOps(deps: OpsDeps) {
       outDir?: string
       transparent?: boolean
       seamless?: boolean
+      /** The UI document this graph was compiled from, for the canvas's benefit. */
+      uiGraph?: UiWorkflow
     },
     job: Job,
   ): Promise<GalleryImage[]> {
@@ -3094,6 +3204,8 @@ function createOps(deps: OpsDeps) {
     const produced = await backends.comfyRun({
       graph: input.apiGraph,
       signal: job.controller.signal,
+      label: job.label,
+      ...(input.uiGraph === undefined ? {} : { uiGraph: input.uiGraph }),
       onProgress: (progress, message) => {
         job.progress = progress
         job.message = message
@@ -5873,6 +5985,7 @@ function registerImageTools(
             name: slugify(name),
             category,
             projectId,
+            uiGraph: graph,
             transparent: optionalBoolean(args, 'transparent', 'transparent') === true,
             seamless: optionalBoolean(args, 'seamless', 'seamless') === true,
           }, job)
@@ -6240,12 +6353,53 @@ export function apply(ctx: Context, config: unknown): void {
   const cfg = resolveConfig(config)
   const post = createPostBridge(cfg, subprocess)
   const extension = createExtensionManager(cfg, cfg.extensionSource)
+
+  // The run the canvas is following. It lives here (not in the backend layer)
+  // because three consumers share it: the canvas command queue that swaps the
+  // graph, the panel ping that drives the in-canvas overlay, and the panel's own
+  // status line.
+  let comfyRun: CanvasRun | undefined
+  let canvasQueueRef: UiQueue | undefined
+
+  /**
+   * Put the graph that is REALLY running on the canvas.
+   *
+   * The library graph is not what runs: `image_generate` resolves prompt, seed
+   * and size at call time, so the canvas used to sit on the template the user
+   * last opened while a different graph executed — the exact "画布一直是最开始
+   * 那个工作流" report. The API graph handed to `/prompt` is the truth, and
+   * `apiToUi` renders it back preserving ComfyUI's node ids, which is what the
+   * canvas needs to light up the running node later.
+   */
+  async function pushRunGraph(activity: ComfyActivity, label: string): Promise<void> {
+    try {
+      // A library run arrives with its own UI document: put THAT on the canvas, so
+      // the user sees their own layout and their own widget values instead of a
+      // reconstruction of the same graph in a generated grid.
+      const ui = activity.uiGraph ?? (activity.graph === undefined
+        ? undefined
+        : apiToUi(activity.graph, await layouts(false).catch(() => undefined)))
+      if (ui === undefined) return
+      canvasQueueRef?.push('workflow.load', `运行 · ${label}`, { id: '', name: label, running: true, graph: ui })
+    } catch {
+      // A graph the converter cannot express costs the canvas its picture, never
+      // the render.
+    }
+  }
+
   const backends = createBackends(cfg, subprocess, post, {
     onBeforeLaunch: async (id) => {
       // Best effort: the result is observable through GET /gig/extension, which
       // is where the panel and the agent read the bridge state from.
       if (id !== 'comfyui') return
       await extension.syncIfInstalled()
+    },
+    onComfyActivity: (activity) => {
+      comfyRun = applyComfyActivity(comfyRun, activity)
+      if (activity.phase === 'submit') {
+        // Deliberately not awaited: the canvas is a nicety, the render is the job.
+        void pushRunGraph(activity, activity.label ?? 'ComfyUI 运行')
+      }
     },
   })
   const jobs = createJobRegistry()
@@ -6289,6 +6443,7 @@ export function apply(ctx: Context, config: unknown): void {
   // one being offline must never mark the other unreachable. It also gets the
   // looser liveness window (see CANVAS_ONLINE_MS).
   const canvasQueue = createUiQueue({ onlineWindowMs: CANVAS_ONLINE_MS })
+  canvasQueueRef = canvasQueue
   // Why the canvas refused the last graphs. Kept in memory only, like the
   // queues: the agent needs to see "app.loadGraphData threw" instead of silently
   // retrying a graph that will never load.
@@ -6466,6 +6621,11 @@ export function apply(ctx: Context, config: unknown): void {
               type: 'canvas.load',
               seq: command.id,
               label: command.label,
+              // A graph the plugin swapped in because a run started carries the
+              // run's own name, so the canvas can say WHAT it is showing instead
+              // of leaving the user to guess whether anything changed.
+              ...(typeof command.payload.name === 'string' ? { name: command.payload.name } : {}),
+              ...(command.payload.running === true ? { running: true } : {}),
               graph: command.payload.graph,
             }))
           // A heartbeat, and NOT part of the command queue: the extension only
@@ -6473,9 +6633,13 @@ export function apply(ctx: Context, config: unknown): void {
           // the canvas's last report ages out of the 15s liveness window and the
           // panel would show "not connected" a few seconds after a successful
           // connection. It carries no seq, because there is nothing to ack.
+          //
+          // It also carries the run that is in flight, when there is one: 1.5s of
+          // latency is finer than any node takes, and riding the heartbeat means
+          // the in-canvas overlay costs no queue entries and needs no acks.
           const canvasPing = canvasToken === undefined
             ? null
-            : { __gig: canvasToken, type: 'canvas.ping' }
+            : { __gig: canvasToken, type: 'canvas.ping', ...(comfyRun === undefined ? {} : { run: comfyRun }) }
           sendJson(res, 200, {
             commands: uiQueue.pending(),
             status: uiQueue.status(),
@@ -6633,6 +6797,7 @@ export function apply(ctx: Context, config: unknown): void {
             name: slugify(meta.name),
             category,
             projectId,
+            uiGraph: graph,
             transparent: optionalBoolean(body, 'transparent', 'transparent') === true,
             seamless: optionalBoolean(body, 'seamless', 'seamless') === true,
           }, j))

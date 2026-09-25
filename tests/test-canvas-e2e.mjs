@@ -110,25 +110,51 @@ const exec = (tool, args) => tool.execute(args, { signal: { aborted: false } })
 
 // ── the "browser": the INSTALLED file, with a fake ComfyUI and a fake parent ──
 
+/** A LiteGraph-shaped graph: real node objects, so id lookups behave like the app. */
+function makeGraph(specs) {
+  const nodes = specs.map((spec, index) => (typeof spec === 'string'
+    ? { id: index + 1, type: spec }
+    : { id: spec.id, type: spec.type }))
+  return {
+    _nodes: nodes,
+    getNodeById(id) { return nodes.find((node) => node.id === Number(id)) },
+    setDirtyCanvas() { this.dirty = (this.dirty || 0) + 1 },
+  }
+}
+
 function loadInstalledExtension(script, { nodes = ['KSampler', 'CLIPTextEncode', 'KSampler'], title = 'item-icon', refuseLoad = false } = {}) {
   const posted = []
   const loaded = []
   const listeners = []
   const app = {
-    graph: { _nodes: nodes.map((type) => ({ type })) },
+    graph: makeGraph(nodes),
     workflowManager: { activeWorkflow: { name: title } },
     registerExtension() {},
     loadGraphData(graph) {
       if (refuseLoad) throw new Error('画布拒绝了这个图')
       loaded.push(graph)
+      // A real load REPLACES the graph, so the nodes the overlay had lit are gone
+      // and the extension has to re-light them on the incoming ones.
+      app.graph = makeGraph((graph && Array.isArray(graph.nodes) ? graph.nodes : []).map((node) => ({ id: node.id, type: node.type })))
     },
+  }
+  // Just enough DOM for the run banner: createElement + appendChild + style.
+  const banner = {
+    tagName: 'DIV', style: { cssText: '', display: '' }, textContent: '', parentNode: null,
+    setAttribute(name, value) { this[name] = value },
+  }
+  const doc = {
+    body: { appendChild(el) { el.parentNode = this } },
+    createElement() { return banner },
   }
   const parent = { postMessage(message, origin) { posted.push({ message, origin }) } }
   const win = { parent, app, addEventListener(type, fn) { if (type === 'message') listeners.push(fn) } }
   win.window = win
-  runInNewContext(script, { window: win, console, setInterval, clearInterval })
+  runInNewContext(script, { window: win, console, setInterval, clearInterval, document: doc })
   return {
-    posted, loaded, parent,
+    posted, loaded, parent, app, banner,
+    /** The nodes the canvas currently holds — what the overlay can light up. */
+    get nodes() { return app.graph._nodes },
     /** Deliver one envelope from the panel into the iframe. */
     deliver(message, { origin } = {}) {
       const event = { origin, data: message, source: parent }
@@ -282,7 +308,64 @@ async function main() {
     assert(later.body.canvas.lastPollSecondsAgo >= 15, 'and the card can still say how long the silence has been')
   }
 
-  // ── 8. read-only, checked rather than promised ────────────────────────────
+  // ── 8. the run overlay (what "画布上看不到在跑什么" was) ───────────────────
+  //
+  // The panel's heartbeat carries the run the host has in flight. This section
+  // drives that envelope into the INSTALLED extension and checks the two things
+  // the user was missing: the canvas says which run it is, and it marks the node
+  // ComfyUI is executing.
+  {
+    const canvas = loadInstalledExtension(installedScript)
+    await settle()
+    const run = { label: '生成 · 药水', nodes: 3, startedAt: '2026-01-01T00:00:00Z' }
+
+    canvas.deliver({ __gig: token, type: 'canvas.ping', run: Object.assign({}, run, { nodeId: '2' }) }, { origin })
+    await settle()
+    const lit = canvas.nodes.find((node) => node.id === 2)
+    assert(lit !== undefined && lit.boxcolor === '#22c55e', 'the node ComfyUI is executing gets highlighted')
+    assert(canvas.banner.style.display === 'block' && canvas.banner.textContent.includes('正在运行 · 生成 · 药水'),
+      'and the canvas itself names the run that is on it')
+    assert(canvas.banner[ 'data-gig-run' ] !== undefined, 'the banner is marked, so it is ours and not ComfyUI chrome')
+
+    canvas.deliver({ __gig: token, type: 'canvas.ping', run: Object.assign({}, run, { nodeId: '2', value: 4, max: 10 }) }, { origin })
+    await settle()
+    assert(canvas.banner.textContent.includes('采样 4/10'), 'the step count rides the same heartbeat')
+
+    // A load that arrives mid-run REPLACES the whole graph — and the host re-offers
+    // an unacknowledged load on every poll, so this happens repeatedly during a
+    // run. The highlight has to move onto the new node objects each time instead
+    // of dying with the old ones.
+    const swap = { __gig: token, type: 'canvas.load', seq: 'swap-1', name: '生成 · 药水', running: true, graph: { nodes: [{ id: 7, type: 'KSampler' }] } }
+    canvas.deliver(swap, { origin })
+    await settle()
+    assert(canvas.nodes.find((node) => node.id === 2) === undefined, 'a loaded graph replaces the canvas rather than merging into it')
+    canvas.deliver({ __gig: token, type: 'canvas.ping', run: Object.assign({}, run, { nodeId: '7' }) }, { origin })
+    await settle()
+    assert(canvas.nodes.find((node) => node.id === 7).boxcolor === '#22c55e', 'the new graph gets the running node highlighted on it')
+    // Re-delivered (exactly what the panel does while the load is unacknowledged):
+    // the run state is unchanged, yet the highlight must be re-applied to the graph
+    // that just replaced it.
+    canvas.deliver(swap, { origin })
+    await settle()
+    assert(canvas.nodes.find((node) => node.id === 7).boxcolor === '#22c55e',
+      'and re-delivering that same graph keeps the highlight, rather than skipping the repaint')
+
+    canvas.deliver({ __gig: token, type: 'canvas.ping' }, { origin })
+    await settle()
+    const after = canvas.nodes.find((node) => node.id === 7)
+    assert(after.boxcolor === undefined, 'an idle heartbeat drops the highlight')
+    assert(canvas.banner.style.display === 'none', 'and hides the run banner again')
+
+    // A canvas that never got a run envelope must not draw one: this is the
+    // ordinary "nothing is running" heartbeat.
+    const quiet = loadInstalledExtension(installedScript)
+    await settle()
+    quiet.deliver({ __gig: token, type: 'canvas.ping' }, { origin })
+    await settle()
+    assert(quiet.banner.style.display !== 'block', 'a plain heartbeat draws no banner at all')
+  }
+
+  // ── 9. read-only, checked rather than promised ────────────────────────────
   const after = await stat(manifestPath)
   const stubAfter = await stat(installedJsPath)
   assert(after.size === before.size && after.mtimeMs === before.mtimeMs, 'the install manifest was not touched by this test')

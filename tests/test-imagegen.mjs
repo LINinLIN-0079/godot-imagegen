@@ -1238,6 +1238,102 @@ async function main() {
     fakeComfyHoldPolls = 0
   }
 
+  // ── the canvas follows the run that is actually happening ──
+  //
+  // The user's report: "画布里面仍然是一开始的工作流…我能看到你在进行画画，但是我看不到
+  // 具体运行的工作流". Only `image_workflow open/patch` ever pushed a graph, so every
+  // generation — including the library `run` they watched — left the canvas on the
+  // template they had opened. And what runs is NOT the library graph: prompt, seed
+  // and size are resolved at call time, so the canvas has to be given the compiled
+  // API graph. This block drives the real submit path against a held run and reads
+  // the envelope the panel would relay.
+  {
+    const realWebSocket = globalThis.WebSocket
+    globalThis.WebSocket = FakeWebSocket
+    // A ComfyUI install of its own, so the bridge can be installed for real
+    // without ever touching the user's own install.
+    const bridgeComfy = join(workRoot, 'bridge-comfy')
+    await mkdir(join(bridgeComfy, 'ComfyUI', 'custom_nodes'), { recursive: true })
+    const canvasCfg = Object.assign({}, config, {
+      unitName: 'godot_imagegen_test_canvas',
+      dataRoot: join(workRoot, 'data-canvas'),
+      comfyRoot: bridgeComfy,
+    })
+    const canvasServer = makeWebServer()
+    const canvasCtx = makeCtx(storage, { webServer: canvasServer })
+    plugin.apply(canvasCtx.ctx, canvasCfg)
+    const canvasWorkshop = byName(canvasCtx.registered, 'image_workshop')
+    const canvasGenerate = byName(canvasCtx.registered, 'image_generate')
+    const installResult = unwrap(await exec(canvasWorkshop, { action: 'install-bridge', origin: 'http://127.0.0.1:43120' }))
+    assert(installResult.bridge.installed === true, 'the bridge installs into a ComfyUI of the test\'s own')
+
+    const canvasPoll = () => callRoute(canvasServer, 'POST', '/gig/ui/poll', {})
+    const promptBodies = () => comfyRequests.filter((r) => r.method === 'POST' && r.url === '/prompt')
+
+    fakeComfyHoldPolls = 6
+    const socketsBefore = fakeSockets.length
+    const running = exec(canvasGenerate, { prompt: 'canvas follow probe', category: 'concept', backend: 'comfyui', project_id: 'canvasrun' })
+    await new Promise((r) => setTimeout(r, 600))
+
+    const midPoll = await canvasPoll()
+    const load = (midPoll.body.canvasMessages || []).find((m) => m.type === 'canvas.load')
+    assert(load !== undefined && load.running === true, 'a ComfyUI run puts its graph on the canvas queue while it runs')
+    const submitted = JSON.parse(promptBodies().pop().raw)
+    const submittedIds = Object.keys(submitted.prompt).map(Number).sort((a, b) => a - b)
+    const pushedIds = (load.graph.nodes || []).map((node) => node.id).sort((a, b) => a - b)
+    assert(pushedIds.length === submittedIds.length && pushedIds.join(',') === submittedIds.join(','),
+      `and it is the graph that was REALLY submitted, node for node (${pushedIds.join(',')})`)
+    assert(Array.isArray(load.graph.links) && load.graph.links.length > 0, 'with its links, so the canvas can draw it')
+    assert(typeof load.name === 'string' && load.name.length > 0 && load.label === `运行 · ${load.name}`,
+      `named after the run so the user can tell it apart (${load.label})`)
+    assert(midPoll.body.canvasPing.run !== undefined && midPoll.body.canvasPing.run.label === load.name,
+      'and the heartbeat carries the run while it is in flight')
+    assert(midPoll.body.canvasPing.run.nodes === submittedIds.length,
+      'with the node count of that same graph')
+
+    const socket = fakeSockets[socketsBefore]
+    assert(socket !== undefined, 'the run still opens its progress socket')
+    const nodeId = Object.keys(submitted.prompt)[2]
+    socket.emit({ type: 'executing', data: { node: nodeId } })
+    socket.emit({ type: 'progress', data: { value: 2, max: 8 } })
+    await new Promise((r) => setTimeout(r, 200))
+    const stepPoll = await canvasPoll()
+    assert(stepPoll.body.canvasPing.run.nodeId === nodeId,
+      'the running node id reaches the canvas (the same id the pushed graph uses, so it can be highlighted)')
+    assert(stepPoll.body.canvasPing.run.value === 2 && stepPoll.body.canvasPing.run.max === 8,
+      'and so does the step counter')
+
+    await running
+    fakeComfyHoldPolls = 0
+    const donePoll = await canvasPoll()
+    assert(donePoll.body.canvasPing.run === undefined, 'once the run ends the heartbeat stops claiming one')
+    assert((donePoll.body.canvasMessages || []).some((m) => m.type === 'canvas.load'),
+      'while the graph itself stays on the canvas, ready to be looked at after the fact')
+
+    // SD WebUI has no graph to show: an SD run must not overwrite the canvas with
+    // a ComfyUI graph it never ran.
+    const queuedBefore = (await canvasPoll()).body.canvasMessages.length
+    await exec(canvasGenerate, { prompt: 'sd should not touch the canvas', category: 'concept', project_id: 'sdrun' })
+    const afterSd = await canvasPoll()
+    assert(afterSd.body.canvasMessages.length === queuedBefore, 'an SD WebUI run queues nothing for the ComfyUI canvas')
+    assert(afterSd.body.canvasPing.run === undefined, 'and reports no canvas run either')
+
+    // A library run carries its own UI document, so the canvas gets the user's own
+    // layout and widget values rather than a same-shaped reconstruction.
+    await callRoute(canvasServer, 'GET', '/gig/workflows')
+    const stored = await callRoute(canvasServer, 'GET', '/gig/workflow?id=item-icon')
+    assert(stored.status === 200 && Array.isArray(stored.body.graph.nodes), 'the item-icon workflow is in the library')
+    await callRoute(canvasServer, 'POST', '/gig/workflow/run', { id: 'item-icon', category: 'item', projectId: 'canvaslib' })
+    await new Promise((r) => setTimeout(r, 500))
+    const libLoads = ((await canvasPoll()).body.canvasMessages || []).filter((m) => m.type === 'canvas.load')
+    const libLoad = libLoads[libLoads.length - 1]
+    const placed = (graph) => JSON.stringify((graph.nodes || []).map((node) => [node.id, node.pos]))
+    assert(placed(libLoad.graph) === placed(stored.body.graph),
+      'a library run puts that very document on the canvas — same ids AND same hand-placed layout')
+
+    globalThis.WebSocket = realWebSocket
+  }
+
   // ── the VRAM advisory ──
   //
   // The measured cliff on an 8 GB card: SDXL at 0.88 MP took 80s for 10 steps, and

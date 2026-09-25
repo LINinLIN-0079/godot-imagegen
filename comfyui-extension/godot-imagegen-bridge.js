@@ -111,7 +111,109 @@
     var app = findApp()
     if (!app) throw new Error('ComfyUI app 尚未就绪')
     if (typeof app.loadGraphData !== 'function') throw new Error('此 ComfyUI 版本没有 app.loadGraphData')
-    return app.loadGraphData(graph)
+    var result = app.loadGraphData(graph)
+    // The nodes the highlight was on are gone with the old graph, so the run
+    // currently in flight has to be re-lit on the graph that just arrived — and
+    // FORCED, because the run state itself did not change and the "same run, skip
+    // the redraw" guard would otherwise skip exactly this repaint.
+    if (lastRun) applyRun(lastRun, true)
+    return result
+  }
+
+  // ── the running-workflow overlay ──────────────────────────────────────────
+  //
+  // The canvas is a foreign page and already has its own idea of "the current
+  // workflow": `app.loadGraphData` swaps the nodes, but the title in the sidebar
+  // keeps the name of whatever the user had open. That is why a host that only
+  // replaced the graph still LOOKED like nothing happened. So the plugin's run is
+  // announced inside the canvas instead: a banner naming the run and its step,
+  // plus a highlight on the node ComfyUI is executing right now.
+  //
+  // The node ids line up because `apiToUi` preserves the ids ComfyUI reports over
+  // its own WebSocket — the graph on the canvas and the executing event refer to
+  // the same node.
+  var banner = null
+  var lit = null
+  var lastRun = null
+  var drawnKey = ''
+
+  function ensureBanner() {
+    if (banner && banner.parentNode) return banner
+    if (typeof document === 'undefined' || !document || !document.body) return null
+    banner = document.createElement('div')
+    banner.setAttribute('data-gig-run', '')
+    banner.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);'
+      + 'z-index:2147483000;pointer-events:none;display:none;white-space:nowrap;'
+      + 'padding:6px 14px;border-radius:999px;font:12px/1.45 system-ui,"Segoe UI",sans-serif;'
+      + 'background:rgba(15,23,42,.92);color:#e2e8f0;border:1px solid rgba(34,197,94,.65);'
+      + 'box-shadow:0 6px 20px rgba(0,0,0,.35)'
+    document.body.appendChild(banner)
+    return banner
+  }
+
+  /** Drop the highlight, restoring the node's own colours. */
+  function unlight() {
+    if (lit === null) return
+    var app = findApp()
+    var graph = app && app.graph
+    var id = lit
+    lit = null
+    if (!graph || typeof graph.getNodeById !== 'function') return
+    try {
+      var node = graph.getNodeById(Number(id))
+      if (!node) return
+      node.boxcolor = undefined
+      node.bgcolor = undefined
+      if (typeof graph.setDirtyCanvas === 'function') graph.setDirtyCanvas(true, true)
+    } catch (e) { /* a node that cannot be repainted is not worth an error */ }
+  }
+
+  /** Draw the run state the host put on its heartbeat. `null` clears it. */
+  function drawRun(run, force) {
+    // Remembered before the "unchanged, skip the repaint" guard: the graph can be
+    // replaced under an unchanged run (the host re-offers an unacknowledged load on
+    // every poll), and that repaint still has to know which node is running.
+    lastRun = run === undefined ? null : run
+    var label = run && typeof run === 'object' ? String(run.label || 'ComfyUI') : ''
+    var key = run && typeof run === 'object'
+      ? label + '|' + run.value + '/' + run.max + '|' + run.nodeId
+      : 'idle'
+    if (!force && key === drawnKey) return
+    drawnKey = key
+    var el = ensureBanner()
+    unlight()
+    if (run === null || run === undefined || typeof run !== 'object') {
+      if (el) el.style.display = 'none'
+      return
+    }
+    var text = '▶ 正在运行 · ' + label
+    if (run.value !== undefined && run.value !== null && run.max) text += ' · 采样 ' + run.value + '/' + run.max
+    if (run.nodes) text += ' · ' + run.nodes + ' 个节点'
+    if (el) {
+      el.textContent = text
+      el.style.display = 'block'
+    }
+    if (run.nodeId === undefined || run.nodeId === null) return
+    var app = findApp()
+    var graph = app && app.graph
+    if (!graph || typeof graph.getNodeById !== 'function') return
+    var node = graph.getNodeById(Number(run.nodeId))
+    if (!node) return
+    lit = String(run.nodeId)
+    try {
+      node.boxcolor = '#22c55e'
+      node.bgcolor = '#14532d'
+      if (typeof graph.setDirtyCanvas === 'function') graph.setDirtyCanvas(true, true)
+    } catch (e) { /* ignore */ }
+  }
+
+  /** Never let the overlay break the heartbeat it rides on. */
+  function applyRun(run, force) {
+    try {
+      drawRun(run, force)
+    } catch (e) {
+      console.warn('[godot-imagegen] 画布运行提示绘制失败', e)
+    }
   }
 
   /** Answer the parent frame, always pinned to the origin we were installed for. */
@@ -141,6 +243,10 @@
     if (!data || typeof data !== 'object' || data.__gig !== TOKEN) return
 
     if (data.type === 'canvas.ping') {
+      // The heartbeat carries the run in flight, when there is one: the host
+      // stamps its own progress onto it, so the canvas follows the same numbers
+      // the panel shows and no extra queue entry has to be acknowledged.
+      applyRun(data.run)
       reply(event.source, { __gig: TOKEN, type: 'canvas.state', state: summarizeGraph() })
       return
     }

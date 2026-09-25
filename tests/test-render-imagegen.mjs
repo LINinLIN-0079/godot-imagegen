@@ -287,6 +287,25 @@ const fakeFrame = { postMessage: (message, origin) => { sentMessages.push({ mess
   assert(/42 秒没应声/.test(quiet) && /「画布」/.test(quiet), 'a canvas that answered then went quiet reports the gap and points at the 画布 section')
   const never = plugin.canvasStatusLine({ online: false }, undefined, false)
   assert(/重启 ComfyUI/.test(never) && !/没应声/.test(never), 'a canvas that never answered points at the restart instead')
+  assert(/覆盖画布上未保存的改动/.test(plugin.canvasStatusLine({ online: true }, undefined, true)),
+    'and a live canvas warns that a run replaces unsaved canvas edits')
+}
+
+// The run line is what turns "画布上还是最开始那个工作流" into an answer: the panel
+// names the run the host put on the canvas, and how far along it is.
+{
+  assert(plugin.runLine({ label: '生成 · 药水', nodes: 7 }) === '▶ 正在运行 · 生成 · 药水 · 7 个节点',
+    `the run line names the workflow and its node count (${plugin.runLine({ label: '生成 · 药水', nodes: 7 })})`)
+  assert(/采样 4\/10/.test(plugin.runLine({ label: 'x', nodes: 7, value: 4, max: 10 })), 'and counts the steps once sampling starts')
+  assert(plugin.runLine({} ) === '▶ 正在运行 · ComfyUI', 'a nameless run still reads as one instead of printing undefined')
+  assert(plugin.runLine({ label: 'x', nodes: 7, value: 0, max: 10 }).includes('采样 0/10'), 'step 0 is shown, not dropped as falsy')
+  // The poll runs every 1.5s: identical runs must not produce a new object, or the
+  // card would re-render for the whole render.
+  assert(plugin.runKey({ label: 'x', nodes: 7, value: 4, max: 10, nodeId: '3' })
+    === plugin.runKey({ label: 'x', nodes: 7, value: 4, max: 10, nodeId: '3' }), 'the same run keys identically')
+  assert(plugin.runKey({ label: 'x', nodes: 7, value: 5, max: 10 }) !== plugin.runKey({ label: 'x', nodes: 7, value: 4, max: 10 }),
+    'a step change does not')
+  assert(plugin.runKey(null) === '' && plugin.runKey(undefined) === '', 'and idle is idle, whichever way it arrives')
 }
 
 // ── step 3: apply() against a capturing betterSidebar ──
@@ -901,6 +920,14 @@ assert(bridgeCard.includes('SomeCustomNode'), 'and warns about node classes this
 assert(bridgeCard.includes('画布拒绝了最近 1 次载入') && bridgeCard.includes('loadGraphData 炸了'),
   'and surfaces a graph the canvas refused, instead of a push that silently did nothing')
 assert(bridgeCard.includes('godot-imagegen-bridge'), 'and names the directory it writes into')
+const bridgeRunning = renderTree(React.createElement(plugin.BridgeCard, {
+  bridge: { installed: true, files: 2, detail: '已安装', canvas: { online: true, nodeCount: 7 } },
+  busy: false, canPush: true, onInstall() {}, onUninstall() {}, onPush() {}, onRefresh() {},
+  run: { label: '工作流 · 道具图标', nodes: 7, value: 3, max: 10 },
+}))
+assert(bridgeRunning.includes('正在运行 · 工作流 · 道具图标') && bridgeRunning.includes('采样 3/10'),
+  'BridgeCard names the run the canvas is showing, with its step')
+assert(!bridgeCard.includes('正在运行'), 'and stays quiet when nothing is running')
 const bridgeOffline = renderTree(React.createElement(plugin.BridgeCard, {
   bridge: { installed: true, files: 2, detail: '已安装', stale: true, canvas: { online: false } },
   busy: false, canPush: false, onInstall() {}, onUninstall() {}, onPush() {}, onRefresh() {},
