@@ -1427,7 +1427,7 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
     // --server-name (which is also the default) and never passing --listen.
     const argv = id === 'sdwebui'
       ? [python, 'launch.py', '--api', '--port', String(cfg.sdwebuiPort), '--server-name', '127.0.0.1', '--skip-prepare-environment', '--no-download-sd-model']
-      : [python, '-s', 'main.py', '--port', String(cfg.comfyPort), '--listen', '127.0.0.1']
+      : comfyLaunchArgs(python, cfg.comfyPort)
     const cwd = id === 'sdwebui' ? root : `${root}/ComfyUI`
     if (!fileExists(cwd)) return { ok: false, detail: `启动目录不存在：${cwd}` }
     const proc = spawnProcess({ argv, cwd, env: { PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' } })
@@ -5128,6 +5128,24 @@ export function weightAdvisory(
   return `⚠ ${warnings.join('')}（本机实测同一个 Qwen 工作流：108 秒 ↔ 242 秒，差别就在这里。）`
 }
 
+/**
+ * The ComfyUI launch line.
+ *
+ * ComfyUI's defaults are tuned for a machine where every model fits: it keeps the
+ * previous checkpoint warm and holds onto weights it is not using. On an 8 GB card
+ * that is exactly the "先跑别的模型，再跑 Qwen 就特别慢" pattern — the new model
+ * streams while the old one squats in VRAM (measured here: the same Qwen workflow
+ * took 108s warm versus 242s when it had to fight for the card), and split
+ * cross-attention lowers the sampling peak that decides whether a step fits.
+ * Exported so the flags are assertable without starting a backend.
+ */
+export function comfyLaunchArgs(python: string, port: number): string[] {
+  return [
+    python, '-s', 'main.py', '--port', String(port), '--listen', '127.0.0.1',
+    '--cache-none', '--disable-smart-memory', '--use-split-cross-attention',
+  ]
+}
+
 /** Where the model files an API graph can ask for actually live. */
 const WEIGHT_INPUTS: Array<{ classType: string; input: string; dirs: string[]; label: string }> = [
   { classType: 'UnetLoaderGGUF', input: 'unet_name', dirs: ['models/unet', 'models/diffusion_models'], label: '主模型' },
@@ -5811,8 +5829,8 @@ function registerImageTools(
     const found = await layouts(force)
     if (found === undefined) {
       throw new Error(
-        '还没有节点定义（/object_info），无法按名字读写工作流参数。'
-        + '请先启动 ComfyUI（image_backend_status action="start"）—— 插件会读取一次并缓存，之后即使后端关闭也能继续编辑。',
+        '没有可用的节点定义：既读不到 ComfyUI 的 /object_info，本地也没有缓存。'
+        + '启动 ComfyUI（image_backend_status action="start"）后重试一次——插件会读取并缓存，之后即使后端关闭也能继续编辑。',
       )
     }
     return found
@@ -6620,13 +6638,23 @@ export function apply(ctx: Context, config: unknown): void {
    * `force` (or a cold cache) fetches the live `/object_info` and re-caches it —
    * which is also how a newly installed custom node becomes editable.
    */
+  /**
+   * The widget layouts that make name-addressed edits possible.
+   *
+   * `force` means "ask ComfyUI again", NOT "refuse the cache": a refresh that fails
+   * (a busy backend timing out on a 1700-node /object_info, which is exactly what
+   * happens while ComfyUI is rendering) used to return nothing and make `patch`
+   * fail with "还没有节点定义" even though a perfectly good cache was on disk — while
+   * `run`, which reads the cache first, sailed through. A failed refresh now falls
+   * back to what we already have.
+   */
   async function layouts(force = false): Promise<Record<string, WidgetSpec[]> | undefined> {
     if (!force) {
       const cached = await layoutCache.load()
       if (cached !== undefined) return cached
     }
     const info = await backends.comfyObjectInfo()
-    if (info === undefined) return force ? undefined : layoutCache.load()
+    if (info === undefined) return layoutCache.load()
     const compact = compactLayouts(info)
     if (Object.keys(compact).length === 0) return layoutCache.load()
     await layoutCache.store(compact, 'comfyui')

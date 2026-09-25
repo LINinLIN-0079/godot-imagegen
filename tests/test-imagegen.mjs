@@ -220,6 +220,13 @@ let fakeComfyHoldPolls = 0
  */
 let fakeComfyDuplicateOutputs = false
 
+/**
+ * When true, `/object_info` answers 500. A busy ComfyUI really does time out on a
+ * 1700-node object_info while it renders, and the plugin must fall back to its cache
+ * instead of declaring that it has no node definitions at all.
+ */
+let fakeComfyObjectInfoFails = false
+
 /** Every WebSocket the plugin opened, with a handle to feed it frames. */
 const fakeSockets = []
 class FakeWebSocket {
@@ -269,6 +276,11 @@ function startFakeComfy(port, requests) {
       return json({ CheckpointLoaderSimple: { input: { required: { ckpt_name: [['anything-v5.safetensors']] } } } })
     }
     if (req.method === 'GET' && url === '/object_info') {
+      if (fakeComfyObjectInfoFails) {
+        res.writeHead(500, { 'content-type': 'application/json' })
+        res.end('{}')
+        return
+      }
       // The classes the built-in workflow templates use, in the real slot shapes.
       // KSampler's seed carries control_after_generate, i.e. TWO serialised slots.
       return json({
@@ -1532,6 +1544,14 @@ async function main() {
     assert(plugin.weightAdvisory(total, qwenParts, undefined, 32 * 1024 ** 3) === undefined,
       '读不到显卡信息时不瞎猜，只在真的超了内存时才说')
 
+    // ⑥ 启动参数：默认的 ComfyUI 会把上一个模型留在显存里，正是"先跑别的再跑 Qwen 特别慢"
+    // 的来源；这三面旗子是插件拉起实例时的固定行为，别再被顺手删掉。
+    const launch = plugin.comfyLaunchArgs('D:/aki/python.exe', 8188)
+    assert(launch.includes('--cache-none'), '启动 ComfyUI 时不缓存上一个模型（--cache-none）')
+    assert(launch.includes('--disable-smart-memory'), '并让它该放就放（--disable-smart-memory）')
+    assert(launch.includes('--use-split-cross-attention'), '采样峰值更低（--use-split-cross-attention）')
+    assert(launch.join(' ').includes('--port 8188') && launch.includes('127.0.0.1'), '端口与只听本机不变')
+
     // 去重 + 耗时：让假的 ComfyUI 把同一张图挂在两个输出节点上。用一个自己的实例，
     // 免得跟在别的用例后面被 dispose 掉。
     const dupServer = makeWebServer()
@@ -1556,6 +1576,29 @@ async function main() {
       `以及采样步数（${record && record.meta && record.meta.steps}），耗时才有比较意义`)
     assert(record.width > 0 && record.height > 0,
       `并从 PNG 本身补上了尺寸（${record && record.width}×${record && record.height}）`)
+
+    // ② force_layout_refresh 曾经把缓存也一起否掉：那次刷新失败（ComfyUI 正忙着出图，
+    // 1700 个节点的 /object_info 超时）之后，patch 直接报"还没有节点定义"，而同样读缓存
+    // 的 run 却好好的。force 的意思应该是"再问一次"，不是"不要缓存"。
+    const patchServer = makeWebServer()
+    const patchCtx = makeCtx(storage, { webServer: patchServer })
+    plugin.apply(patchCtx.ctx, Object.assign({}, config, {
+      unitName: 'godot_imagegen_test_patch',
+      dataRoot: join(workRoot, 'data-patch'),
+    }))
+    const patchWorkflow = byName(patchCtx.registered, 'image_workflow')
+    await exec(patchWorkflow, { action: 'list' })
+    const warmed = unwrap(await exec(patchWorkflow, {
+      action: 'patch', id: 'item-icon', edits: [{ classType: 'KSampler', set: { steps: 12 } }],
+    }))
+    assert(warmed.applied.length === 1, '缓存热的时候能按名字改参数')
+    fakeComfyObjectInfoFails = true
+    const fromCache = unwrap(await exec(patchWorkflow, {
+      action: 'patch', id: 'item-icon', force_layout_refresh: true, edits: [{ classType: 'KSampler', set: { steps: 14 } }],
+    }))
+    assert(fromCache.applied.length === 1,
+      '刷新 /object_info 失败时仍用缓存改参数（force = 再问一次，不是不要缓存）')
+    fakeComfyObjectInfoFails = false
   }
 
   // ── summary ──

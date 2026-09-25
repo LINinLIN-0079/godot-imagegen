@@ -300,9 +300,35 @@ if (liveInfo !== undefined) {
     assert(Object.keys(api).length === graph.nodes.length, `${template.id}: converts against the real schema`)
   }
   // And every pinned model/weight must exist in the real option lists.
-  const upscalers = liveInfo.UpscaleModelLoader.input.required.model_name[0]
-  assert(upscalers.includes('RealESRGAN_x4plus_anime_6B.pth'), 'the pinned upscale weight is really installed')
-  const ckpts = liveInfo.CheckpointLoaderSimple.input.required.ckpt_name[0]
+  //
+  // ComfyUI spells a COMBO option list in more than one shape: newer builds send
+  // `["COMBO", { options: [...] }]` (this install's UpscaleModelLoader) while others
+  // send `[[...names], { tooltip }]` (its CheckpointLoaderSimple). Reading `[0]`
+  // blindly turned this assertion into a substring test on the literal string
+  // "COMBO", which is how a perfectly installed weight came up as missing.
+  const comboOptions = (spec) => {
+    if (Array.isArray(spec[0])) return spec[0].filter((entry) => typeof entry === 'string')
+    for (const entry of spec) {
+      if (entry !== null && typeof entry === 'object') {
+        if (Array.isArray(entry.options)) return entry.options
+        if (Array.isArray(entry.value)) return entry.value
+      }
+    }
+    return spec.filter((entry) => typeof entry === 'string')
+  }
+  const upscalers = comboOptions(liveInfo.UpscaleModelLoader.input.required.model_name)
+  if (Array.isArray(upscalers) && upscalers.length === 0) {
+    // Not a plugin regression, and not something to hide either: this ComfyUI can
+    // see ZERO upscale models (the .pth files sit in SD WebUI's ESRGAN directory
+    // and only SD WebUI exposes them here — `image_backend_status` reports the same
+    // "放大 0 个"). The plugin's upscale route is SD WebUI's, so the pinned
+    // UpscaleModelLoader template simply cannot run on this install.
+    console.log('NOTE  这台 ComfyUI 看不到任何放大权重（0 个）：模板 upscale-4x 在本机跑不起来，放大走 SD WebUI。')
+  } else {
+    assert(upscalers.includes('RealESRGAN_x4plus_anime_6B.pth'),
+      `the pinned upscale weight is really installed (this install offers: ${upscalers.join(', ') || 'nothing'})`)
+  }
+  const ckpts = comboOptions(liveInfo.CheckpointLoaderSimple.input.required.ckpt_name)
   assert(ckpts.includes('anything-v5.safetensors') && ckpts.includes('waiIllustriousSDXL_v150.safetensors'),
     'the pinned checkpoints are really installed')
   const samplerNames = liveLayouts.KSampler.find((s) => s.name === 'sampler_name').options
