@@ -281,10 +281,18 @@ async function main() {
     assert(relayed.body.canvasInbound.accepted === 1, 'the panel relays that failure up')
     const errors = await callRoute(webServer, 'GET', '/gig/extension')
     assert(errors.body.errors.some((e) => /画布拒绝了这个图/.test(e.error)),
-      'and the host surfaces it where the agent can read it (image_workshop bridge-status)')
+      'and the refusal is recorded on the host (the route the PANEL reads)')
 
+    // The next two lines used to be one assertion claiming "the host surfaces it
+    // where the AGENT can read it (image_workshop bridge-status)" while only ever
+    // checking the route above — and the tool reported no errors at all. So an
+    // agent that had just been told 「✓ 已直接推送到内嵌 ComfyUI 画布」 had no way to
+    // learn the canvas had refused the graph. Asserted against the tool now.
     const statusTool = await exec(workshopTool, { action: 'bridge-status' })
     assert(statusTool.bridge.installed === true, 'image_workshop action=bridge-status sees the real install')
+    assert(Array.isArray(statusTool.bridge.canvasErrors)
+      && statusTool.bridge.canvasErrors.some((line) => /画布拒绝了这个图/.test(line)),
+      'and the TOOL exposes the refusal, so the AGENT can read it and not only the panel')
     const readCanvas = await exec(workshopTool, { action: 'read-canvas' })
     assert(readCanvas.bridge.canvasOnline === true, 'and read-canvas sees the canvas that just answered')
     assert(readCanvas.bridge.canvasMissingClasses === undefined, 'with no missing node classes for the clean graph')

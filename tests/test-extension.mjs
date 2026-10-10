@@ -387,7 +387,7 @@ async function main() {
   const runtimeToken = JSON.parse(await readFile(join(workRoot, 'data-vm', 'installed-files.json'), 'utf8')).token
   const runtimeScript = await readFile(join(runtimeManager.targetDir, 'web', 'godot-imagegen-bridge.js'), 'utf8')
 
-  function loadCanvasRuntime(script, { throwOnLoad = false } = {}) {
+  function loadCanvasRuntime(script, { throwOnLoad = false, silentLoad = false } = {}) {
     const listeners = []
     const posted = []
     const loaded = []
@@ -398,6 +398,13 @@ async function main() {
       loadGraphData(graph) {
         if (throwOnLoad) throw new Error('loadGraphData 炸了')
         loaded.push(graph)
+        // A real load REPLACES the graph. This fake used to only record the call,
+        // which models exactly the state a FAILED load leaves behind: the old graph
+        // still loaded. So "ok:true beside an unchanged canvas" was the only thing
+        // this suite could ever see — and that is the bug, because ComfyUI reports
+        // a refused load with a modal rather than a rejection.
+        if (silentLoad) return
+        app.graph = { _nodes: (graph && Array.isArray(graph.nodes) ? graph.nodes : []).map((n) => ({ id: n.id, type: n.type })) }
       },
     }
     const parent = { postMessage: (message, origin) => posted.push({ message, origin }) }
@@ -455,6 +462,23 @@ async function main() {
     await settle()
     const result = runtime.posted[runtime.posted.length - 1].message
     assert(result.type === 'canvas.result' && result.ok === false && /loadGraphData 炸了/.test(result.error), 'a graph the canvas refuses is reported as a failure with the reason')
+  }
+
+  {
+    // The failure that actually happened on the machine, and the one no earlier
+    // test could see: ComfyUI RESOLVES the load and says nothing — the graph is
+    // simply never replaced — and the refusal exists only as a modal on the canvas.
+    // A host that trusted the promise reported success, and the agent, the panel
+    // and the user were all told a workflow had been placed that never was.
+    const runtime = loadCanvasRuntime(runtimeScript, { silentLoad: true })
+    await settle()
+    deliver(runtime, { origin: 'http://127.0.0.1:43120', data: { __gig: runtimeToken, type: 'canvas.load', seq: 'seq-silent', graph: { nodes: [{ id: 1, type: 'EmptyLatentImage' }, { id: 2, type: 'SaveImage' }] } }, source: runtime.parent })
+    await settle()
+    const result = runtime.posted[runtime.posted.length - 1].message
+    assert(result.type === 'canvas.result' && result.seq === 'seq-silent' && result.ok === false,
+      'a load the canvas silently ignored is reported as a FAILURE, not as success')
+    assert(/画布没有换图/.test(result.error) && /EmptyLatentImage×1/.test(result.error) && /KSampler×2/.test(result.error),
+      'and the reason names what was pushed against what the canvas actually holds')
   }
 
   // ── K: the plugin-level bridge (routes + tools) ────────────────────────────

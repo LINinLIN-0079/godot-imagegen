@@ -5280,10 +5280,16 @@ function registerImageTools(
     extension: ExtensionManager
     /** Cached node layouts, refreshed from ComfyUI on demand. */
     layouts: (force?: boolean) => Promise<Record<string, WidgetSpec[]> | undefined>
+    /**
+     * Canvas load refusals, oldest first. The routes already read this; the tools
+     * need it too, because otherwise an agent told 「✓ 已推送」 has no way to learn
+     * that the canvas rejected the load.
+     */
+    canvasErrors: Array<{ at: string; seq: string; error: string }>
   },
 ): void {
   const { cfg, jobs, gallery, backends, post, runWorkflow } = ops
-  const { library, queue, canvas, extension, layouts } = deps
+  const { library, queue, canvas, extension, layouts, canvasErrors } = deps
   const projectIdParam = { type: 'string', description: '图库归属的项目 id（可选，默认 default；与 Godot 资产管理器的项目对应）。' }
 
   /** Watch a tool's abort flag and cancel the matching job. */
@@ -6331,6 +6337,7 @@ function registerImageTools(
               canvasNodeCount: { type: 'number' },
               canvasClasses: { type: 'array', items: { type: 'string' } },
               canvasMissingClasses: { type: 'array', items: { type: 'string' } },
+              canvasErrors: { type: 'array', items: { type: 'string' } },
               canvasTitle: { type: 'string' },
             },
             required: ['installed'],
@@ -6377,6 +6384,7 @@ function registerImageTools(
             canvasNodeCount?: number
             canvasClasses?: string[]
             canvasMissingClasses?: string[]
+            canvasErrors?: string[]
             canvasTitle?: string
           }
           state?: { updatedAt: string; lastPollSecondsAgo?: number; section?: string; activeWorkflowId?: string; selectedImageId?: string; formDescription?: string; canvasNodes?: number }
@@ -6402,6 +6410,10 @@ function registerImageTools(
           }
           if (b.canvasMissingClasses !== undefined && b.canvasMissingClasses.length > 0) {
             lines.push(`  ⚠ 画布缺少这些节点类型（需要装对应自定义节点）：${b.canvasMissingClasses.join(', ')}`)
+          }
+          if (b.canvasErrors !== undefined && b.canvasErrors.length > 0) {
+            lines.push(`  ⚠ 画布拒绝了最近 ${b.canvasErrors.length} 次载入（推送看起来成功，但画布没换图）：`)
+            for (const entry of b.canvasErrors.slice(-3)) lines.push(`      ${entry}`)
           }
         } else {
           lines.push(v.delivered
@@ -6445,6 +6457,12 @@ function registerImageTools(
             ...(reported?.nodeCount === undefined ? {} : { canvasNodeCount: reported.nodeCount }),
             ...(reported?.classes === undefined ? {} : { canvasClasses: reported.classes }),
             ...(reported?.missingClasses === undefined || reported.missingClasses.length === 0 ? {} : { canvasMissingClasses: reported.missingClasses }),
+            // The refusals the canvas has already reported. Until now these reached
+            // only the panel's bridge card, so an agent that had just been told
+            // 「✓ 已直接推送到内嵌 ComfyUI 画布」 could not find out that the canvas
+            // had in fact rejected the load — which is the whole failure this tool
+            // was supposed to make visible.
+            ...(canvasErrors.length === 0 ? {} : { canvasErrors: canvasErrors.map((entry) => `${entry.at.slice(11, 19)} ${entry.error}`) }),
             ...(reported?.title === undefined || reported.title === '' ? {} : { canvasTitle: reported.title }),
             ...extra,
           }
@@ -6746,7 +6764,7 @@ export function apply(ctx: Context, config: unknown): void {
     return compact
   }
 
-  registerImageTools(tools, ops, { library, queue: uiQueue, canvas: canvasQueue, extension, layouts })
+  registerImageTools(tools, ops, { library, queue: uiQueue, canvas: canvasQueue, extension, layouts, canvasErrors })
 
   /**
    * Take the canvas's replies, which the panel relays for it.

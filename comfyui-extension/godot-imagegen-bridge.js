@@ -74,6 +74,31 @@
   }
 
   /** Which node classes the canvas is using, and how many nodes it has. */
+  /**
+   * A comparable fingerprint of a graph's node classes, counts included.
+   *
+   * Neither half is enough on its own. Node counts alone cannot tell two loads
+   * apart — pushing a 7-node workflow onto a canvas already holding a DIFFERENT
+   * 7-node one looks identical — and a set of class names alone misses a load that
+   * dropped a node. So: class × count, sorted.
+   */
+  function signatureOf(counts) {
+    return Object.keys(counts).sort().map(function (type) {
+      return type + '×' + counts[type]
+    }).join(', ')
+  }
+
+  /** The same fingerprint, taken from a UI-format document we are about to push. */
+  function graphSignature(graph) {
+    var nodes = (graph && Array.isArray(graph.nodes)) ? graph.nodes : []
+    var counts = {}
+    for (var i = 0; i < nodes.length; i++) {
+      var type = (nodes[i] && nodes[i].type) || 'unknown'
+      counts[type] = (counts[type] || 0) + 1
+    }
+    return signatureOf(counts)
+  }
+
   function summarizeGraph() {
     var app = findApp()
     var graph = app && app.graph
@@ -101,17 +126,27 @@
     return {
       nodeCount: nodes.length,
       classes: Object.keys(classes).sort(),
+      signature: signatureOf(classes),
       missingClasses: missing,
       title: title,
     }
   }
 
-  /** Put a UI-format workflow on the canvas. */
-  function loadGraph(graph) {
+  /**
+   * Put a UI-format workflow on the canvas, and WAIT for it.
+   *
+   * `app.loadGraphData` is async. This used to call it without awaiting and hand
+   * the Promise back as if it were the outcome, which made "we called it" and "it
+   * worked" the same fact. Awaiting is still not enough on its own — ComfyUI
+   * reports a refused load with a MODAL rather than a rejection — so the caller
+   * also verifies the canvas afterwards. Both halves are needed; see the
+   * `canvas.load` handler.
+   */
+  async function loadGraph(graph) {
     var app = findApp()
     if (!app) throw new Error('ComfyUI app 尚未就绪')
     if (typeof app.loadGraphData !== 'function') throw new Error('此 ComfyUI 版本没有 app.loadGraphData')
-    var result = app.loadGraphData(graph)
+    var result = await app.loadGraphData(graph)
     // The nodes the highlight was on are gone with the old graph, so the run
     // currently in flight has to be re-lit on the graph that just arrived — and
     // FORCED, because the run state itself did not change and the "same run, skip
@@ -254,25 +289,49 @@
     if (data.type !== 'canvas.load' || !data.graph) return
 
     ready.then(function () {
-      try {
-        loadGraph(data.graph)
-        // The frontend swaps the graph object asynchronously, so reading the nodes
-        // in this same tick reports the graph being REPLACED — which made the host
-        // (and so the panel) briefly see "0 个节点 / 没有工作流". Report one tick
-        // later, when the canvas really is showing the new graph. Still exactly one
-        // reply: a bare VM harness without timers gets it immediately instead.
-        var report = function () {
-          reply(event.source, { __gig: TOKEN, type: 'canvas.result', seq: data.seq, ok: true, state: summarizeGraph() })
-        }
-        if (typeof setTimeout === 'function') setTimeout(report, 250)
-        else report()
-      } catch (error) {
-        // Report the failure instead of swallowing it: the agent needs to know
-        // the canvas refused the graph.
-        var message = error && error.message ? error.message : String(error)
+      var fail = function (message) {
+        // Report the failure instead of swallowing it: the agent needs to know the
+        // canvas refused the graph.
         console.warn('[godot-imagegen] 载入工作流失败', message)
         reply(event.source, { __gig: TOKEN, type: 'canvas.result', seq: data.seq, ok: false, error: message, state: summarizeGraph() })
       }
+      // Still exactly one reply: a bare VM harness without timers reports at once.
+      var settle = function (fn) {
+        if (typeof setTimeout === 'function') setTimeout(fn, 250)
+        else fn()
+      }
+      var attempt = async function () {
+        try {
+          await loadGraph(data.graph)
+        } catch (error) {
+          fail(error && error.message ? error.message : String(error))
+          return
+        }
+        // The frontend swaps the graph object asynchronously, so reading the nodes
+        // in this same tick reports the graph being REPLACED — which made the host
+        // (and so the panel) briefly see "0 个节点 / 没有工作流". Wait first, then
+        // look — and looking is the point.
+        settle(function () {
+          // Awaiting the promise is NOT enough on its own. On a refused load some
+          // builds resolve it anyway and say so only with a modal on the canvas,
+          // which is how a rejected graph came back as `ok:true` while the canvas
+          // sat on 「由于重新加载工作流数据出错，加载被中止」 still holding the OLD
+          // graph — and the agent, the panel and the user were all told it worked.
+          // So compare what the canvas actually holds against what we handed it:
+          // the one check that does not depend on which error channel a given
+          // build happens to use.
+          var expected = graphSignature(data.graph)
+          var state = summarizeGraph()
+          var actual = state && state.signature
+          if (expected !== '' && actual !== expected) {
+            fail('画布没有换图：推过去的是「' + expected + '」，画布上实际是「' + actual + '」。'
+              + 'ComfyUI 前端拒绝了这次载入（它通常只在画布上弹一个提示框，不抛错）。')
+            return
+          }
+          reply(event.source, { __gig: TOKEN, type: 'canvas.result', seq: data.seq, ok: true, state: state })
+        })
+      }
+      attempt()
     })
   })
 
