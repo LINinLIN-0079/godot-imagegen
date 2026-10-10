@@ -159,13 +159,18 @@ assert(iconTexts.length === 2 && String(iconTexts[0].widgets_values[0]).includes
   'the icon template ships a usable positive prompt')
 assert(String(iconTexts[1].widgets_values[0]).includes('lowres'), 'the icon template ships the standard negative prompt')
 const iconCkpt = iconTemplate.graph.nodes.find((n) => n.type === 'CheckpointLoaderSimple')
+// A LITERAL in the document, not a claim about this machine. Whether the install
+// actually has it is the environment question, and it is answered separately:
+// by the NOTE further down when it is absent, and at run time by the checkpoint
+// advisory. The old message said "really exists on this machine", which this
+// assertion never checked.
 assert(iconCkpt.widgets_values[0] === 'anything-v5.safetensors',
-  'the icon template pins a checkpoint that really exists on this machine')
+  'the icon template pins anything-v5.safetensors')
 
 const upscaleTemplate = await library.read('upscale-4x')
 const upscaleModel = upscaleTemplate.graph.nodes.find((n) => n.type === 'UpscaleModelLoader')
 assert(upscaleModel.widgets_values[0] === 'RealESRGAN_x4plus_anime_6B.pth',
-  'the upscale template pins an upscale weight that really exists on this machine')
+  'the upscale template pins RealESRGAN_x4plus_anime_6B.pth')
 
 // ── meta lives inside the document ──
 
@@ -294,10 +299,24 @@ if (liveInfo !== undefined) {
   assert(compact < full / 2, `the compact cache is far smaller than the raw document (${Math.round(compact / 1024)} KB vs ${Math.round(full / 1024)} KB)`)
 
   // Every template must survive a round-trip against the REAL schema.
+  //
+  // The same pass collects the checkpoints the templates actually pin, so the
+  // check further down is DERIVED from the documents instead of hard-coded: a
+  // re-pinned template would otherwise leave that check asserting a name
+  // nothing references any more.
+  const pinnedCheckpoints = new Map()
   for (const template of presentTemplates) {
     const { graph } = await library.read(template.id)
     const api = uiToApi(graph, liveLayouts)
     assert(Object.keys(api).length === graph.nodes.length, `${template.id}: converts against the real schema`)
+    for (const node of Object.values(api)) {
+      if (node?.class_type !== 'CheckpointLoaderSimple') continue
+      const name = node.inputs?.ckpt_name
+      if (typeof name === 'string' && name !== '') {
+        if (!pinnedCheckpoints.has(name)) pinnedCheckpoints.set(name, [])
+        pinnedCheckpoints.get(name).push(template.id)
+      }
+    }
   }
   // And every pinned model/weight must exist in the real option lists.
   //
@@ -329,8 +348,33 @@ if (liveInfo !== undefined) {
       `the pinned upscale weight is really installed (this install offers: ${upscalers.join(', ') || 'nothing'})`)
   }
   const ckpts = comboOptions(liveInfo.CheckpointLoaderSimple.input.required.ckpt_name)
-  assert(ckpts.includes('anything-v5.safetensors') && ckpts.includes('waiIllustriousSDXL_v150.safetensors'),
-    'the pinned checkpoints are really installed')
+  // What a machine has installed is the operator's choice, and this plugin ships
+  // no models — so a pinned checkpoint being absent is the same class of thing
+  // as the zero-upscale-weights case above, and gets the same treatment: a NOTE
+  // that names it, not a red suite. As a hard assertion this went red for anyone
+  // who had ComfyUI up with a different model set, which is a normal
+  // configuration and says nothing about this code.
+  //
+  // The teeth move to where the template is actually run: `image_workflow
+  // action=run` now raises a checkpoint advisory BEFORE submitting, on whatever
+  // machine runs it. That is a better home for it than a test which can only
+  // ever describe the machine it happens to be running on.
+  // Deliberately non-vacuous, and deliberately UNCONDITIONAL: the derivation
+  // above is all this check now rests on, so finding nothing there has to fail
+  // rather than pass quietly. Sitting before the branches rather than inside one
+  // also keeps this suite's assertion count independent of what the machine
+  // happens to have installed — the README quotes that count.
+  assert(pinnedCheckpoints.size > 0 && Array.isArray(ckpts),
+    'the templates pin at least one checkpoint (derived from the documents themselves)')
+
+  const missingCheckpoints = [...pinnedCheckpoints.keys()].filter((name) => !ckpts.includes(name))
+  if (ckpts.length === 0) {
+    console.log('NOTE  这台 ComfyUI 看不到任何 checkpoint：模板在本机能否运行无法验证。')
+  } else if (missingCheckpoints.length > 0) {
+    for (const name of missingCheckpoints) {
+      console.log(`NOTE  这台 ComfyUI 没有 ${name}——模板 ${pinnedCheckpoints.get(name).join('、')} 钉住了它，在本机跑不起来。`)
+    }
+  }
   const samplerNames = liveLayouts.KSampler.find((s) => s.name === 'sampler_name').options
   const schedulers = liveLayouts.KSampler.find((s) => s.name === 'scheduler').options
   for (const template of presentTemplates) {

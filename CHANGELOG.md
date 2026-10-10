@@ -70,8 +70,6 @@
 
 ### Known issues
 
-以下两项是公开前实测发现、**尚未**处理的，写在这里而不是留着不说：
-
 - **`image_workflow action=open to_canvas=true` 在本机被真实 ComfyUI 前端拒绝**：
   工具返回成功，画布却弹出「由于重新加载工作流数据出错，加载被中止」。已确认与
   "模板钉了未安装的模型"无关（换用本机确实装着的 checkpoint 依然失败），根因未定位。
@@ -79,15 +77,39 @@
   插件自带的 `test-canvas-e2e.mjs`（49 条断言全绿）**结构上抓不到这类失败**——
   它把真实扩展 `.js` 放进 `node:vm`、配一个假的 ComfyUI `app` 跑，假 `app` 不做真
   前端的校验；该套件也不在 `npm test` 链里。
-- **`sd15-basic` 模板钉了 `anything-v5.safetensors`，本机未安装**（本机只有
-  `waiIllustriousSDXL_v150.safetensors`）。因此该模板在本机跑不了，且
-  `test-workflow-library.mjs` 的对应断言会失败——`npm test` 在本机退出码为 1。
-  同一段里放大权重的检查在缺权重时会降级成一行 `NOTE`，这条却是硬断言，两处处理不一致。
 
 ## [Unreleased]
 
-- 定位并修掉上面两条已知问题；`to_canvas` 优先验证 `loadGraphData` 收到的是 UI 格式
-  还是 API 格式。
+### Added
+
+- **模板 checkpoint 前置预警**：`image_workflow action=run` 在提交之前先比对工作流
+  钉住的 `ckpt_name` 与本机已装列表，缺了就点名说明，并给出最接近的那个——而不是等
+  ComfyUI 在跑起来之后回一条校验错误。`image_generate` 一直是按已装列表解析 checkpoint
+  的（显式指定但缺失会被拒绝并列出可用项，默认值失配则回落到第一个已装模型），工作流
+  这条路径此前没有对应处理。**只警告，不拒绝运行**；已装列表读不到时保持沉默（空列表
+  在这里意味着"读不到"，不是"没装"）。
+
+### Fixed
+
+- **`models('comfyui')` 的 COMBO 形状**：原来按 `[0]` 读 `/object_info` 的 `ckpt_name`，
+  在 `["COMBO", { options: [...] }]` 形状上读到的是字符串 `"COMBO"`，于是返回**空列表**。
+  空列表不等于"没装 checkpoint"——它会让 `pickModel` 回落到空，使 `image_generate` 在
+  明明有模型的机器上报「ComfyUI 中没有任何 checkpoint」。现在与测试里早已验证过的读法
+  一致，两种形状都认（同一台机器上 `UpscaleModelLoader` 用一种、`CheckpointLoaderSimple`
+  用另一种，所以任何一种形状都不能假设）。
+- **`test-workflow-library.mjs` 不再因环境不同而红**：原先把"两个钉住的 checkpoint 都已
+  安装"当作硬断言，于是任何开着 ComfyUI 但模型集不同的机器跑 `npm test` 都退出 1——那是
+  一种正常配置，不是关于这份代码的结论。现在改为 `NOTE`，点名缺哪个模型、影响哪些模板；
+  断言改为非空校验（确认推导出的 pinned 集合不空），存在性交给运行时预警。
+  受影响的 `sd15-basic`（钉 `anything-v5.safetensors`）在本机仍跑不了，但现在它会**被
+  说清楚**，而不是表现为一次莫名其妙的失败。
+- 两处断言文案名不副实：写的是 "really exists on this machine"，实际只校验了文档里的
+  字面量，从未碰过机器。
+
+### 待处理
+
+- 定位 `to_canvas` 推送被真前端拒绝的根因（优先验证 `loadGraphData` 收到的是 UI 格式还是
+  API 格式）。
 - ComfyUI 通道接线 ControlNet、放大与反推（目前这三项只走 SD WebUI）。
 - `transparent_method: generative` 需要把 layerdiffuse 权重放进
   `ComfyUI/models/layerdiffuse`（`extra_model_paths` 没有映射它）。
