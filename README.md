@@ -6,6 +6,8 @@
 你通过右侧边栏的 **「美术工坊」** 面板点选提示词、看图、抠图、放大；产物自动落进 Godot 项目的
 `assets/generated/<品类>/`，并给出 `res://` 路径，一键注册进 `godot-asset-planner` 的资产库。
 
+**作者**：[LINinLIN-0079](https://github.com/LINinLIN-0079) · **许可证**：MIT（见 [LICENSE](LICENSE)） · **更新记录**：[CHANGELOG.md](CHANGELOG.md)
+
 面板里的 ComfyUI 画布不是截图，而是 **真正的 ComfyUI 前端**（内嵌 iframe）。装上一个随插件分发的
 轻量 web 扩展后，**对话里说「把 item-icon 放到画布上」就真的会切过去**，画布上正在编辑什么也会回传给代理。
 
