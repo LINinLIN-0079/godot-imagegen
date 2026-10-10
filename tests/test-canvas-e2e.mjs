@@ -296,6 +296,17 @@ async function main() {
     const readCanvas = await exec(workshopTool, { action: 'read-canvas' })
     assert(readCanvas.bridge.canvasOnline === true, 'and read-canvas sees the canvas that just answered')
     assert(readCanvas.bridge.canvasMissingClasses === undefined, 'with no missing node classes for the clean graph')
+
+    // The OTHER half of the relay, and the one that stayed invisible: an envelope the
+    // host REFUSES never becomes an error, so a stale token (an extension reinstalled
+    // without the iframe reloading) made the canvas look merely quiet — no reading,
+    // no failure. That is where a long hunt for "the verdict never arrives" died, so
+    // the refusal has to be readable too.
+    await callRoute(webServer, 'POST', '/gig/ui/poll', { inbound: [{ __gig: 'stale-token', type: 'canvas.result', seq: 'x1', ok: false, error: '不该被接收' }] })
+    const rejected = await exec(workshopTool, { action: 'bridge-status' })
+    assert(Array.isArray(rejected.bridge.canvasRejections)
+      && rejected.bridge.canvasRejections.some((line) => /令牌不匹配/.test(line)),
+      'and an envelope the HOST refused is surfaced too, instead of leaving the canvas looking quiet')
   }
 
   // ── 7. the bug the user hit: does it still drop at 15s? ───────────────────

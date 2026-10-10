@@ -5286,10 +5286,12 @@ function registerImageTools(
      * that the canvas rejected the load.
      */
     canvasErrors: Array<{ at: string; seq: string; error: string }>
+    /** Canvas envelopes the relay REFUSED, with why — see `canvasRejections`. */
+    canvasRejections: string[]
   },
 ): void {
   const { cfg, jobs, gallery, backends, post, runWorkflow } = ops
-  const { library, queue, canvas, extension, layouts, canvasErrors } = deps
+  const { library, queue, canvas, extension, layouts, canvasErrors, canvasRejections } = deps
   const projectIdParam = { type: 'string', description: '图库归属的项目 id（可选，默认 default；与 Godot 资产管理器的项目对应）。' }
 
   /** Watch a tool's abort flag and cancel the matching job. */
@@ -6338,6 +6340,7 @@ function registerImageTools(
               canvasClasses: { type: 'array', items: { type: 'string' } },
               canvasMissingClasses: { type: 'array', items: { type: 'string' } },
               canvasErrors: { type: 'array', items: { type: 'string' } },
+              canvasRejections: { type: 'array', items: { type: 'string' } },
               canvasTitle: { type: 'string' },
             },
             required: ['installed'],
@@ -6385,6 +6388,7 @@ function registerImageTools(
             canvasClasses?: string[]
             canvasMissingClasses?: string[]
             canvasErrors?: string[]
+            canvasRejections?: string[]
             canvasTitle?: string
           }
           state?: { updatedAt: string; lastPollSecondsAgo?: number; section?: string; activeWorkflowId?: string; selectedImageId?: string; formDescription?: string; canvasNodes?: number }
@@ -6414,6 +6418,10 @@ function registerImageTools(
           if (b.canvasErrors !== undefined && b.canvasErrors.length > 0) {
             lines.push(`  ⚠ 画布拒绝了最近 ${b.canvasErrors.length} 次载入（推送看起来成功，但画布没换图）：`)
             for (const entry of b.canvasErrors.slice(-3)) lines.push(`      ${entry}`)
+          }
+          if (b.canvasRejections !== undefined && b.canvasRejections.length > 0) {
+            lines.push(`  ⚠ 中继有 ${b.canvasRejections.length} 条画布消息被宿主拒收（这些消息没有生效）：`)
+            for (const entry of b.canvasRejections.slice(-3)) lines.push(`      ${entry}`)
           }
         } else {
           lines.push(v.delivered
@@ -6463,6 +6471,10 @@ function registerImageTools(
             // had in fact rejected the load — which is the whole failure this tool
             // was supposed to make visible.
             ...(canvasErrors.length === 0 ? {} : { canvasErrors: canvasErrors.map((entry) => `${entry.at.slice(11, 19)} ${entry.error}`) }),
+            // Same reasoning as the line above, for the other half of the relay: an
+            // envelope the HOST refused never becomes an error, so without this a
+            // broken relay reports a perfectly quiet canvas.
+            ...(canvasRejections.length === 0 ? {} : { canvasRejections }),
             ...(reported?.title === undefined || reported.title === '' ? {} : { canvasTitle: reported.title }),
             ...extra,
           }
@@ -6733,6 +6745,16 @@ export function apply(ctx: Context, config: unknown): void {
   // queues: the agent needs to see "app.loadGraphData threw" instead of silently
   // retrying a graph that will never load.
   const canvasErrors: Array<{ at: string; seq: string; error: string }> = []
+  /**
+   * Envelopes the canvas relay handed us that were REFUSED, and why.
+   *
+   * These were collected from the start and shown nowhere: the panel never rendered
+   * them and no tool exposed them, so a silently broken relay looked exactly like a
+   * canvas with nothing to say. That is not hypothetical — it is where a long hunt
+   * for "the verdict never arrives" dead-ended: every message was being refused, and
+   * nothing anywhere said so.
+   */
+  const canvasRejections: string[] = []
 
   /**
    * The node layouts that let a workflow's widgets be addressed by name.
@@ -6764,7 +6786,7 @@ export function apply(ctx: Context, config: unknown): void {
     return compact
   }
 
-  registerImageTools(tools, ops, { library, queue: uiQueue, canvas: canvasQueue, extension, layouts, canvasErrors })
+  registerImageTools(tools, ops, { library, queue: uiQueue, canvas: canvasQueue, extension, layouts, canvasErrors, canvasRejections })
 
   /**
    * Take the canvas's replies, which the panel relays for it.
@@ -6813,6 +6835,11 @@ export function apply(ctx: Context, config: unknown): void {
           if (canvasErrors.length > 10) canvasErrors.shift()
         }
       }
+    }
+    if (rejected.length > 0) {
+      const at = new Date().toISOString().slice(11, 19)
+      for (const reason of rejected) canvasRejections.push(`${at} ${reason}`)
+      while (canvasRejections.length > 10) canvasRejections.shift()
     }
     return { accepted, rejected }
   }
@@ -6982,6 +7009,7 @@ export function apply(ctx: Context, config: unknown): void {
               ...(reported ?? {}),
             },
             errors: canvasErrors,
+            rejections: canvasRejections,
           })
           return
         }
