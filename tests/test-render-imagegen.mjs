@@ -209,7 +209,7 @@ const plugin = handoff.factory((spec) => {
   throw new Error('unexpected require: ' + spec)
 })
 assert(plugin.name === 'godot-imagegen', 'plugin exports its name')
-assert(plugin.inject.includes('betterSidebar'), 'plugin injects betterSidebar')
+assert(plugin.inject === undefined, 'plugin declares no hard inject — a missing sidebar host must not stall the client fiber')
 assert(typeof plugin.apply === 'function', 'plugin exports apply')
 assert(typeof plugin.ArtStudio === 'function', 'exposes the tab component as a test handle')
 for (const handle of [
@@ -312,7 +312,16 @@ const fakeFrame = { postMessage: (message, origin) => { sentMessages.push({ mess
 
 const descriptors = []
 const disposers = []
+const injected = []
 const ctx = {
+  // cordis: inject(deps, callback) runs the body once every dep resolves. The
+  // bundle must reach registerTab through this — a plugin-level inject would
+  // leave the fiber PENDING when no sidebar host is mounted, which the desktop
+  // reports as a renderer boot failure.
+  inject(deps, callback) {
+    injected.push(deps)
+    return callback(ctx)
+  },
   effect(callback) {
     const disposer = callback()
     if (typeof disposer === 'function') disposers.push(disposer)
@@ -326,6 +335,7 @@ const ctx = {
   },
 }
 plugin.apply(ctx)
+assert(injected.length === 1 && injected[0].includes('betterSidebar'), 'apply requests betterSidebar through ctx.inject')
 assert(descriptors.length === 1, 'apply registers exactly one tab')
 assert(descriptors.length === 1 && descriptors[0].id === 'godot-imagegen', 'tab id is godot-imagegen')
 assert(descriptors.length === 1 && descriptors[0].title === '美术工坊', 'tab title is 美术工坊')
