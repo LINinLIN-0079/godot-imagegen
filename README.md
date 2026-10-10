@@ -21,7 +21,7 @@
 | 画布桥接 | 随插件分发的 ComfyUI web 扩展（源码在仓库 `comfyui-extension/`），安装时把 **DSH origin + 一次性令牌** 烤进副本；装/卸都是一键，写入前必先备份 |
 | 对话驱动 | 代理可通过 `image_workflow` / `image_workshop` 改写工作流、把工作流直接推到 ComfyUI 画布、把提示词与参数填进面板、在面板里定位图片——你只需在对话里说 |
 | 浏览器面板 | better-sidebar tab「美术工坊」（order 63）。**三态**：侧边栏**入口态**（状态 + 启动后端 + 工作流速跑）、**浮窗态**（右键 tab →「移动到自由窗口」，宽 ≥700px 时三分栏：图库 / ComfyUI 画布 / 参数）、**全屏态**（面板自绘「⛶ 全屏」/「⤡ 回浮窗」，只改浮窗几何）。含提示词预设、任务进度（含后端实时预览图）、图库灯箱（放大/抠图/反推/发送到对话/注册资产/删除） |
-| DSH 技能 | `D:\游戏开发skill\game-art` —— 游戏美术提示词手册、分品类尺寸与透明规范、端到端工作流、21 条样例提示词、色键抠图脚本 |
+| DSH 技能（可选配对） | 本机技能目录里的 `game-art` —— 游戏美术提示词手册、分品类尺寸与透明规范、端到端工作流、21 条样例提示词、色键抠图脚本。**不属于本仓库**，插件不依赖它，只是提示词写法与它对齐 |
 | 持久化 | 独立 KV 单元 `godot_imagegen`（图库记录 + 用户预设 + 设置） |
 
 **每个产物都会带上**：绝对路径、`res://` 路径（落在 Godot 项目内时）、尺寸、seed、模型、后端、抠图/放大方法。
@@ -200,20 +200,29 @@ image_workflow  action="patch" id="item-icon" edits=[…] to_canvas=true   # 改
 
 ## 5. 安装与挂载
 
-插件本体在 `D:\deepseek\my-imagegen\`（独立仓库），通过与 `godot-asset-planner` **完全相同的 bundle 通道**挂载：
+插件本体就是一个独立仓库（也就是你正在看的这个），通过与 `godot-asset-planner` **完全相同的 bundle 通道**挂载。
+
+**推荐：走官方 CLI。** 包内的 `cordis.patch.yml` 就是 `dsh.bundle` 层，CLI 装包时会据此把
+`godot-imagegen` 追加进 `dsh.profile.bundles`，不需要手工改 profile：
+
+```powershell
+dsh plugin --profile <profile> add godot-imagegen
+```
+
+**手工挂载（本地开发 / 直接指向本仓库时用）：**
 
 1. **Junction**（把包放进 profile 的 `node_modules`，客户端半端才能被 client-modules 扫描到）
 
    ```powershell
    New-Item -ItemType Junction `
      -Path   "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\godot-imagegen" `
-     -Target "D:\deepseek\my-imagegen"
+     -Target "<本仓库的绝对路径>"
    ```
 
-2. **profile 的 package.json**：`dependencies` 加 `"godot-imagegen": "link:D:/deepseek/my-imagegen"`，
+2. **profile 的 package.json**：`dependencies` 加 `"godot-imagegen": "link:<本仓库的绝对路径>"`，
    `dsh.profile.bundles` 数组追加 `"godot-imagegen"`。包自身的 `cordis.patch.yml` 会插入宿主插件行。
 
-   `profiles/desktop`（桌面应用）与 `profiles/web`（`dsh web`）都已按上述方式挂载。
+   `profiles/desktop`（桌面应用）与 `profiles/web`（`dsh web`）都需要按上述方式挂载。
 
 3. **重启 DSH Desktop**：新增 bundle 行在启动时合并，重启前 `/gig` 路由与 `image_*` 工具都不存在。
    之后纯客户端改动（`lib/client.js`）刷新页面即可；宿主改动（`godot-imagegen.ts`）需再次重启。
@@ -234,17 +243,17 @@ image_workflow  action="patch" id="item-icon" edits=[…] to_canvas=true   # 改
     godotProject: D:/my-game          # 产物落 <root>/assets/generated 并获得 res:// 路径
     # outDir: D:/art-out              # 显式覆盖输出根目录（优先于 godotProject）
     # unitName: godot_imagegen        # 图库 KV 单元名
-    # sdwebuiRoot: D:/AKI open/sd-webui-aki-v4.10/sd-webui-aki-v4.10
-    # sdwebuiPython: D:/AKI open/sd-webui-aki-v4.10/sd-webui-aki-v4.10/python/python.exe
+    # sdwebuiRoot: <秋叶根目录>/sd-webui-aki-v4.10
+    # sdwebuiPython: <秋叶根目录>/sd-webui-aki-v4.10/python/python.exe
     # sdwebuiPort: 7860
-    # comfyRoot: D:/AKI open/ComfyUI-aki-v2
-    # comfyPython: D:/AKI open/ComfyUI-aki-v2/python/python.exe
+    # comfyRoot: <秋叶根目录>/ComfyUI-aki-v2
+    # comfyPython: <秋叶根目录>/ComfyUI-aki-v2/python/python.exe
     # comfyPort: 8188
     # postPython: 后处理解释器（默认用 ComfyUI 的那个）
     # defaultBackend: sdwebui | comfyui
     # sdwebuiModel / comfyModel: 默认 checkpoint 文件名
     # dataRoot: <DSH_HOME>/godot-imagegen   # 工作流库 / 布局缓存 / 备份 / 安装清单
-    # extensionSource: D:/deepseek/my-imagegen/comfyui-extension  # 画布扩展源码目录
+    # extensionSource: <本仓库>/comfyui-extension   # 画布扩展源码目录
     # requestTimeoutMs: 1800000     # 单次后端操作超时（默认 30 分钟；SDXL 长任务需要）
     # startTimeoutMs: 360000        # 「启动后端」等待就绪的上限
 ```
@@ -355,7 +364,7 @@ image_workflow  action="patch" id="item-icon" edits=[…] to_canvas=true   # 改
 ## 10. 验证
 
 ```powershell
-cd D:\deepseek\my-imagegen            # 本仓库根目录
+cd <本仓库根目录>
 npm test                              # = 下面五条"离线"套件（900 条；ComfyUI 开着则 922 条，见下）
 node tests/test-workflow.mjs          # 62 条（ComfyUI 开着 65 条）：工作流层，含 10 个真实 ComfyUI 导出文件
 node tests/test-workflow-library.mjs  # 252 条（ComfyUI 开着 271 条）：工作流库、6 套模板、布局缓存
@@ -373,7 +382,8 @@ node tests/test-extension-live.mjs         # 8 条断言（已装好时）：对
 node tests/test-extension-live.mjs --serve # 25 条断言：先安装、再自己启动 ComfyUI，
                                            #   验证它真的把扩展 serve 出来（要 ComfyUI 先关着）
 node --check lib/client.js
-node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"   # 技能 frontmatter / 行尾校验
+# 技能 frontmatter / 行尾校验（可选：需要本机另有 godot-asset-planner 仓库与 game-art 技能目录）
+# node <godot-asset-planner>/check-skill-frontmatter.mjs "<技能目录>"
 ```
 
 **断言条数会随 ComfyUI 是否在跑而变化**（这是设计，不是漏测）：`test-workflow.mjs` 与
@@ -393,7 +403,7 @@ node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"  
 | 扩展本体 | `test-extension.mjs` | 把**装进 ComfyUI 的那个 .js** 丢进 `node:vm`：错 origin/错令牌/无令牌/垃圾载荷都不载入，正确信封真的调到 `app.loadGraphData`，拒绝时回 `ok:false` |
 | 面板中继 | `test-render-imagegen.mjs` | 真的跑 effect：信封以 `postMessage` 投进 iframe（targetOrigin 是 ComfyUI 源）、回包搭下一次轮询上行、心跳在**空转 tick** 上照样发出、冒充窗口的消息被丢弃 |
 | 端到端 | `test-canvas-e2e.mjs` | 真实安装的 `.js` + 真实宿主路由 + 真实工作流库：心跳→在线、推送→`loadGraphData`→回执→清队列、拒绝→错误可见、16 秒不掉线；**只读**（断言清单与扩展的 mtime 未变） |
-| 真机写路径 | `test-extension-live.mjs` | 真的写进 `D:\AKI open\` 再真的卸干净、全树扫描无残片。**已装好时自动改为对副本验证**：复制真实安装（含 `__pycache__`）到临时目录、改写清单路径后卸载，并断言真实目录与清单分毫未动 |
+| 真机写路径 | `test-extension-live.mjs` | 真的写进你真实的 `<comfyRoot>` 再真的卸干净、全树扫描无残片。**已装好时自动改为对副本验证**：复制真实安装（含 `__pycache__`）到临时目录、改写清单路径后卸载，并断言真实目录与清单分毫未动 |
 
 - **离线套件**用两个真实 HTTP 服务冒充 A1111 与 ComfyUI（覆盖 `/sdapi/v1/*`、`/controlnet/model_list`、
   `/tagger/v1/*`、`/prompt`、`/history`、`/view`），并用**真实的秋叶 Python** 跑抠图与放大，
@@ -412,7 +422,7 @@ node D:\deepseek\my-plugins\check-skill-frontmatter.mjs "D:\游戏开发skill"  
   是 ComfyUI 的源、绝不是 `*`），而画布的回包会搭下一次轮询送回宿主，冒充窗口发来的消息被丢弃。
 - **实时套件**驱动真正安装的 SD WebUI / ComfyUI：真实出图、真实 rembg 抠图、真实 R-ESRGAN 放大、
   真实 ControlNet 引导，并断言产物真的落在 Godot 项目的 `assets/generated/<品类>/` 且带 `res://` 路径；
-  桥接的实时套件则真的写进 `D:\AKI open\ComfyUI-aki-v2`，再真的卸干净并全树扫描确认无残片。
+  桥接的实时套件则真的写进你真实的 `<comfyRoot>`，再真的卸干净并全树扫描确认无残片。
   `--serve` 只有在"先安装、再由它启动 ComfyUI"的顺序下才能验证「ComfyUI 把扩展 serve 出来」——
   它会自己启动、自己关掉；发现 ComfyUI 已经开着时**跳过**这两项并说明原因，而不是假装失败或假装通过。
 
