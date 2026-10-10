@@ -198,7 +198,68 @@ image_workflow  action="patch" id="item-icon" edits=[…] to_canvas=true   # 改
 后处理（抠图 / 放大 / 无缝平铺）走秋叶自带的 Python，它已经装了
 **Pillow、numpy、OpenCV、scipy、rembg、onnxruntime**，所以插件不额外安装任何依赖。
 
-## 5. 安装与挂载
+## 5. 依赖与鸣谢
+
+### 5.1 依赖
+
+**宿主（必需）**
+
+| 依赖 | 形态 | 说明 |
+| --- | --- | --- |
+| DeepSeek Harness | 宿主 | 插件运行的环境（`dsh.bundle` + `dsh.client` 一个包两半） |
+| `tools` 服务 | 宿主服务 | `export const inject = ['tools', 'storage']` 之一：`image_*` 工具的注册面 |
+| `storage` 服务（`@deepseek-ai/storage-json`） | 宿主服务 | 图库记录 / 用户预设 / 设置的 KV 单元，默认名 `godot_imagegen`（`unitName` 可改） |
+| `@deepseek-ai/cordis` `^4.0.1` | peerDependency | **只是包关系**：宿主半边不 import 它，而是在本地声明所需的结构类型（见 `godot-imagegen.ts` 的 `Context`），因此不产生运行时耦合 |
+
+**宿主能力（可选，有则增强）**
+
+| 能力 | 缺了会怎样 |
+| --- | --- |
+| `subprocess` 服务 | 优先用它启动后端与跑后处理；取不到时回落到 `node:child_process`，功能不变 |
+| `webServer`（`dsh-host-webserver`） | `/gig` 路由经 `ctx.inject(['webServer'])` 条件注册；没有它时面板与宿主之间的同源 HTTP 通道不存在 |
+| `dsh-better-sidebar` | 「美术工坊」面板的挂载点。**没有它时 `image_*` 工具与 `/gig` 路由照常工作**，只是看不到侧边栏面板。客户端注册走内层 `ctx.inject(['betterSidebar'])`，所以缺宿主时不会把客户端 fiber 卡成 pending、也不会被启动健康门判成渲染器启动失败 |
+
+**外部运行时（不是 npm 依赖；插件不安装、不升级、不卸载它们）**
+
+| 依赖 | 默认地址 | 用途 |
+| --- | --- | --- |
+| SD WebUI（秋叶整合包） | `127.0.0.1:7860` | 主后端：文生图、图生图、局部重绘、batch 变体、放大、反推 |
+| ComfyUI（秋叶整合包） | `127.0.0.1:8188` | 第二后端：工作流库与内嵌画布 |
+| 上面两套自带的 Python | — | 后处理（抠图 / 放大 / 无缝平铺）走它已装的 Pillow、numpy、OpenCV、scipy、rembg、onnxruntime。**所以本插件自身不安装任何 Python 包** |
+
+**首次使用某项功能时才下载**
+
+- rembg 的 u2net 权重（约 176 MB）——`image_cutout`
+- WD14 tagger 的 ONNX 模型——`image_interrogate`（可能数百 MB、首次耗时数分钟；未装 WD14 时先退内置 deepdanbooru）
+- ControlNet 模型——只有用到 `control_type` 时才需要
+- 出图 checkpoint（如 `anything-v5`、`waiIllustriousSDXL_v150`）与放大权重（RealESRGAN / SwinIR / AnimeSharp）**由你自己的后端提供**，插件不附带也不下载
+
+**随插件分发**
+
+- ComfyUI 画布桥接 web 扩展（源码在 `comfyui-extension/`）。安装时把它拷进 `<comfyRoot>/ComfyUI/custom_nodes/godot-imagegen-bridge/`——这是插件**唯一**的写入点，装/卸都带清单与时间戳备份，见第 10 节。
+
+**可选配对（不属于本仓库）**
+
+- `game-art` 技能：游戏美术提示词手册与分品类尺寸/透明规范。插件不依赖它，只是提示词写法与它对齐。
+
+### 5.2 鸣谢
+
+这个插件能成立，靠的是一整条上游链路。感谢：
+
+- [ComfyUI](https://github.com/comfyanonymous/ComfyUI)（comfyanonymous）——工作流引擎，以及被内嵌进面板的那个真实画布；
+- [Stable Diffusion WebUI](https://github.com/AUTOMATIC1111/stable-diffusion-webui)（AUTOMATIC1111）——主后端与 `/sdapi/v1/*` 接口面；
+- **秋叶整合包**（绘世启动器）——把上述两套后端在 Windows 上装成开箱可用，并自带后处理所需的 Python 环境；本插件的默认路径、端口与启动方式都是按它设计的；
+- [rembg](https://github.com/danielgatis/rembg)（danielgatis）与 [U²-Net](https://github.com/xuebinqin/U-2-Net)（Xuebin Qin）——抠图；
+- [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)（Xintao Wang）、[SwinIR](https://github.com/JingyunLiang/SwinIR)（Jingyun Liang）与 4x-AnimeSharp——放大权重；
+- [WD14 tagger 扩展](https://github.com/picobyte/stable-diffusion-webui-wd14-tagger)（picobyte）、[DeepDanbooru](https://github.com/KichangKim/DeepDanbooru)（Kichang Kim）与 [SmilingWolf 的 WD v1.4 系列模型](https://huggingface.co/SmilingWolf/wd-v1-4-convnext-tagger-v2)——反推提示词；
+- [ControlNet](https://github.com/lllyasviel/ControlNet)（Lvmin Zhang）——保姿势 / 保构图；
+- `dsh-better-sidebar`——「美术工坊」面板赖以挂载的侧边栏宿主。
+
+也感谢各家 checkpoint 与放大权重的作者：插件提供的是接口，画出来什么样是他们的功劳。
+
+本插件自身以 **MIT** 分发（见 [`LICENSE`](LICENSE)）。上面每一项都有自己的许可证，**它们的条款不因被本插件调用而改变**——尤其是各家 checkpoint / 权重，商用与再分发前请先读它们各自的授权。
+
+## 6. 安装与挂载
 
 插件本体就是一个独立仓库（也就是你正在看的这个），通过与 `godot-asset-planner` **完全相同的 bundle 通道**挂载。
 
@@ -233,7 +294,7 @@ dsh plugin --profile <profile> add godot-imagegen
 - 「美术工坊」出现在 better-sidebar（需要 `dsh-better-sidebar`，desktop / web profile 都有）；
 - 在面板「设置」里填 **Godot 项目根目录**，之后产物才会带 `res://` 路径。
 
-## 6. 配置项
+## 7. 配置项
 
 都写在 profile 的 `cordis.patch.yml` 里，作为 `godot-imagegen` 行的 `config`（全部可选，都有可用默认值）：
 
@@ -262,7 +323,7 @@ dsh plugin --profile <profile> add godot-imagegen
 `extensionSource` 默认取**本模块旁边的** `comfyui-extension/`（按 `import.meta.url` 解析），所以仓库搬家、
 或者经 profile junction 加载，都不需要改这一项。
 
-## 7. 工具速查
+## 8. 工具速查
 
 ### `image_generate` — 文生图
 
@@ -330,7 +391,7 @@ dsh plugin --profile <profile> add godot-imagegen
 
 画布四个动作用的是**另一条通道**（桥接扩展的轮询），状态与面板互不影响。
 
-## 8. 与 godot-asset-planner 的协作
+## 9. 与 godot-asset-planner 的协作
 
 **不共享 storage。** `godot_asset_planner` 这个 KV 单元每个后端只允许一个活动句柄，归 godot-asset-planner 所有，
 所以本插件用自己的 `godot_imagegen` 单元，二者互不干扰。
@@ -343,7 +404,7 @@ dsh plugin --profile <profile> add godot-imagegen
    （`{ assetName, assetType:"image", filePath, projectId, linkedGoal? }`），不碰它的存储实现。
    面板顶部会显示从 `/gap/state` 读到的当前 planner 项目作为归属。
 
-## 9. 安全边界
+## 10. 安全边界
 
 - **只接管、不重复启动**：后端已在运行时 `action=start` 直接复用，绝不新起一个抢端口。
 - **绝不终止非本插件启动的进程**：`action=stop` 对你自己用绘世启动器拉起的实例会明确拒绝并说明原因。
@@ -361,7 +422,7 @@ dsh plugin --profile <profile> add godot-imagegen
 - **不自动安装**：桥接扩展的首次安装必须是显式动作（面板按钮或 `install-bridge`）；
   只有"已经装过"时，「启动后端」才会在拉起进程**之前**重新同步一次，且**只在内容不一致时**才写。
 
-## 10. 验证
+## 11. 验证
 
 ```powershell
 cd <本仓库根目录>
@@ -460,7 +521,7 @@ node --check lib/client.js
 改前先备份该文件；**重装或升级 `dsh-better-sidebar` 会把它还原**（`profiles/*/package.json` 里
 desktop 钉的是 `0.18.0`、web 钉的是 `0.16.1`）。注意升级到 0.19.x 不是替代方案：那版把浮窗功能整个删掉了。
 
-## 11. 已知限制
+## 12. 已知限制
 
 - **浮窗要用右键菜单，不能用「拖到主会话区」**：`dsh-better-sidebar` 0.18.0 的中心列锚点是旧版槽位名
   （`#root [data-slot="conversation"]`），当前 DSH 渲染的是 `main.conversation`，所以它算不出落点、
