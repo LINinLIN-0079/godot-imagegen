@@ -143,20 +143,21 @@
   }
 
   /**
-   * Put a UI-format workflow on the canvas, and WAIT for it.
+   * Put a UI-format workflow on the canvas.
    *
-   * `app.loadGraphData` is async. This used to call it without awaiting and hand
-   * the Promise back as if it were the outcome, which made "we called it" and "it
-   * worked" the same fact. Awaiting is still not enough on its own — ComfyUI
-   * reports a refused load with a MODAL rather than a rejection — so the caller
-   * also verifies the canvas afterwards. Both halves are needed; see the
-   * `canvas.load` handler.
+   * Deliberately NOT async, and deliberately not awaited by the caller before it
+   * decides anything: on a REFUSED load this build may never settle that promise
+   * (ComfyUI reports the refusal with a modal and leaves it hanging). Awaiting it
+   * first therefore means sending NO verdict at all — the host sees neither success
+   * nor failure, which is worse than the lie it replaced. The promise is handed
+   * back so a rejection can be one way to reach a verdict, while the caller reaches
+   * one anyway when it never settles.
    */
-  async function loadGraph(graph) {
+  function loadGraph(graph) {
     var app = findApp()
     if (!app) throw new Error('ComfyUI app 尚未就绪')
     if (typeof app.loadGraphData !== 'function') throw new Error('此 ComfyUI 版本没有 app.loadGraphData')
-    var result = await app.loadGraphData(graph)
+    var result = app.loadGraphData(graph)
     // The nodes the highlight was on are gone with the old graph, so the run
     // currently in flight has to be re-lit on the graph that just arrived — and
     // FORCED, because the run state itself did not change and the "same run, skip
@@ -299,58 +300,68 @@
     if (data.type !== 'canvas.load' || !data.graph) return
 
     ready.then(function () {
-      var fail = function (message) {
+      var verdictSent = false
+      var send = function (ok, detail, state) {
+        if (verdictSent) return
+        verdictSent = true
+        if (ok) {
+          reply(event.source, { __gig: TOKEN, type: 'canvas.result', seq: data.seq, ok: true, state: state })
+          return
+        }
         // Report the failure instead of swallowing it: the agent needs to know the
         // canvas refused the graph.
-        console.warn('[godot-imagegen] 载入工作流失败', message)
-        reply(event.source, { __gig: TOKEN, type: 'canvas.result', seq: data.seq, ok: false, error: message, state: summarizeGraph() })
+        console.warn('[godot-imagegen] 载入工作流失败', detail)
+        reply(event.source, { __gig: TOKEN, type: 'canvas.result', seq: data.seq, ok: false, error: detail, state: state })
       }
-      // Exactly one reply, however long the look takes.
-      var finish = function (expected, state) {
+
+      var expected = graphSignature(data.graph)
+      var refusal = function (state) {
         var actual = state && state.signature
-        if (expected !== '' && actual !== expected) {
-          fail('画布没有换图（等了 ' + Math.round(LOAD_SETTLE_MS / 1000) + ' 秒）：推过去的是「' + expected + '」，画布上实际是「' + actual + '」。'
-            + 'ComfyUI 前端拒绝了这次载入——最常见的原因是这张图钉了本机没有的资源'
-            + '（checkpoint / 放大权重 / input 图片），它通常只在画布上弹一个提示框，不抛错。')
-          return
-        }
-        reply(event.source, { __gig: TOKEN, type: 'canvas.result', seq: data.seq, ok: true, state: state })
+        return '画布没有换图（等了 ' + Math.round(LOAD_SETTLE_MS / 1000) + ' 秒）：推过去的是「' + expected + '」，画布上实际是「' + actual + '」。'
+          + 'ComfyUI 前端拒绝了这次载入——最常见的原因是这张图钉了本机没有的资源'
+          + '（checkpoint / 放大权重 / input 图片），它通常只在画布上弹一个提示框，不抛错。'
       }
-      var attempt = async function () {
-        try {
-          await loadGraph(data.graph)
-        } catch (error) {
-          fail(error && error.message ? error.message : String(error))
-          return
+
+      // The load's own promise is ONE signal, never the gate. On a refused load this
+      // build may leave it unsettled forever — that is exactly how the previous
+      // version came to send NO verdict at all, which is worse than the success it
+      // used to claim.
+      var rejected = null
+      try {
+        var pending = loadGraph(data.graph)
+        if (pending && typeof pending.then === 'function') {
+          pending.then(
+            function () { /* resolved: the signature check below still decides */ },
+            function (error) { rejected = error && error.message ? error.message : String(error) },
+          )
         }
-        // Awaiting the promise is NOT enough on its own: on a refused load some builds
-        // resolve it anyway and say so only with a modal on the canvas, which is how a
-        // rejected graph came back as `ok:true` while the canvas sat on 「由于重新加载
-        // 工作流数据出错，加载被中止」 still holding the OLD graph — and the agent, the
-        // panel and the user were all told it worked. So compare what the canvas
-        // actually holds against what we handed it: the one check that does not depend
-        // on which error channel a given build uses.
-        //
-        // Keep looking for a bounded while rather than sampling once — see
-        // LOAD_SETTLE_MS for why an early single sample is worse than useless here.
-        var expected = graphSignature(data.graph)
-        if (typeof setTimeout !== 'function') {
-          // A bare VM harness without timers: one look, immediately.
-          finish(expected, summarizeGraph())
-          return
-        }
-        var deadline = Date.now() + LOAD_SETTLE_MS
-        var look = function () {
-          var state = summarizeGraph()
-          if (expected === '' || (state && state.signature) === expected || Date.now() >= deadline) {
-            finish(expected, state)
-            return
-          }
-          setTimeout(look, 200)
-        }
-        setTimeout(look, 250)
+      } catch (error) {
+        send(false, error && error.message ? error.message : String(error), summarizeGraph())
+        return
       }
-      attempt()
+
+      if (typeof setTimeout !== 'function') {
+        // A bare VM harness without timers: one look, immediately.
+        var immediate = summarizeGraph()
+        if (rejected !== null) send(false, rejected, immediate)
+        else if (expected === '' || (immediate && immediate.signature) === expected) send(true, null, immediate)
+        else send(false, refusal(immediate), immediate)
+        return
+      }
+
+      // Otherwise: exactly one verdict, from whichever signal arrives first —
+      // a rejection, a matching signature, or the window expiring with the graph
+      // still not swapped. Keep looking rather than sampling once; see
+      // LOAD_SETTLE_MS for why an early single sample is worse than useless here.
+      var deadline = Date.now() + LOAD_SETTLE_MS
+      var look = function () {
+        var state = summarizeGraph()
+        if (rejected !== null) { send(false, rejected, state); return }
+        if (expected === '' || (state && state.signature) === expected) { send(true, null, state); return }
+        if (Date.now() >= deadline) { send(false, refusal(state), state); return }
+        setTimeout(look, 200)
+      }
+      setTimeout(look, 250)
     })
   })
 

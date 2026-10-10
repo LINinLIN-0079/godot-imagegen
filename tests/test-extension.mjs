@@ -387,7 +387,7 @@ async function main() {
   const runtimeToken = JSON.parse(await readFile(join(workRoot, 'data-vm', 'installed-files.json'), 'utf8')).token
   const runtimeScript = await readFile(join(runtimeManager.targetDir, 'web', 'godot-imagegen-bridge.js'), 'utf8')
 
-  function loadCanvasRuntime(script, { throwOnLoad = false, silentLoad = false, slowLoadMs = 0 } = {}) {
+  function loadCanvasRuntime(script, { throwOnLoad = false, silentLoad = false, slowLoadMs = 0, hangOnLoad = false } = {}) {
     const listeners = []
     const posted = []
     const loaded = []
@@ -398,6 +398,10 @@ async function main() {
       loadGraphData(graph) {
         if (throwOnLoad) throw new Error('loadGraphData 炸了')
         loaded.push(graph)
+        // A REFUSED load on this build leaves the promise unsettled forever while
+        // ComfyUI says so only with a modal. A verdict that waits on that promise
+        // therefore sends nothing at all, so the verdict must not gate on it.
+        if (hangOnLoad) return new Promise(() => {})
         // A real load REPLACES the graph. This fake used to only record the call,
         // which models exactly the state a FAILED load leaves behind: the old graph
         // still loaded. So "ok:true beside an unchanged canvas" was the only thing
@@ -473,6 +477,22 @@ async function main() {
     await settle()
     const result = runtime.posted[runtime.posted.length - 1].message
     assert(result.type === 'canvas.result' && result.ok === false && /loadGraphData 炸了/.test(result.error), 'a graph the canvas refuses is reported as a failure with the reason')
+  }
+
+  {
+    // The shape a refused load ACTUALLY has on this build: the promise is never
+    // settled and the graph is never swapped. Gating the verdict on that promise
+    // sends NOTHING at all — no success, no failure — which is worse than the false
+    // success it replaced, because the host is then left with no verdict to show
+    // anyone. Found live: the refusal was visible on the canvas, and the host had
+    // recorded nothing.
+    const runtime = loadCanvasRuntime(runtimeScript, { hangOnLoad: true })
+    await settle()
+    deliver(runtime, { origin: 'http://127.0.0.1:43120', data: { __gig: runtimeToken, type: 'canvas.load', seq: 'seq-hang', graph: { nodes: [{ id: 1, type: 'CheckpointLoaderSimple' }] } }, source: runtime.parent })
+    await new Promise((resolve) => setTimeout(resolve, 3000))
+    const result = runtime.posted[runtime.posted.length - 1].message
+    assert(result.type === 'canvas.result' && result.seq === 'seq-hang' && result.ok === false,
+      'a load whose promise NEVER settles still gets a verdict, and it is a refusal')
   }
 
   {
