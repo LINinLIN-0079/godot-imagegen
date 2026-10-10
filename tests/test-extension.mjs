@@ -387,7 +387,7 @@ async function main() {
   const runtimeToken = JSON.parse(await readFile(join(workRoot, 'data-vm', 'installed-files.json'), 'utf8')).token
   const runtimeScript = await readFile(join(runtimeManager.targetDir, 'web', 'godot-imagegen-bridge.js'), 'utf8')
 
-  function loadCanvasRuntime(script, { throwOnLoad = false, silentLoad = false } = {}) {
+  function loadCanvasRuntime(script, { throwOnLoad = false, silentLoad = false, slowLoadMs = 0 } = {}) {
     const listeners = []
     const posted = []
     const loaded = []
@@ -404,7 +404,14 @@ async function main() {
         // this suite could ever see — and that is the bug, because ComfyUI reports
         // a refused load with a modal rather than a rejection.
         if (silentLoad) return
-        app.graph = { _nodes: (graph && Array.isArray(graph.nodes) ? graph.nodes : []).map((n) => ({ id: n.id, type: n.type })) }
+        const swap = () => {
+          app.graph = { _nodes: (graph && Array.isArray(graph.nodes) ? graph.nodes : []).map((n) => ({ id: n.id, type: n.type })) }
+        }
+        // A real frontend swaps the graph asynchronously and a heavy workflow takes
+        // time to instantiate; `slowLoadMs` reproduces that so a check cannot pass by
+        // sampling once and getting lucky.
+        if (slowLoadMs > 0 && typeof setTimeout === 'function') setTimeout(swap, slowLoadMs)
+        else swap()
       },
     }
     const parent = { postMessage: (message, origin) => posted.push({ message, origin }) }
@@ -414,7 +421,11 @@ async function main() {
       addEventListener(type, fn) { if (type === 'message') listeners.push(fn) },
     }
     win.window = win
-    runInNewContext(script, { window: win, console, setInterval, clearInterval })
+    // setTimeout is passed in ON PURPOSE. It used to be omitted, so the extension
+    // always took its no-timers branch here and the whole timing side of the canvas
+    // verdict — the settle window, and everything that depends on looking more than
+    // once — was never exercised. test-canvas-e2e still runs the no-timers branch.
+    runInNewContext(script, { window: win, console, setInterval, clearInterval, setTimeout })
     return { listeners, posted, loaded, parent, win }
   }
   const deliver = (runtime, event) => { for (const fn of runtime.listeners) fn(event) }
@@ -465,6 +476,21 @@ async function main() {
   }
 
   {
+    // A load that swaps the graph LATER than the first sample must still be reported
+    // as a success. Sampling once and calling a mismatch a refusal is the false
+    // alarm this guard has to avoid — and it is not hypothetical: the author had
+    // already mis-read a working canvas that way, from a stale report, before
+    // writing it.
+    const runtime = loadCanvasRuntime(runtimeScript, { slowLoadMs: 700 })
+    await settle()
+    deliver(runtime, { origin: 'http://127.0.0.1:43120', data: { __gig: runtimeToken, type: 'canvas.load', seq: 'seq-slow', graph: { nodes: [{ id: 1, type: 'KSampler' }] } }, source: runtime.parent })
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    const result = runtime.posted[runtime.posted.length - 1].message
+    assert(result.type === 'canvas.result' && result.seq === 'seq-slow' && result.ok === true,
+      'a load that swaps the graph LATE is reported as success, not as a false refusal')
+  }
+
+  {
     // The failure that actually happened on the machine, and the one no earlier
     // test could see: ComfyUI RESOLVES the load and says nothing — the graph is
     // simply never replaced — and the refusal exists only as a modal on the canvas.
@@ -473,7 +499,8 @@ async function main() {
     const runtime = loadCanvasRuntime(runtimeScript, { silentLoad: true })
     await settle()
     deliver(runtime, { origin: 'http://127.0.0.1:43120', data: { __gig: runtimeToken, type: 'canvas.load', seq: 'seq-silent', graph: { nodes: [{ id: 1, type: 'EmptyLatentImage' }, { id: 2, type: 'SaveImage' }] } }, source: runtime.parent })
-    await settle()
+    // Longer than the settle window: the verdict is only reached after it expires.
+    await new Promise((resolve) => setTimeout(resolve, 3000))
     const result = runtime.posted[runtime.posted.length - 1].message
     assert(result.type === 'canvas.result' && result.seq === 'seq-silent' && result.ok === false,
       'a load the canvas silently ignored is reported as a FAILURE, not as success')

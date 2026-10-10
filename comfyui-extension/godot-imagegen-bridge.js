@@ -42,6 +42,16 @@
   var DSH_ORIGIN = '__DSH_ORIGIN__'
   var TOKEN = '__TOKEN__'
 
+  /**
+   * How long a load is allowed to keep not-matching before it is called a refusal.
+   *
+   * The graph swap is asynchronous and a heavy workflow takes real time to
+   * instantiate, so a single early sample reads a slow-but-successful load as a
+   * refusal. Reading the state too early is precisely how this check's author first
+   * mis-read a perfectly working canvas as a broken one.
+   */
+  var LOAD_SETTLE_MS = 2500
+
   /** The ComfyUI app object, whichever way this frontend build exposes it. */
   function findApp() {
     try {
@@ -295,10 +305,16 @@
         console.warn('[godot-imagegen] 载入工作流失败', message)
         reply(event.source, { __gig: TOKEN, type: 'canvas.result', seq: data.seq, ok: false, error: message, state: summarizeGraph() })
       }
-      // Still exactly one reply: a bare VM harness without timers reports at once.
-      var settle = function (fn) {
-        if (typeof setTimeout === 'function') setTimeout(fn, 250)
-        else fn()
+      // Exactly one reply, however long the look takes.
+      var finish = function (expected, state) {
+        var actual = state && state.signature
+        if (expected !== '' && actual !== expected) {
+          fail('画布没有换图（等了 ' + Math.round(LOAD_SETTLE_MS / 1000) + ' 秒）：推过去的是「' + expected + '」，画布上实际是「' + actual + '」。'
+            + 'ComfyUI 前端拒绝了这次载入——最常见的原因是这张图钉了本机没有的资源'
+            + '（checkpoint / 放大权重 / input 图片），它通常只在画布上弹一个提示框，不抛错。')
+          return
+        }
+        reply(event.source, { __gig: TOKEN, type: 'canvas.result', seq: data.seq, ok: true, state: state })
       }
       var attempt = async function () {
         try {
@@ -307,29 +323,32 @@
           fail(error && error.message ? error.message : String(error))
           return
         }
-        // The frontend swaps the graph object asynchronously, so reading the nodes
-        // in this same tick reports the graph being REPLACED — which made the host
-        // (and so the panel) briefly see "0 个节点 / 没有工作流". Wait first, then
-        // look — and looking is the point.
-        settle(function () {
-          // Awaiting the promise is NOT enough on its own. On a refused load some
-          // builds resolve it anyway and say so only with a modal on the canvas,
-          // which is how a rejected graph came back as `ok:true` while the canvas
-          // sat on 「由于重新加载工作流数据出错，加载被中止」 still holding the OLD
-          // graph — and the agent, the panel and the user were all told it worked.
-          // So compare what the canvas actually holds against what we handed it:
-          // the one check that does not depend on which error channel a given
-          // build happens to use.
-          var expected = graphSignature(data.graph)
+        // Awaiting the promise is NOT enough on its own: on a refused load some builds
+        // resolve it anyway and say so only with a modal on the canvas, which is how a
+        // rejected graph came back as `ok:true` while the canvas sat on 「由于重新加载
+        // 工作流数据出错，加载被中止」 still holding the OLD graph — and the agent, the
+        // panel and the user were all told it worked. So compare what the canvas
+        // actually holds against what we handed it: the one check that does not depend
+        // on which error channel a given build uses.
+        //
+        // Keep looking for a bounded while rather than sampling once — see
+        // LOAD_SETTLE_MS for why an early single sample is worse than useless here.
+        var expected = graphSignature(data.graph)
+        if (typeof setTimeout !== 'function') {
+          // A bare VM harness without timers: one look, immediately.
+          finish(expected, summarizeGraph())
+          return
+        }
+        var deadline = Date.now() + LOAD_SETTLE_MS
+        var look = function () {
           var state = summarizeGraph()
-          var actual = state && state.signature
-          if (expected !== '' && actual !== expected) {
-            fail('画布没有换图：推过去的是「' + expected + '」，画布上实际是「' + actual + '」。'
-              + 'ComfyUI 前端拒绝了这次载入（它通常只在画布上弹一个提示框，不抛错）。')
+          if (expected === '' || (state && state.signature) === expected || Date.now() >= deadline) {
+            finish(expected, state)
             return
           }
-          reply(event.source, { __gig: TOKEN, type: 'canvas.result', seq: data.seq, ok: true, state: state })
-        })
+          setTimeout(look, 200)
+        }
+        setTimeout(look, 250)
       }
       attempt()
     })
