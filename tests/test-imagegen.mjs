@@ -227,6 +227,15 @@ let fakeComfyDuplicateOutputs = false
  */
 let fakeComfyObjectInfoFails = false
 
+/**
+ * When set to a checkpoint filename, `/prompt` answers the 400 a real ComfyUI
+ * sends for a graph naming a model it does not have (`value_not_in_list`). That
+ * makes a run DIE, which is the one path where the checkpoint advisory used to
+ * be dropped: the caller got this raw 400 while the explanation sat on the job,
+ * visible only in the panel.
+ */
+let fakeComfyPromptRejects = null
+
 /** Every WebSocket the plugin opened, with a handle to feed it frames. */
 const fakeSockets = []
 class FakeWebSocket {
@@ -323,6 +332,24 @@ function startFakeComfy(port, requests) {
       return json({ UpscaleModelLoader: { input: { required: { model_name: [['RealESRGAN_x4plus_anime_6B.pth', '4x-AnimeSharp.pth']] } } } })
     }
     if (req.method === 'POST' && url === '/prompt') {
+      if (fakeComfyPromptRejects !== null) {
+        // The exact 400 a real ComfyUI returns for a checkpoint it does not have.
+        res.writeHead(400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          error: { type: 'prompt_outputs_failed_validation', message: 'Prompt outputs failed validation', details: '', extra_info: {} },
+          node_errors: {
+            '4': {
+              errors: [{
+                type: 'value_not_in_list',
+                message: 'Value not in list',
+                details: `ckpt_name: '${fakeComfyPromptRejects}' not in ['anything-v5.safetensors']`,
+                extra_info: { input_name: 'ckpt_name' },
+              }],
+            },
+          },
+        }))
+        return
+      }
       const id = 'prompt-' + (history.size + pending.size + 1)
       const images = [{ filename: 'ComfyUI_test.png', subfolder: '', type: 'output' }]
       const result = {
@@ -1432,6 +1459,24 @@ async function main() {
       'a template pinned to a checkpoint this install lacks says WHICH one, before the run')
     assert(/anything-v5\.safetensors/.test(String(absent.note)),
       'and names what is installed instead, so the fix is in the message')
+  }
+
+  // ── the checkpoint advisory on a FAILED run ──
+  //
+  // The success path repeats the advisory back in `note`. The FAILURE path is the
+  // one this advisory exists for, and it used to drop it: the run dies at
+  // ComfyUI's own validation, and the caller was handed that raw 400 while the
+  // explanation — computed, stored on the job, visible in the panel — never left
+  // the panel. Reproduced against the exact 400 a real ComfyUI sends, which is
+  // what the first live run of this feature actually produced.
+  {
+    fakeComfyPromptRejects = 'waiIllustriousSDXL_v150.safetensors'
+    await rejects(
+      () => exec(workflowTool, { action: 'run', id: 'sdxl-basic', category: 'character', project_id: 'ckptfail' }),
+      /这个工作流钉住的 checkpoint「waiIllustriousSDXL_v150\.safetensors」不在本机 ComfyUI 里/,
+      'a FAILED workflow run hands the checkpoint advisory to the caller, not only to the panel',
+    )
+    fakeComfyPromptRejects = null
   }
 
   // ── the empty-prompt advisory ──

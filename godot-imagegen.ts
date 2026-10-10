@@ -6231,18 +6231,32 @@ function registerImageTools(
         // Captured so the run's own advisory (raised before it started, and shown
         // in the panel while it ran) can also be repeated back to the caller.
         let ranJob: Job | undefined
-        const images = await runJob('generate', `工作流 · ${name}`, exec, (job) => {
-          ranJob = job
-          return runWorkflow({
-            apiGraph,
-            name: slugify(name),
-            category,
-            projectId,
-            uiGraph: graph,
-            transparent: optionalBoolean(args, 'transparent', 'transparent') === true,
-            seamless: optionalBoolean(args, 'seamless', 'seamless') === true,
-          }, job)
-        })
+        let images: GalleryImage[]
+        try {
+          images = await runJob('generate', `工作流 · ${name}`, exec, (job) => {
+            ranJob = job
+            return runWorkflow({
+              apiGraph,
+              name: slugify(name),
+              category,
+              projectId,
+              uiGraph: graph,
+              transparent: optionalBoolean(args, 'transparent', 'transparent') === true,
+              seamless: optionalBoolean(args, 'seamless', 'seamless') === true,
+            }, job)
+          })
+        } catch (error) {
+          // The success path already repeats the advisory back below, but the
+          // FAILURE path is the one the checkpoint advisory exists for: a
+          // workflow pinned to a model this install lacks dies at ComfyUI's own
+          // validation, and the caller was handed that raw 400 while the
+          // explanation — computed, stored on the job, visible in the panel —
+          // was dropped on the floor. Enriched in place rather than wrapped, so
+          // the error keeps its identity for whatever handles it.
+          const advisory = ranJob?.advisory
+          if (advisory !== undefined && error instanceof Error) error.message = `${error.message}\n${advisory}`
+          throw error
+        }
         return {
           action,
           images: images.map(wireImage),
