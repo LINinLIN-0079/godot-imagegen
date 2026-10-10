@@ -545,6 +545,29 @@ function literalInput(graph: Record<string, unknown>, classType: string, key: st
   return undefined
 }
 
+/**
+ * Read the option list out of an `/object_info` COMBO spec.
+ *
+ * ComfyUI spells a COMBO in more than one shape: newer builds send
+ * `["COMBO", { options: [...] }]` while others send `[[...names], { tooltip }]`.
+ * Reading `[0]` and hoping is how a perfectly installed weight came up as
+ * missing — what came back was the literal string "COMBO", not a list. Which
+ * shape a node uses varies per node AND per build: on this install
+ * `UpscaleModelLoader` sends the first and `CheckpointLoaderSimple` the second,
+ * so neither shape can be assumed.
+ */
+function comboOptions(spec: unknown): string[] {
+  if (!Array.isArray(spec)) return []
+  if (Array.isArray(spec[0])) return spec[0].filter((entry): entry is string => typeof entry === 'string')
+  for (const entry of spec) {
+    if (entry === null || typeof entry !== 'object') continue
+    const record = entry as { options?: unknown; value?: unknown }
+    if (Array.isArray(record.options)) return record.options.filter((v): v is string => typeof v === 'string')
+    if (Array.isArray(record.value)) return record.value.filter((v): v is string => typeof v === 'string')
+  }
+  return spec.filter((entry): entry is string => typeof entry === 'string')
+}
+
 /** A compact, human-readable size. */
 function humanSize(bytes: number | undefined): string {
   if (bytes === undefined) return '?'
@@ -1247,9 +1270,14 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
         const data = (await fetchJson(`${sdBase}/sdapi/v1/sd-models`, { timeoutMs: 8000 })) as Array<Record<string, unknown>>
         list = data.map((m) => String(m.title ?? m.model_name ?? '')).filter((s) => s !== '')
       } else {
-        const info = (await fetchJson(`${comfyBase}/object_info/CheckpointLoaderSimple`, { timeoutMs: 8000 })) as Record<string, { input?: { required?: { ckpt_name?: unknown[] } } }>
-        const options = info.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0]
-        if (Array.isArray(options)) list = options.map((v) => String(v))
+        const info = (await fetchJson(`${comfyBase}/object_info/CheckpointLoaderSimple`, { timeoutMs: 8000 })) as Record<string, { input?: { required?: { ckpt_name?: unknown } } }>
+        // Through `comboOptions`, not `[0]` — see the helper. On the
+        // `["COMBO", { options }]` shape, `[0]` is the string "COMBO", so this
+        // returned an EMPTY list, and an empty list is not "no checkpoints
+        // installed": it is what made `pickModel` fall through to nothing and
+        // `image_generate` answer "ComfyUI 中没有任何 checkpoint" on a machine
+        // that plainly had one.
+        list = comboOptions(info.CheckpointLoaderSimple?.input?.required?.ckpt_name)
       }
     } catch {
       list = []
@@ -2040,6 +2068,47 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
       + '本机实测 0.88MP 时 10 步 80 秒，1.01MP 时 13 分钟都没跑完。建议降到 ≤0.9MP、换 SD1.5，或分张出图再拼。'
   }
 
+  /**
+   * Warn before running a workflow that pins a checkpoint this ComfyUI does not
+   * have.
+   *
+   * `image_generate` resolves its checkpoint from what is installed: an explicit
+   * `model` that is absent is refused with the available list, and a default
+   * that does not match falls back to the first installed model. A stored
+   * workflow gets no such treatment — it carries a literal `ckpt_name` inside
+   * its `CheckpointLoaderSimple`, and nothing compared that literal against this
+   * install. So a template pinned to a model the machine does not have was
+   * submitted anyway and came back as ComfyUI's own validation error, after the
+   * run had already started. Naming it up front is the same bargain the paging
+   * and weight advisories already make.
+   *
+   * Silent when the installed list comes back empty: here an empty list means
+   * "could not be read", not "nothing is installed", and a warning invented from
+   * an unreadable list is worse than no warning at all.
+   */
+  async function comfyCheckpointAdvisory(graph: Record<string, unknown>): Promise<string | undefined> {
+    const pinned = new Set<string>()
+    for (const node of Object.values(graph)) {
+      const candidate = node as { class_type?: unknown; inputs?: Record<string, unknown> }
+      if (candidate.class_type !== 'CheckpointLoaderSimple') continue
+      const name = candidate.inputs?.ckpt_name
+      if (typeof name === 'string' && name !== '') pinned.add(name)
+    }
+    if (pinned.size === 0) return undefined
+    const installed = await models('comfyui')
+    if (installed.length === 0) return undefined
+    const missing = [...pinned].filter((name) => !installed.includes(name))
+    if (missing.length === 0) return undefined
+    return missing
+      .map((name) => {
+        const lower = name.toLowerCase()
+        const near = installed.find((m) => m.toLowerCase().includes(lower) || lower.includes(m.toLowerCase()))
+        return `⚠ 这个工作流钉住的 checkpoint「${name}」不在本机 ComfyUI 里（已装：${installed.join('、')}）。`
+          + (near === undefined ? '' : `最接近的是「${near}」——改用它，或先把这个装好。`)
+      })
+      .join('\n')
+  }
+
   async function comfyRun(params: {
     graph: Record<string, unknown>
     signal?: AbortSignal
@@ -2209,6 +2278,7 @@ function createBackends(cfg: ImagegenConfig, subprocess: SubprocessSurface | und
     sdUpscale: (params: Parameters<typeof sdUpscale>[0]) => interruptOnFailure('sdwebui', () => sdUpscale(params)),
     sdInterrogate,
     comfyRun: (params: Parameters<typeof comfyRun>[0]) => interruptOnFailure('comfyui', () => comfyRun(params)),
+    comfyCheckpointAdvisory,
     comfyVramAdvisory,
     comfyWeightAdvisory,
     comfyGraph,
@@ -3285,6 +3355,7 @@ function createOps(deps: OpsDeps) {
     // explanation.
     const advisories = [
       comfyPromptAdvisory(input.apiGraph),
+      await backends.comfyCheckpointAdvisory(input.apiGraph).catch(() => undefined),
       await backends.comfyWeightAdvisory(input.apiGraph).catch(() => undefined),
       await backends.comfyVramAdvisory(input.apiGraph).catch(() => undefined),
     ].filter((text): text is string => text !== undefined)

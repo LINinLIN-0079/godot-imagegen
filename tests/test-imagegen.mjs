@@ -1405,6 +1405,35 @@ async function main() {
     await new Promise((r) => setTimeout(r, 600))
   }
 
+  // ── the checkpoint advisory ──
+  //
+  // A stored workflow carries a literal `ckpt_name` inside its
+  // CheckpointLoaderSimple, and nothing used to compare that literal against
+  // what this ComfyUI has. So a template pinned to an absent model was submitted
+  // anyway and came back as ComfyUI's own validation error AFTER the run had
+  // started. `image_generate` has always resolved its checkpoint from the
+  // installed list (explicit-but-absent is refused, a stale default falls back to
+  // the first installed model); this brings the workflow path to the same place.
+  //
+  // The fake's `/object_info/CheckpointLoaderSimple` deliberately advertises ONE
+  // checkpoint (`anything-v5.safetensors`) so that default-checkpoint resolution
+  // stays deterministic — which happens to let two real templates exercise both
+  // branches: sd15-basic pins the one that is there, sdxl-basic the one that is
+  // not. On the author's own machine it is the other way round, and the paired
+  // NOTE in test-workflow-library covers that direction.
+  {
+    const installed = await exec(workflowTool, { action: 'run', id: 'sd15-basic', category: 'concept', project_id: 'ckpt' })
+    assert(!/不在本机 ComfyUI 里/.test(String(installed.note)),
+      `a template whose checkpoint IS installed gets no checkpoint warning (${String(installed.note).split('\n').pop()})`)
+
+    const absent = await exec(workflowTool, { action: 'run', id: 'sdxl-basic', category: 'character', project_id: 'ckpt' })
+    assert(absent.images.length === 1, 'the run still happens — this warns, it does not refuse')
+    assert(/不在本机 ComfyUI 里/.test(String(absent.note)) && /waiIllustriousSDXL_v150\.safetensors/.test(String(absent.note)),
+      'a template pinned to a checkpoint this install lacks says WHICH one, before the run')
+    assert(/anything-v5\.safetensors/.test(String(absent.note)),
+      'and names what is installed instead, so the fix is in the message')
+  }
+
   // ── the empty-prompt advisory ──
   //
   // sd15-basic / sdxl-basic / img2img-refine ship a deliberate prompt SKELETON
